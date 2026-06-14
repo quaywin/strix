@@ -99,7 +99,10 @@ export class ScraperEngine {
                 resource_type: req.resourceType(),
                 post_data: req.postData(),
               });
-              if (reqUrl.includes("index.m3u8")) {
+              if (
+                reqUrl.includes("index.m3u8") ||
+                reqUrl.includes("playlist.m3u8")
+              ) {
                 finalResolve();
               }
             }
