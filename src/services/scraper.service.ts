@@ -49,6 +49,104 @@ export class ScraperService {
     cache.delete(`extract:${url}`);
   }
 
+  resolveM3u8Playlist(playlistUrl: string, body: string): string {
+    const lines = body.split(/\r?\n/);
+    const variants: {
+      url: string;
+      bandwidth: number;
+      width: number;
+      height: number;
+    }[] = [];
+
+    let currentStreamInf: {
+      bandwidth: number;
+      width: number;
+      height: number;
+    } | null = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const rawLine = lines[i];
+      if (!rawLine) continue;
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      if (line.startsWith("#EXT-X-STREAM-INF:")) {
+        const bandwidthMatch = line.match(/BANDWIDTH=(\d+)/);
+        const resolutionMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
+        const bandwidth =
+          bandwidthMatch && bandwidthMatch[1]
+            ? parseInt(bandwidthMatch[1], 10)
+            : 0;
+        let width = 0;
+        let height = 0;
+
+        if (resolutionMatch && resolutionMatch[1] && resolutionMatch[2]) {
+          width = parseInt(resolutionMatch[1], 10);
+          height = parseInt(resolutionMatch[2], 10);
+        }
+
+        currentStreamInf = { bandwidth, width, height };
+      } else if (!line.startsWith("#")) {
+        if (line.includes(".m3u8")) {
+          try {
+            const absoluteUrl = new URL(line, playlistUrl).toString();
+            if (currentStreamInf) {
+              variants.push({
+                url: absoluteUrl,
+                ...currentStreamInf,
+              });
+            } else {
+              variants.push({
+                url: absoluteUrl,
+                bandwidth: 0,
+                width: 0,
+                height: 0,
+              });
+            }
+          } catch (e) {
+            logger.warn(
+              `Failed to resolve relative URL: ${line} against ${playlistUrl}`,
+              "ScraperService",
+            );
+          }
+        }
+        currentStreamInf = null;
+      }
+    }
+
+    if (variants.length > 0) {
+      // Sort variants: highest resolution first, then highest bandwidth
+      variants.sort((a, b) => {
+        const areaA = a.width * a.height;
+        const areaB = b.width * b.height;
+        if (areaB !== areaA) {
+          return areaB - areaA;
+        }
+        return b.bandwidth - a.bandwidth;
+      });
+      return variants[0]?.url || playlistUrl;
+    }
+
+    // Fallback: check for any non-comment lines containing .m3u8
+    for (let i = 0; i < lines.length; i++) {
+      const rawLine = lines[i];
+      if (!rawLine) continue;
+      const line = rawLine.trim();
+      if (line && !line.startsWith("#") && line.includes(".m3u8")) {
+        try {
+          return new URL(line, playlistUrl).toString();
+        } catch (e) {
+          logger.warn(
+            `Failed to resolve fallback relative URL: ${line} against ${playlistUrl}`,
+            "ScraperService",
+          );
+        }
+      }
+    }
+
+    return playlistUrl;
+  }
+
   async extractStreamUrl(url: string): Promise<string> {
     const cacheKey = `extract:${url}`;
     const cached = getCached(cacheKey);
@@ -64,7 +162,7 @@ export class ScraperService {
     // Prefer master > playlist > mono > any m3u8 > mp4/mkv.
     // ping.gif is a common analytics beacon that falsely matches .m3u8 via
     // query params on some CDNs, so we explicitly exclude it.
-    const selectedReq = requests.find((r) => r.url.includes("mono.m3u8"));
+    const selectedReq = requests.find((r) => r.url.includes("index.m3u8"));
 
     logger.info(
       `Total requests captured: ${requests.length}`,
@@ -78,7 +176,52 @@ export class ScraperService {
       );
     }
 
-    const streamUrl = selectedReq.url;
+    let playlistBody = selectedReq.body;
+    if (!playlistBody && selectedReq.url.includes(".m3u8")) {
+      try {
+        const headers = new Headers();
+        if (selectedReq.headers) {
+          for (const [key, value] of Object.entries(selectedReq.headers)) {
+            const lowerKey = key.toLowerCase();
+            if (
+              ![
+                "host",
+                "connection",
+                "content-length",
+                "accept-encoding",
+              ].includes(lowerKey)
+            ) {
+              headers.set(key, value);
+            }
+          }
+        }
+        const res = await fetch(selectedReq.url, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (res.ok) {
+          playlistBody = await res.text();
+        }
+      } catch (e) {
+        logger.warn(
+          `Failed to fetch playlist body for ${selectedReq.url}: ${(e as Error).message}`,
+          "ScraperService",
+        );
+      }
+    }
+
+    let streamUrl = selectedReq.url;
+    if (playlistBody) {
+      const resolved = this.resolveM3u8Playlist(selectedReq.url, playlistBody);
+      if (resolved !== selectedReq.url) {
+        logger.info(
+          `Resolved master playlist to sub-playlist: ${resolved}`,
+          "ScraperService",
+        );
+        streamUrl = resolved;
+      }
+    }
+
     requests.length = 0;
 
     setCached(cacheKey, streamUrl, CONFIG.CACHE_TTL_MS);
