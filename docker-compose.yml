@@ -1,0 +1,52 @@
+# Single-service deployment for scrape-stream-api.
+#
+# Usage:
+#   cp .env.example .env        # one-time, then edit if you want non-default ports
+#   docker compose up --build -d
+#   docker compose logs -f app
+
+services:
+  app:
+    build: .
+    image: scrape-stream-api:latest
+    container_name: scrape-stream-api
+    restart: unless-stopped
+
+    # `init: true` runs tini as PID 1 so SIGTERM is forwarded correctly and
+    # zombie Chromium processes get reaped.
+    init: true
+
+    # PORT (from .env, default 5005) is the container-side port the app binds.
+    # HOST_PORT optionally remaps the host side (e.g. HOST_PORT=80 -> 5005).
+    ports:
+      - "${HOST_PORT:-${PORT:-5005}}:${PORT:-5005}"
+
+    # Loads every variable in .env into the container's environment.
+    # Required: create .env first (cp .env.example .env).
+    env_file:
+      - .env
+
+    # Force container-friendly defaults regardless of what .env says.
+    # USER_DATA_DIR must point at the mounted volume; CHROME_PATH must stay
+    # empty so Playwright uses the Chromium baked into the image.
+    environment:
+      USER_DATA_DIR: /app/user_data
+      CHROME_PATH: ""
+
+    # Persistent Chrome profile (cookies, cache) survives container restarts.
+    # First-mount: Docker copies ownership from the image's /app/user_data
+    # (owned by appuser), so the non-root process can write to it.
+    volumes:
+      - user_data:/app/user_data
+
+    # Override the Dockerfile's healthcheck timing if you need; otherwise
+    # the image's defaults apply (every 30s, 30s grace on start).
+    # healthcheck:
+    #   test: ["CMD", "bun", "-e", "fetch('http://localhost:5005/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   start_period: 30s
+    #   retries: 3
+
+volumes:
+  user_data:

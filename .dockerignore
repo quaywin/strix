@@ -1,0 +1,29 @@
+# Build context — keep this small to speed up `docker build`.
+
+# Dependencies (re-installed inside the image via `bun install`)
+node_modules/
+
+# Runtime data — must NEVER be baked into the image
+user_data/
+
+# Local secrets / env files (compose mounts these at runtime)
+.env
+.env.local
+.env.*.local
+
+# Version control & editor cruft
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+
+# OS / log noise
+*.log
+.DS_Store
+
+# Docker meta files are not needed inside the image
+Dockerfile
+.dockerignore
+docker-compose.yml
+compose.yml
