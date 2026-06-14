@@ -151,7 +151,6 @@ export class ScraperService {
     const cacheKey = `extract:${url}`;
     const cached = getCached(cacheKey);
     if (cached) {
-      logger.info(`Returning cached stream URL for: ${url}`, "ScraperService");
       return cached;
     }
 
