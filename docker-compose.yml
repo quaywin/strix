@@ -27,11 +27,11 @@ services:
       - .env
 
     # Force container-friendly defaults regardless of what .env says.
-    # USER_DATA_DIR must point at the mounted volume; CHROME_PATH must stay
-    # empty so Playwright uses the Chromium baked into the image.
+    # USER_DATA_DIR must point at the mounted volume; CHROME_PATH points
+    # to the Google Chrome binary (which contains the required H.264/AAC codecs).
     environment:
       USER_DATA_DIR: /app/user_data
-      CHROME_PATH: ""
+      CHROME_PATH: "/usr/bin/google-chrome"
 
     # Persistent Chrome profile (cookies, cache) survives container restarts.
     # First-mount: Docker copies ownership from the image's /app/user_data

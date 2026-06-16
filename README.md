@@ -1,123 +1,152 @@
 # scrape-stream-api
 
-A tiny Bun + Elysia + Playwright service that does exactly one thing:
-**given a video page URL, return its raw `.m3u8` (or `.mp4`/`.mkv`) stream URL.**
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bun Version](https://img.shields.io/badge/Bun-%3E%3D1.0.0-blue?logo=bun)](https://bun.sh)
+[![Playwright](https://img.shields.io/badge/Playwright-Chromium-green?logo=playwright)](https://playwright.dev)
+[![Docker](https://img.shields.io/badge/Docker-Ready-blue?logo=docker)](https://www.docker.com)
 
-## Endpoints
+A tiny, high-performance Bun + Elysia + Playwright microservice designed to do exactly one thing:
+**given a video page URL, bypass bot-detection, extract its raw `.m3u8` (HLS) or video (`.mp4`/`.mkv`/etc.) stream URL, and either redirect or proxy the stream directly to the client.**
+
+It is perfect for video streaming applications, IPTV players, and web scrapers that need to resolve protected or short-lived streaming links.
+
+---
+
+## Key Features
+
+- **Anti-Bot Stealth**: Injects advanced anti-fingerprinting overrides (masking `navigator.webdriver`, setting custom user-agent, mocking `userAgentData`, permissions API, plugins, and languages) to bypass sophisticated headless-detection scripts (e.g. on sites like `dlhd.pk`).
+- **Interactive Player Clicker**: Auto-detects and triggers play buttons inside frames/iframes to trigger underlying video streams.
+- **Smart Cache Resolution**: Caches extracted URLs for 50 minutes (TTL) to save browser resources, with an automatic cache invalidation and retry fallback.
+- **Redirect or Proxy Modes**:
+  - **Redirect mode**: Returns a HTTP `302` redirect to the raw stream URL.
+  - **Proxy mode**: Acts as an intermediary proxy, streaming the video data back to client. Handles Range requests/headers for seamless video seeking on `.mp4`/`.mkv` streams.
+- **Docker Ready**: Self-contained multi-stage Docker configuration bundling Bun, Playwright Chromium, and all system libraries.
+
+---
+
+## API Endpoints
 
 ### `GET /`
+Health check endpoint. Returns `scrape-stream-api`.
 
-Health check. Returns the string `scrape-stream-api`.
+---
 
-### `GET /scrape-stream?url=<page-url>`
+### `GET /scrape-stream` & `GET /scrape-stream/:filename`
+Visits the page in a stealthy headless browser, waits for media requests, and extracts the stream URL.
 
-Visits the page in a stealthy headless Chrome, waits for media requests, and
-returns the best stream URL it can find.
+The variant route with `:filename` is extremely useful for players (e.g. IPTV players or Apple TV/iOS players) that require a specific file extension (like `.m3u8` or `.mp4`) at the end of the URL path to work correctly.
 
-**Query params:**
-- `url` (required) — the video page URL to scrape
+**Query Parameters:**
+- `url` (required) — The URL of the video hosting page to scrape.
+- `proxy` (optional) — If set to `true` or `1`, the service acts as a streaming proxy instead of redirecting the client to the CDN URL.
 
-**200 response:**
-```json
-{ "url": "https://cdn.example.com/.../index.m3u8?...", "source": "<input url>" }
+#### Mode 1: Redirect Mode (`proxy` is false/omitted)
+Returns a HTTP `302 Redirect` pointing directly to the resolved stream.
+```http
+GET /scrape-stream?url=https://example.com/video-page
 ```
 
-**Error responses:**
-- `400` — missing `url` parameter
-- `500` — scrape failed (site down, no video source, timeout, etc.)
-  ```json
-  { "error": "<message>" }
-  ```
+#### Mode 2: Proxy Mode (`proxy=true`)
+Streams the target video data directly from the upstream server to the client. This is helpful if the target CDN restricts access by IP address or custom headers.
+```http
+GET /scrape-stream/playlist.m3u8?url=https://example.com/video-page&proxy=true
+```
 
-The extracted URL is cached for 5 minutes (configurable via code) because most
-`.m3u8` links carry short-lived signed tokens.
+In proxy mode:
+- **Seek Support**: Range-related headers (`Range`, `Content-Range`, `Accept-Ranges`, `Content-Length`) are fully forwarded to support seeking in video players (e.g., MP4/MKV).
+- **Auto-Retry**: If the upstream server rejects the proxy request (e.g., returns `403` or `502` due to an expired CDN token), the service automatically invalidates the cache, performs a fresh scrape, and retries the connection once.
 
-## Setup
+#### Error Responses
+- `400 Bad Request` — Missing `url` parameter.
+- `404 Not Found` — No playable video source or `.m3u8` playlist was found on the page.
+- `504 Gateway Timeout` — Upstream proxy connection timed out.
+- `500 Internal Server Error` — Scraper browser crash or unexpected system error.
 
+---
+
+## Setup & Local Development
+
+### Installation
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/your-username/scrape-stream-api.git
+   cd scrape-stream-api
+   ```
+2. Install dependencies:
+   ```bash
+   bun install
+   ```
+3. Install the Playwright Chromium browser binary:
+   ```bash
+   npx playwright install chromium
+   ```
+4. Copy the environment template and configure:
+   ```bash
+   cp .env.example .env
+   ```
+
+### Running
+
+To start the server in watch mode:
 ```bash
-bun install
-npx playwright install chromium   # if not already installed elsewhere
-cp .env.example .env              # then edit if needed
 bun run dev
 ```
+By default, the server will start on `http://localhost:5005`.
+
+---
 
 ## Configuration (`.env`)
 
-| Variable        | Default     | Description                                                  |
-| --------------- | ----------- | ----------------------------------------------------------- |
-| `PORT`          | `5005`      | Server port                                                 |
-| `CHROME_PATH`   | _empty_     | Path to a real Chrome binary. Empty = Playwright Chromium.  |
-| `USER_DATA_DIR` | `./user_data` | Persistent browser profile dir. Shared across requests.    |
-| `SCRAPER_TIMEOUT` | `15000`   | Per-page navigation/scrape timeout, in ms.                  |
+You can customize the application behavior using the following environment variables:
 
-## Deploy with Docker
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `PORT` | `5005` | The port on which the service will run. |
+| `CHROME_PATH` | *empty* | Path to a real, installed Chrome binary (falls back to Playwright's Chromium if empty). |
+| `USER_DATA_DIR` | `./user_data` | Directory where browser session profile cookies and cache are stored. |
+| `SCRAPER_TIMEOUT` | `15000` | Timeout in milliseconds for navigation and page loading. |
+| `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Timeout in milliseconds when waiting for the upstream proxy connection. |
 
-The repo ships with a `Dockerfile` and `docker-compose.yml` that bundle the
-Bun runtime, Playwright Chromium, and all required system libraries into a
-single image (~1.5 GB).
-
-### Quick start
-
+### Cookie & Authentication Injection (`auth.json`)
+If the target website requires specific authentication cookies or local storage states, copy the `auth.json.example` template to `auth.json` and populate it:
 ```bash
-cp .env.example .env               # one-time, adjust ports/timeouts if needed
+cp auth.json.example auth.json
+```
+The browser will automatically load these cookies and local storage variables on initialization.
+
+---
+
+## Production Deployment with Docker
+
+The project contains a `Dockerfile` and `docker-compose.yml` to bundle the Bun runtime, headless Playwright Chromium, and Debian-based dependencies into a single image.
+
+### Quick Start
+```bash
+# Prepare env variables
+cp .env.example .env
+
+# Build and run containers in background
 docker compose up --build -d
+
+# Check service logs
 docker compose logs -f app
 ```
 
-The service will be available at `http://<host>:5005/`.
+### Docker Volume Persistence
+A named Docker volume `user_data` is configured to persist browser profiles, cookie state, and cached resources across container restarts.
 
-### What the image does
+### Useful Commands
+- **Rebuild image**: `docker compose build`
+- **Stop containers**: `docker compose down`
+- **Clean start (deletes cache volume)**: `docker compose down -v && docker compose up --build -d`
 
-- Based on `oven/bun:1-debian` (Debian variant — required for Playwright
-  system deps like `libnss3`, `libatk1.0-0`, `libgbm1`).
-- Installs Chromium via `bunx playwright install --with-deps chromium`.
-- Runs as a non-root user (`appuser`, uid 1001). Safe because the app already
-  launches Chrome with `--no-sandbox`.
-- Persists the Chrome profile to a named Docker volume (`user_data`) so
-  cookies / cache survive container restarts.
-- Built-in healthcheck pings `GET /` every 30s.
+---
 
-### Useful commands
+## Contributing
 
-```bash
-docker compose build               # rebuild image after dependency changes
-docker compose up -d               # start in background
-docker compose logs -f app         # tail logs
-docker compose restart app         # restart without rebuilding
-docker compose down                # stop and remove containers (keeps volume)
-docker compose down -v             # also delete the user_data volume
-```
+Contributions are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to run tests, write code, and submit pull requests.
 
-### Changing the exposed port
+## License
 
-The compose file reads `PORT` (and optional `HOST_PORT`) from `.env`:
-
-```bash
-# .env
-PORT=8080                          # container listens on 8080
-HOST_PORT=80                       # optional: publish on host port 80 -> 8080
-```
-
-### Notes
-
-- **Build is slow the first time** (~5-10 min on a small VPS) because
-  Chromium + apt deps must be downloaded. Subsequent rebuilds hit the layer
-  cache and finish in seconds unless `package.json` changes.
-- **Image size** is ~1.5 GB. If you deploy on a PaaS with size limits,
-  consider pushing the image to a registry (ghcr.io / Docker Hub) rather
-  than building in place.
-- **Memory**: give the container at least 512 MB (1 GB recommended) since
-  Chromium is memory-hungry.
-
-## Stealth
-
-`PlaywrightBrowserProvider` injects an init script that masks common
-headless-detection signals (`navigator.webdriver`, `userAgentData.brands`,
-`plugins`, `languages`, `chrome.runtime`) and sets a realistic Chrome
-user-agent. This is necessary for sites like `dlhd.pk` that detect
-`HeadlessChrome` and serve ad networks instead of the real player.
-
-If a target site still detects the bot, options to explore:
-- run with a real Chrome profile (`USER_DATA_DIR` pointing at an existing one)
-- use `playwright-extra` + `puppeteer-extra-plugin-stealth`
-- headed mode via Xvfb on Linux (the Docker image is headless-only)
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
