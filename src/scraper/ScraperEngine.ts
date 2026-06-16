@@ -1,4 +1,5 @@
 import type { Frame, Page, Request, Response } from "playwright";
+import path from "node:path";
 import { CONFIG } from "../config";
 import { PlaywrightBrowserProvider } from "./BrowserProvider";
 
@@ -49,6 +50,20 @@ export class ScraperEngine {
           const context = await this.browserProvider.getBrowserContext();
           page = await context.newPage();
 
+          // Log browser console errors/warnings and uncaught page exceptions
+          page.on("console", (msg) => {
+            const type = msg.type();
+            if (type === "error" || type === "warning") {
+              console.log(
+                `[BROWSER CONSOLE] [${type.toUpperCase()}] ${msg.text()}`,
+              );
+            }
+          });
+
+          page.on("pageerror", (err) => {
+            console.error(`[BROWSER ERROR] ${err.message}`);
+          });
+
           const cleanup = async () => {
             for (const id of activeTimeouts) clearTimeout(id);
             activeTimeouts.clear();
@@ -68,6 +83,26 @@ export class ScraperEngine {
             console.log(
               `[SCRAPER] m3u8 captured or timeout reached for ${url}`,
             );
+
+            // Take a debug screenshot if no m3u8 was found before closing the page
+            const hasM3u8 = requests.some((r) => r.url.includes(".m3u8"));
+            if (!hasM3u8 && page) {
+              try {
+                const screenshotPath = path.join(
+                  CONFIG.USER_DATA_DIR || "./user_data",
+                  "debug_last_failure.png",
+                );
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                console.log(
+                  `[SCRAPER] Failed to find m3u8. Saved debug screenshot to: ${screenshotPath}`,
+                );
+              } catch (screenshotErr) {
+                console.error(
+                  `[SCRAPER] Failed to capture debug screenshot: ${screenshotErr}`,
+                );
+              }
+            }
+
             await Promise.race([
               Promise.all(responsePromises),
               trackedSleep(2000),
