@@ -145,6 +145,12 @@ export class ScraperEngine {
 
           const handleResponse = (response: Response) => {
             const resUrl = response.url();
+            const status = response.status();
+
+            if (status >= 400) {
+              console.log(`[BROWSER HTTP ERROR] ${status} for URL: ${resUrl}`);
+            }
+
             if (resUrl.includes(".m3u8")) {
               const p = (async () => {
                 try {

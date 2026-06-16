@@ -4,6 +4,7 @@ export const CONFIG = {
   PORT: parseInt(process.env.PORT || "5005", 10),
   CHROME_PATH: process.env.CHROME_PATH || "",
   USER_DATA_DIR: process.env.USER_DATA_DIR || "./user_data",
+  PROXY_SERVER: process.env.PROXY_SERVER || "", // e.g. "http://123.45.67.89:8080" hoặc "http://user:pass@host:port"
   SCRAPER: {
     DEFAULT_TIMEOUT: parseInt(process.env.SCRAPER_TIMEOUT || "15000", 10),
   },

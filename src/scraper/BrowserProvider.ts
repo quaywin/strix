@@ -106,6 +106,13 @@ export class PlaywrightBrowserProvider {
         chromePath;
     }
 
+    if (CONFIG.PROXY_SERVER) {
+      (launchOptions as any).proxy = {
+        server: CONFIG.PROXY_SERVER,
+      };
+      console.log(`[BROWSER] Using proxy server: ${CONFIG.PROXY_SERVER}`);
+    }
+
     this.globalContext = await chromium.launchPersistentContext(
       userDataDir,
       launchOptions,
@@ -113,7 +120,11 @@ export class PlaywrightBrowserProvider {
     await this.globalContext.addInitScript(STEALTH_INIT_SCRIPT);
 
     // Load static auth state (cookies & localStorage) from auth.json if present
-    const authPath = path.join(process.cwd(), "auth.json");
+    let authPath = path.join(process.cwd(), "auth.json");
+    if (!fs.existsSync(authPath)) {
+      authPath = path.join(userDataDir, "auth.json");
+    }
+
     if (fs.existsSync(authPath)) {
       try {
         const authData = JSON.parse(fs.readFileSync(authPath, "utf-8"));
