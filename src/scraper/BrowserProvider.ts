@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { BrowserContext } from "playwright";
@@ -101,7 +102,8 @@ export class PlaywrightBrowserProvider {
     };
 
     if (chromePath) {
-      (launchOptions as { executablePath?: string }).executablePath = chromePath;
+      (launchOptions as { executablePath?: string }).executablePath =
+        chromePath;
     }
 
     this.globalContext = await chromium.launchPersistentContext(
@@ -109,6 +111,56 @@ export class PlaywrightBrowserProvider {
       launchOptions,
     );
     await this.globalContext.addInitScript(STEALTH_INIT_SCRIPT);
+
+    // Load static auth state (cookies & localStorage) from auth.json if present
+    const authPath = path.join(process.cwd(), "auth.json");
+    if (fs.existsSync(authPath)) {
+      try {
+        const authData = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+
+        // Load cookies
+        if (authData.cookies && Array.isArray(authData.cookies)) {
+          await this.globalContext.addCookies(authData.cookies);
+          console.log(
+            `[BROWSER] Loaded ${authData.cookies.length} cookies from auth.json`,
+          );
+        }
+
+        // Load localStorage
+        if (authData.origins && Array.isArray(authData.origins)) {
+          for (const originEntry of authData.origins) {
+            if (originEntry.origin && Array.isArray(originEntry.localStorage)) {
+              await this.globalContext.addInitScript(
+                (data) => {
+                  try {
+                    if (window.location.origin === data.origin) {
+                      for (const item of data.localStorage) {
+                        window.localStorage.setItem(item.name, item.value);
+                      }
+                    }
+                  } catch (e) {
+                    console.error(
+                      "[BROWSER] Failed to set localStorage in init script:",
+                      e,
+                    );
+                  }
+                },
+                {
+                  origin: originEntry.origin,
+                  localStorage: originEntry.localStorage,
+                },
+              );
+            }
+          }
+          console.log(
+            `[BROWSER] Registered localStorage init scripts for ${authData.origins.length} origins from auth.json`,
+          );
+        }
+      } catch (error) {
+        console.error(`[BROWSER] Error loading auth.json:`, error);
+      }
+    }
+
     return this.globalContext;
   }
 

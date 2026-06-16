@@ -1,0 +1,25 @@
+{
+  "cookies": [
+    {
+      "name": "your_cookie_name",
+      "value": "your_cookie_value",
+      "domain": ".example.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://example.com",
+      "localStorage": [
+        {
+          "name": "your_localstorage_key",
+          "value": "your_localstorage_value"
+        }
+      ]
+    }
+  ]
+}
