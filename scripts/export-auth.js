@@ -8,30 +8,34 @@
  * JSON string conforming to the Playwright storageState layout and
  * copy it directly to your Clipboard.
  */
-(function() {
+(function () {
   const origin = window.location.origin;
   const hostname = window.location.hostname;
 
   // 1. Extract non-HttpOnly Cookies
-  const cookies = document.cookie ? document.cookie.split(';').map(c => {
-    const [name, ...valueParts] = c.trim().split('=');
-    return {
-      name: name.trim(),
-      value: valueParts.join('=').trim(),
-      domain: hostname,
-      path: '/',
-      expires: -1,
-      httpOnly: false, // JavaScript cannot read HttpOnly flags
-      secure: window.location.protocol === 'https:',
-      sameSite: 'Lax'
-    };
-  }) : [];
+  const cookies = document.cookie
+    ? document.cookie.split(";").map((c) => {
+        const [name, ...valueParts] = c.trim().split("=");
+        return {
+          name: name.trim(),
+          value: valueParts.join("=").trim(),
+          domain: hostname,
+          path: "/",
+          expires: -1,
+          httpOnly: false, // JavaScript cannot read HttpOnly flags
+          secure: window.location.protocol === "https:",
+          sameSite: "Lax",
+        };
+      })
+    : [];
 
   // 2. Extract LocalStorage items
-  const localStorageItems = Object.entries(localStorage).map(([name, value]) => ({
-    name,
-    value
-  }));
+  const localStorageItems = Object.entries(localStorage).map(
+    ([name, value]) => ({
+      name,
+      value,
+    }),
+  );
 
   // 3. Format to Playwright's auth state schema
   const authState = {
@@ -39,17 +43,24 @@
     origins: [
       {
         origin: origin,
-        localStorage: localStorageItems
-      }
-    ]
+        localStorage: localStorageItems,
+      },
+    ],
   };
 
   // 4. Copy to Clipboard
   copy(JSON.stringify(authState, null, 2));
 
-  console.log("%c Successfully copied Cookie & LocalStorage session data! ", "background: #222; color: #bada55; font-size: 16px; font-weight: bold;");
+  console.log(
+    "%c Successfully copied Cookie & LocalStorage session data! ",
+    "background: #222; color: #bada55; font-size: 16px; font-weight: bold;",
+  );
   console.log("👉 Next Steps:");
-  console.log("1. Open or create the 'auth.json' file in the root of your scrape-stream-api directory.");
+  console.log(
+    "1. Open or create the 'auth.json' file in the root of your strix directory.",
+  );
   console.log("2. Paste (Ctrl+V or Cmd+V) the copied JSON content.");
-  console.log("⚠️ Note: If the website uses secure 'HttpOnly' cookies for authentication, please export cookies using browser extensions like 'Cookie-Editor' and merge them into the 'cookies' array in 'auth.json'.");
+  console.log(
+    "⚠️ Note: If the website uses secure 'HttpOnly' cookies for authentication, please export cookies using browser extensions like 'Cookie-Editor' and merge them into the 'cookies' array in 'auth.json'.",
+  );
 })();

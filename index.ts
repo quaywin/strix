@@ -106,7 +106,7 @@ const app = new Elysia()
       headers: { "Content-Type": "application/json" },
     });
   })
-  .get("/", () => "scrape-stream-api")
+  .get("/", () => "strix")
   .get("/scrape-stream", async ({ query, request }) => {
     return handleScrapeStream(
       query as { url?: string; proxy?: string },
@@ -121,7 +121,4 @@ const app = new Elysia()
   })
   .listen(CONFIG.PORT);
 
-logger.info(
-  `scrape-stream-api listening on http://localhost:${CONFIG.PORT}`,
-  "App",
-);
+logger.info(`strix listening on http://localhost:${CONFIG.PORT}`, "App");

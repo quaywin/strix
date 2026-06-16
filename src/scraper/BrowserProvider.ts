@@ -81,7 +81,7 @@ export class PlaywrightBrowserProvider {
     const chromePath = CONFIG.CHROME_PATH;
     const userDataDir =
       CONFIG.USER_DATA_DIR ||
-      path.join(os.tmpdir(), "playwright_profile_scrape_stream");
+      path.join(os.tmpdir(), "playwright_profile_strix");
 
     const launchOptions = {
       headless: true,

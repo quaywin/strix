@@ -1,6 +1,6 @@
-# Contributing to scrape-stream-api
+# Contributing to strix
 
-First off, thank you for considering contributing to `scrape-stream-api`! It's people like you who make the open-source community such an amazing place to learn, inspire, and create.
+First off, thank you for considering contributing to `strix`! It's people like you who make the open-source community such an amazing place to learn, inspire, and create.
 
 To maintain a healthy codebase and smooth development flow, please read and follow these guidelines.
 
@@ -22,8 +22,8 @@ Please be respectful and constructive in all issues, pull requests, and discussi
 1. **Fork the Repository** on GitHub.
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/<your-username>/scrape-stream-api.git
-   cd scrape-stream-api
+   git clone https://github.com/<your-username>/strix.git
+   cd strix
    ```
 3. **Install dependencies**:
    ```bash

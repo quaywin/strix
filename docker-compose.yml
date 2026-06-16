@@ -1,4 +1,4 @@
-# Single-service deployment for scrape-stream-api.
+# Single-service deployment for strix.
 #
 # Usage:
 #   cp .env.example .env        # one-time, then edit if you want non-default ports
@@ -8,8 +8,8 @@
 services:
   app:
     build: .
-    image: scrape-stream-api:latest
-    container_name: scrape-stream-api
+    image: strix:latest
+    container_name: strix
     restart: unless-stopped
 
     # `init: true` runs tini as PID 1 so SIGTERM is forwarded correctly and

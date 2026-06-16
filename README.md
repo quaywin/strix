@@ -1,4 +1,4 @@
-# scrape-stream-api
+# strix
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bun Version](https://img.shields.io/badge/Bun-%3E%3D1.0.0-blue?logo=bun)](https://bun.sh)
@@ -27,7 +27,7 @@ It is perfect for video streaming applications, IPTV players, and web scrapers t
 ## API Endpoints
 
 ### `GET /`
-Health check endpoint. Returns `scrape-stream-api`.
+Health check endpoint. Returns `strix`.
 
 ---
 
@@ -70,8 +70,8 @@ In proxy mode:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/scrape-stream-api.git
-   cd scrape-stream-api
+   git clone https://github.com/your-username/strix.git
+   cd strix
    ```
 2. Install dependencies:
    ```bash
