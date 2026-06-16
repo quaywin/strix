@@ -115,6 +115,16 @@ cp auth.json.example auth.json
 ```
 The browser will automatically load these cookies and local storage variables on initialization.
 
+#### How to Export Session Data from Chrome
+You can easily export your active session's cookies and local storage directly from your browser console:
+
+1. Log in to the target website on Google Chrome.
+2. Open Developer Tools (`F12` or `Cmd + Option + I` on macOS) and click the **Console** tab.
+3. Open the file `scripts/export-auth.js` in this project, copy its entire contents, paste it into the browser console, and press **Enter**.
+4. The JSON formatted session state is automatically copied to your clipboard. Simply open `auth.json` in your project root and paste (`Ctrl+V` / `Cmd+V`) the contents there.
+
+> ⚠️ **Note on Secure Cookies (HttpOnly)**: JavaScript cannot read cookies marked with the `HttpOnly` flag. If the target website relies on `HttpOnly` cookies for authentication, please use an extension like **Cookie-Editor** to export all cookies as JSON, and copy them directly into the `"cookies"` array in your `auth.json`.
+
 ---
 
 ## Production Deployment with Docker
