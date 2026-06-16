@@ -49,6 +49,15 @@ export class ScraperService {
     cache.delete(`extract:${url}`);
   }
 
+  /**
+   * Eagerly warm up the browser context (launch Chromium + load auth) so the
+   * first scrape request is fast. Call once at server startup; failures are
+   * logged but non-fatal — the first request will retry creation.
+   */
+  async warmup(): Promise<void> {
+    await scraperEngine.warmup();
+  }
+
   resolveM3u8Playlist(playlistUrl: string, body: string): string {
     const lines = body.split(/\r?\n/);
     const variants: {

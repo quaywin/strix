@@ -3,4 +3,10 @@ user_data/
 .env
 *.log
 .DS_Store
+
+# Per-domain auth files (each file is a Playwright storageState with cookies/localStorage)
+auth/*.json
+!auth/*.example.json
+
+# Legacy single-file auth (kept for backward compatibility)
 auth.json

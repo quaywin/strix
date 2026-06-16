@@ -122,3 +122,11 @@ const app = new Elysia()
   .listen(CONFIG.PORT);
 
 logger.info(`strix listening on http://localhost:${CONFIG.PORT}`, "App");
+
+// Eager warmup: launch the browser context and load auth state now so the
+// first scrape request doesn't pay the multi-second Chromium startup cost.
+// Fire-and-forget; concurrent first requests await the same singleton promise.
+scraperService
+  .warmup()
+  .then(() => logger.info("Browser context ready (warmup complete)", "App"))
+  .catch((e) => logger.error("Browser warmup failed", "App", e));

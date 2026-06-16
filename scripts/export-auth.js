@@ -57,10 +57,14 @@
   );
   console.log("👉 Next Steps:");
   console.log(
-    "1. Open or create the 'auth.json' file in the root of your strix directory.",
+    "1. Create a per-domain file under the 'auth/' directory in your strix project root, named after the site hostname (e.g. 'auth/" +
+      hostname +
+      ".json'). See 'auth/auth.example.json' for the schema.",
   );
-  console.log("2. Paste (Ctrl+V or Cmd+V) the copied JSON content.");
   console.log(
-    "⚠️ Note: If the website uses secure 'HttpOnly' cookies for authentication, please export cookies using browser extensions like 'Cookie-Editor' and merge them into the 'cookies' array in 'auth.json'.",
+    "2. Paste (Ctrl+V or Cmd+V) the copied JSON content into that file.",
+  );
+  console.log(
+    "⚠️ Note: If the website uses secure 'HttpOnly' cookies for authentication, please export cookies using browser extensions like 'Cookie-Editor' and merge them into the 'cookies' array of that file.",
   );
 })();

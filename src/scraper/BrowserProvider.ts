@@ -73,11 +73,24 @@ const USER_AGENT =
   "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 export class PlaywrightBrowserProvider {
-  private globalContext: BrowserContext | null = null;
+  // Promise-based singleton so concurrent callers (e.g. eager warmup racing
+  // with the first request) await the SAME in-flight creation instead of
+  // each spawning a separate browser context.
+  private contextPromise: Promise<BrowserContext> | null = null;
 
   async getBrowserContext(): Promise<BrowserContext> {
-    if (this.globalContext) return this.globalContext;
+    if (!this.contextPromise) {
+      this.contextPromise = this.createContext().catch((err) => {
+        // Clear the cached promise on failure so the next call can retry
+        // creation instead of all future callers permanently rejecting.
+        this.contextPromise = null;
+        throw err;
+      });
+    }
+    return this.contextPromise;
+  }
 
+  private async createContext(): Promise<BrowserContext> {
     const chromePath = CONFIG.CHROME_PATH;
     const userDataDir =
       CONFIG.USER_DATA_DIR ||
@@ -113,72 +126,144 @@ export class PlaywrightBrowserProvider {
       console.log(`[BROWSER] Using proxy server: ${CONFIG.PROXY_SERVER}`);
     }
 
-    this.globalContext = await chromium.launchPersistentContext(
+    const context = await chromium.launchPersistentContext(
       userDataDir,
       launchOptions,
     );
-    await this.globalContext.addInitScript(STEALTH_INIT_SCRIPT);
+    await context.addInitScript(STEALTH_INIT_SCRIPT);
 
-    // Load static auth state (cookies & localStorage) from auth.json if present
+    // Load auth state (per-domain files in auth/, with legacy auth.json fallback)
+    await this.loadAuthState(userDataDir, context);
+
+    return context;
+  }
+
+  /**
+   * Load authentication state into the global browser context.
+   *
+   * Reads per-domain files from the `auth/` directory at the project root.
+   * Each file is a Playwright storageState blob (`{ cookies, origins }`)
+   * named after the target domain (e.g. `auth/dlhd.pk.json`). Files ending
+   * in `.example.json` are skipped. Falls back to a single legacy `auth.json`
+   * at the project root (or `userDataDir`) when `auth/` is absent, for
+   * backward compatibility.
+   */
+  private async loadAuthState(
+    userDataDir: string,
+    context: BrowserContext,
+  ): Promise<void> {
+    const authDir = path.join(process.cwd(), "auth");
+    if (fs.existsSync(authDir) && fs.statSync(authDir).isDirectory()) {
+      const files = fs
+        .readdirSync(authDir)
+        .filter((f) => f.endsWith(".json") && !f.endsWith(".example.json"))
+        .sort();
+
+      let loaded = 0;
+      for (const file of files) {
+        const filePath = path.join(authDir, file);
+        try {
+          const authData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+          const count = await this.applyAuthData(authData, context);
+          console.log(
+            `[BROWSER] Loaded auth from ${file} (${count.cookies} cookies, ${count.origins} origins)`,
+          );
+          loaded++;
+        } catch (error) {
+          console.error(`[BROWSER] Error loading ${filePath}:`, error);
+        }
+      }
+      if (loaded > 0) {
+        console.log(`[BROWSER] Loaded auth for ${loaded} domain(s) from auth/`);
+      }
+      return;
+    }
+
+    // Legacy fallback: single auth.json (project root, then userDataDir)
     let authPath = path.join(process.cwd(), "auth.json");
     if (!fs.existsSync(authPath)) {
       authPath = path.join(userDataDir, "auth.json");
     }
-
     if (fs.existsSync(authPath)) {
       try {
         const authData = JSON.parse(fs.readFileSync(authPath, "utf-8"));
-
-        // Load cookies
-        if (authData.cookies && Array.isArray(authData.cookies)) {
-          await this.globalContext.addCookies(authData.cookies);
-          console.log(
-            `[BROWSER] Loaded ${authData.cookies.length} cookies from auth.json`,
-          );
-        }
-
-        // Load localStorage
-        if (authData.origins && Array.isArray(authData.origins)) {
-          for (const originEntry of authData.origins) {
-            if (originEntry.origin && Array.isArray(originEntry.localStorage)) {
-              await this.globalContext.addInitScript(
-                (data) => {
-                  try {
-                    if (window.location.origin === data.origin) {
-                      for (const item of data.localStorage) {
-                        window.localStorage.setItem(item.name, item.value);
-                      }
-                    }
-                  } catch (e) {
-                    console.error(
-                      "[BROWSER] Failed to set localStorage in init script:",
-                      e,
-                    );
-                  }
-                },
-                {
-                  origin: originEntry.origin,
-                  localStorage: originEntry.localStorage,
-                },
-              );
-            }
-          }
-          console.log(
-            `[BROWSER] Registered localStorage init scripts for ${authData.origins.length} origins from auth.json`,
-          );
-        }
+        const count = await this.applyAuthData(authData, context);
+        console.log(
+          `[BROWSER] Loaded legacy ${path.basename(authPath)} (${count.cookies} cookies, ${count.origins} origins). Consider migrating to auth/<domain>.json.`,
+        );
       } catch (error) {
-        console.error(`[BROWSER] Error loading auth.json:`, error);
+        console.error(`[BROWSER] Error loading ${authPath}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Apply a single Playwright storageState blob to the given context.
+   * Returns the number of cookies and origins applied for logging.
+   */
+  private async applyAuthData(
+    authData: {
+      cookies?: unknown[];
+      origins?: Array<{ origin?: string; localStorage?: unknown[] }>;
+    },
+    context: BrowserContext,
+  ): Promise<{ cookies: number; origins: number }> {
+    let cookieCount = 0;
+    if (Array.isArray(authData.cookies)) {
+      await context.addCookies(
+        authData.cookies as Parameters<BrowserContext["addCookies"]>[0],
+      );
+      cookieCount = authData.cookies.length;
+    }
+
+    let originCount = 0;
+    if (Array.isArray(authData.origins)) {
+      for (const originEntry of authData.origins) {
+        if (originEntry.origin && Array.isArray(originEntry.localStorage)) {
+          await context.addInitScript(
+            (data: {
+              origin: string;
+              localStorage: Array<{ name: string; value: string }>;
+            }) => {
+              try {
+                if (window.location.origin === data.origin) {
+                  for (const item of data.localStorage) {
+                    window.localStorage.setItem(item.name, item.value);
+                  }
+                }
+              } catch (e) {
+                console.error(
+                  "[BROWSER] Failed to set localStorage in init script:",
+                  e,
+                );
+              }
+            },
+            {
+              origin: originEntry.origin,
+              localStorage: originEntry.localStorage as Array<{
+                name: string;
+                value: string;
+              }>,
+            },
+          );
+          originCount++;
+        }
       }
     }
 
-    return this.globalContext;
+    return { cookies: cookieCount, origins: originCount };
   }
 
   async close(): Promise<void> {
-    if (this.globalContext) {
-      await this.globalContext.close();
-      this.globalContext = null;
+    const promise = this.contextPromise;
+    this.contextPromise = null;
+    if (promise) {
+      try {
+        const context = await promise;
+        await context.close();
+      } catch (e) {
+        // Creation may have failed; nothing to close.
+      }
     }
   }
 }

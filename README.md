@@ -108,12 +108,18 @@ You can customize the application behavior using the following environment varia
 | `SCRAPER_TIMEOUT` | `15000` | Timeout in milliseconds for navigation and page loading. |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Timeout in milliseconds when waiting for the upstream proxy connection. |
 
-### Cookie & Authentication Injection (`auth.json`)
-If the target website requires specific authentication cookies or local storage states, copy the `auth.json.example` template to `auth.json` and populate it:
+### Cookie & Authentication Injection (`auth/`)
+If the target website requires specific authentication cookies or local storage states, manage them as **per-domain files** under the `auth/` directory. Each file is a Playwright `storageState` blob (`{ cookies, origins }`) named after the site hostname.
+
 ```bash
-cp auth.json.example auth.json
+# From the project root
+mkdir -p auth
+cp auth/auth.example.json auth/example.com.json   # then edit the copied file
 ```
-The browser will automatically load these cookies and local storage variables on initialization.
+
+On startup the browser loads every `auth/*.json` file (skipping `*.example.json`) and applies each one's cookies and local storage to the shared browser context. Cookies are scoped by their `domain` field, and local storage entries are applied only when `window.location.origin` matches, so multiple domains can coexist safely.
+
+> **Backward compatibility:** If the `auth/` directory does not exist, the service falls back to a single legacy `auth.json` at the project root (or `USER_DATA_DIR`). Prefer the per-domain layout for new setups.
 
 #### How to Export Session Data from Chrome
 You can easily export your active session's cookies and local storage directly from your browser console:
@@ -121,9 +127,9 @@ You can easily export your active session's cookies and local storage directly f
 1. Log in to the target website on Google Chrome.
 2. Open Developer Tools (`F12` or `Cmd + Option + I` on macOS) and click the **Console** tab.
 3. Open the file `scripts/export-auth.js` in this project, copy its entire contents, paste it into the browser console, and press **Enter**.
-4. The JSON formatted session state is automatically copied to your clipboard. Simply open `auth.json` in your project root and paste (`Ctrl+V` / `Cmd+V`) the contents there.
+4. The JSON formatted session state is automatically copied to your clipboard. Create `auth/<hostname>.json` (e.g. `auth/dlhd.pk.json`) in your project root and paste (`Ctrl+V` / `Cmd+V`) the contents there. Use `auth/auth.example.json` as a template.
 
-> ⚠️ **Note on Secure Cookies (HttpOnly)**: JavaScript cannot read cookies marked with the `HttpOnly` flag. If the target website relies on `HttpOnly` cookies for authentication, please use an extension like **Cookie-Editor** to export all cookies as JSON, and copy them directly into the `"cookies"` array in your `auth.json`.
+> ⚠️ **Note on Secure Cookies (HttpOnly)**: JavaScript cannot read cookies marked with the `HttpOnly` flag. If the target website relies on `HttpOnly` cookies for authentication, please use an extension like **Cookie-Editor** to export all cookies as JSON, and copy them directly into the `"cookies"` array of that domain's file.
 
 ---
 
