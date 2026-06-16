@@ -34,11 +34,11 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
 # ---------------------------------------------------------------------------
-# 2. Install Google Chrome (with codecs) + its apt dependencies via Playwright.
-#    Placed AFTER `bun install` so a Playwright version bump in package.json
-#    invalidates this layer and re-downloads the matching browser build.
+# 2. Install Chromium from Debian Repository (supports H.264/AAC & ARM64/AMD64)
 # ---------------------------------------------------------------------------
-RUN bunx playwright install --with-deps chrome
+RUN apt-get update && apt-get install -y \
+    chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
 # 3. Copy application source.
