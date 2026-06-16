@@ -38,6 +38,7 @@ services:
     # (owned by appuser), so the non-root process can write to it.
     volumes:
       - user_data:/app/user_data
+      - ./auth.json:/app/auth.json:ro
 
     # Override the Dockerfile's healthcheck timing if you need; otherwise
     # the image's defaults apply (every 30s, 30s grace on start).
