@@ -170,7 +170,7 @@ export class ScraperService {
     // Prefer master > playlist > mono > any m3u8 > mp4/mkv.
     // ping.gif is a common analytics beacon that falsely matches .m3u8 via
     // query params on some CDNs, so we explicitly exclude it.
-    const selectedReq = requests.find((r) => r.url.includes("index.m3u8"));
+    const selectedReq = requests.find((r) => r.url.includes(".m3u8"));
 
     logger.info(
       `Total requests captured: ${requests.length}`,
@@ -205,7 +205,7 @@ export class ScraperService {
         }
         const res = await fetch(selectedReq.url, {
           headers,
-          signal: AbortSignal.timeout(5000),
+          signal: AbortSignal.timeout(10000),
         });
         if (res.ok) {
           playlistBody = await res.text();
