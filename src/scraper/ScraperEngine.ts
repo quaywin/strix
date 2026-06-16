@@ -101,12 +101,8 @@ export class ScraperEngine {
 
           const handleRequest = (req: Request) => {
             const reqUrl = req.url();
-            if (
-              reqUrl.includes(".m3u8") ||
-              reqUrl.includes(".vtt") ||
-              reqUrl.includes(".srt") ||
-              reqUrl.match(/\.(mp4|mkv|webm|avi|mov|flv)(\?|$)/i)
-            ) {
+            if (reqUrl.includes("index.m3u8")) {
+              console.log(reqUrl);
               requests.push({
                 url: reqUrl,
                 method: req.method(),
@@ -114,9 +110,7 @@ export class ScraperEngine {
                 resource_type: req.resourceType(),
                 post_data: req.postData(),
               });
-              if (reqUrl.includes(".m3u8")) {
-                finalResolve();
-              }
+              finalResolve();
             }
           };
 
