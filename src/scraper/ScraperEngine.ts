@@ -44,9 +44,47 @@ export class ScraperEngine {
 
     return new Promise((resolve) => {
       let resolved = false;
+      let acquired = false;
+
+      const cleanup = async () => {
+        for (const id of activeTimeouts) clearTimeout(id);
+        activeTimeouts.clear();
+        if (page) {
+          try {
+            await page.close();
+            page = null;
+          } catch (e) {
+            console.error(`[SCRAPER] Error closing page: ${e}`);
+          }
+        }
+        if (acquired) {
+          await this.browserProvider.releaseContext();
+          acquired = false;
+        }
+      };
+
+      const finalResolve = async () => {
+        if (resolved) return;
+        resolved = true;
+        console.log(`[SCRAPER] m3u8 captured or timeout reached for ${url}`);
+
+        await Promise.race([Promise.all(responsePromises), trackedSleep(2000)]);
+        await cleanup();
+        resolve(requests);
+      };
+
+      trackedTimeout(
+        () => {
+          console.log(`[SCRAPER] Global safety timeout reached for ${url}`);
+          finalResolve();
+        },
+        (timeoutSec + 10) * 1000,
+      );
+
       (async () => {
         try {
-          const context = await this.browserProvider.getBrowserContext();
+          const context = await this.browserProvider.acquireContext();
+          acquired = true;
           page = await context.newPage();
 
           // Log browser console errors/warnings and uncaught page exceptions
@@ -63,49 +101,9 @@ export class ScraperEngine {
             console.error(`[BROWSER ERROR] ${err.message}`);
           });
 
-          const cleanup = async () => {
-            for (const id of activeTimeouts) clearTimeout(id);
-            activeTimeouts.clear();
-            if (page) {
-              try {
-                await page.close();
-                page = null;
-              } catch (e) {
-                console.error(`[SCRAPER] Error closing page: ${e}`);
-              }
-            }
-          };
-
-          const finalResolve = async () => {
-            if (resolved) return;
-            resolved = true;
-            console.log(
-              `[SCRAPER] m3u8 captured or timeout reached for ${url}`,
-            );
-
-            await Promise.race([
-              Promise.all(responsePromises),
-              trackedSleep(2000),
-            ]);
-            await cleanup();
-            resolve(requests);
-          };
-
-          trackedTimeout(
-            () => {
-              console.log(`[SCRAPER] Global safety timeout reached for ${url}`);
-              finalResolve();
-            },
-            (timeoutSec + 10) * 1000,
-          );
-
           const handleRequest = (req: Request) => {
             const reqUrl = req.url();
-            if (
-              reqUrl.includes("index.m3u8") ||
-              reqUrl.includes("master.m3u8")
-            ) {
-              console.log(reqUrl);
+            if (reqUrl.includes("index.m3u8")) {
               requests.push({
                 url: reqUrl,
                 method: req.method(),
@@ -212,6 +210,7 @@ export class ScraperEngine {
           await finalResolve();
         } catch (e) {
           console.error(`[SCRAPER] Error during scraping ${url}: ${e}`);
+          await cleanup();
           resolve([]);
         }
       })();
@@ -224,7 +223,8 @@ export class ScraperEngine {
    * the underlying provider dedups via a promise-based singleton.
    */
   async warmup(): Promise<void> {
-    await this.browserProvider.getBrowserContext();
+    const context = await this.browserProvider.acquireContext();
+    await this.browserProvider.releaseContext();
   }
 
   async close(): Promise<void> {

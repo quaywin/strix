@@ -62,10 +62,5 @@ ENV PORT=3001 \
 
 EXPOSE 3001
 
-# Healthcheck: hit the root endpoint. Uses Bun directly (no curl/wget needed
-# in the image). Reads PORT from env so it stays correct if overridden.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD bun -e "fetch('http://localhost:'+(process.env.PORT||'3001')+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-
 # The Elysia server reads CONFIG.PORT at startup and listens on that port.
 CMD ["bun", "run", "index.ts"]

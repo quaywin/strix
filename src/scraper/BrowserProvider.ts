@@ -77,17 +77,50 @@ export class PlaywrightBrowserProvider {
   // with the first request) await the SAME in-flight creation instead of
   // each spawning a separate browser context.
   private contextPromise: Promise<BrowserContext> | null = null;
+  private activeCount = 0;
+  private idleTimeout: NodeJS.Timeout | null = null;
+  private readonly IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-  async getBrowserContext(): Promise<BrowserContext> {
+  async acquireContext(): Promise<BrowserContext> {
+    if (this.idleTimeout) {
+      clearTimeout(this.idleTimeout);
+      this.idleTimeout = null;
+    }
+    this.activeCount++;
+
     if (!this.contextPromise) {
+      console.log("[BROWSER] Launching browser context...");
       this.contextPromise = this.createContext().catch((err) => {
         // Clear the cached promise on failure so the next call can retry
         // creation instead of all future callers permanently rejecting.
         this.contextPromise = null;
+        this.activeCount = Math.max(0, this.activeCount - 1);
         throw err;
       });
     }
     return this.contextPromise;
+  }
+
+  async releaseContext(): Promise<void> {
+    this.activeCount = Math.max(0, this.activeCount - 1);
+
+    if (this.activeCount === 0 && this.contextPromise) {
+      if (this.idleTimeout) {
+        clearTimeout(this.idleTimeout);
+      }
+      this.idleTimeout = setTimeout(() => {
+        console.log(
+          "[BROWSER] Idle for 5 minutes. Closing browser context to free resources...",
+        );
+        this.close().catch((err) => {
+          console.error("[BROWSER] Error closing idle browser context:", err);
+        });
+      }, this.IDLE_TIMEOUT_MS);
+    }
+  }
+
+  async getBrowserContext(): Promise<BrowserContext> {
+    return this.acquireContext();
   }
 
   private async createContext(): Promise<BrowserContext> {
@@ -257,10 +290,16 @@ export class PlaywrightBrowserProvider {
   async close(): Promise<void> {
     const promise = this.contextPromise;
     this.contextPromise = null;
+    this.activeCount = 0;
+    if (this.idleTimeout) {
+      clearTimeout(this.idleTimeout);
+      this.idleTimeout = null;
+    }
     if (promise) {
       try {
         const context = await promise;
         await context.close();
+        console.log("[BROWSER] Browser context closed successfully.");
       } catch (e) {
         // Creation may have failed; nothing to close.
       }
