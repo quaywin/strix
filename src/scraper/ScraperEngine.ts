@@ -101,7 +101,10 @@ export class ScraperEngine {
 
           const handleRequest = (req: Request) => {
             const reqUrl = req.url();
-            if (reqUrl.includes("index.m3u8")) {
+            if (
+              reqUrl.includes("index.m3u8") ||
+              reqUrl.includes("master.m3u8")
+            ) {
               console.log(reqUrl);
               requests.push({
                 url: reqUrl,
