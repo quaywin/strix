@@ -129,22 +129,30 @@ export class PlaywrightBrowserProvider {
       CONFIG.USER_DATA_DIR ||
       path.join(os.tmpdir(), "playwright_profile_strix");
 
+    const args = [
+      "--disable-blink-features=AutomationControlled",
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-web-security",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--disable-site-isolation-trials",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--no-zygote",
+      "--lang=en-US,en;q=0.9",
+      "--window-size=1920,1080",
+    ];
+
+    if (CONFIG.HEADLESS) {
+      args.push("--headless=new");
+    }
+
     const launchOptions = {
-      headless: true,
+      headless: CONFIG.HEADLESS,
       userAgent: USER_AGENT,
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-site-isolation-trials",
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-zygote",
-      ],
+      args,
     };
 
     if (chromePath) {
@@ -159,11 +167,35 @@ export class PlaywrightBrowserProvider {
       console.log(`[BROWSER] Using proxy server: ${CONFIG.PROXY_SERVER}`);
     }
 
+    console.log(
+      `[BROWSER] Headless mode is set to: ${CONFIG.HEADLESS} (executable: ${chromePath || "bundled chromium"})`,
+    );
+
     const context = await chromium.launchPersistentContext(
       userDataDir,
       launchOptions,
     );
     await context.addInitScript(STEALTH_INIT_SCRIPT);
+
+    // Auto reset the singleton context when it closes or crashes
+    context.on("close", () => {
+      console.log(
+        "[BROWSER] Browser context closed or crashed. Resetting singleton...",
+      );
+      if (this.contextPromise) {
+        this.contextPromise
+          .then((ctx) => {
+            if (ctx === context) {
+              this.contextPromise = null;
+              this.activeCount = 0;
+            }
+          })
+          .catch(() => {
+            this.contextPromise = null;
+            this.activeCount = 0;
+          });
+      }
+    });
 
     // Load auth state (per-domain files in auth/, with legacy auth.json fallback)
     await this.loadAuthState(userDataDir, context);

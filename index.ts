@@ -8,10 +8,10 @@ import {
 } from "./src/services/scraper.service";
 
 const handleScrapeStream = async (
-  query: { url?: string; proxy?: string },
+  query: { url?: string; proxy?: string; sub?: string },
   request: Request,
 ): Promise<Response> => {
-  const { url, proxy } = query;
+  const { url, proxy, sub } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -19,12 +19,13 @@ const handleScrapeStream = async (
     });
   }
   const wantProxy = proxy === "1" || proxy === "true";
+  const wantSub = sub === "1" || sub === "true";
   // Forward the client Range header in proxy mode so mp4/mkv clients can
   // seek; ignored for non-proxy mode (we just 302 to the stream URL).
   const range = request.headers.get("range");
   try {
     if (!wantProxy) {
-      const streamUrl = await scraperService.extractStreamUrl(url);
+      const streamUrl = await scraperService.extractStreamUrl(url, wantSub);
       return Response.redirect(streamUrl, 302);
     }
 
@@ -33,7 +34,7 @@ const handleScrapeStream = async (
     // expired); we invalidate the cache, re-scrape once, and retry exactly
     // one time. Further failures surface as a 502 to the client.
     const proxyOnce = async (): Promise<Response> => {
-      const streamUrl = await scraperService.extractStreamUrl(url);
+      const streamUrl = await scraperService.extractStreamUrl(url, wantSub);
       const upstream = await fetch(streamUrl, {
         signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
         headers: range ? { range } : undefined,
@@ -109,13 +110,13 @@ const app = new Elysia()
   .get("/", () => "strix")
   .get("/scrape-stream", async ({ query, request }) => {
     return handleScrapeStream(
-      query as { url?: string; proxy?: string },
+      query as { url?: string; proxy?: string; sub?: string },
       request,
     );
   })
   .get("/scrape-stream/:filename", async ({ query, request }) => {
     return handleScrapeStream(
-      query as { url?: string; proxy?: string },
+      query as { url?: string; proxy?: string; sub?: string },
       request,
     );
   })

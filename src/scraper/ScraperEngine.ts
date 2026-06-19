@@ -24,12 +24,15 @@ export class ScraperEngine {
   async collectRequests(
     url: string,
     timeoutSec: number = CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
+    resolveM3u8Body: boolean = false,
   ): Promise<RequestData[]> {
-    const requests: RequestData[] = [];
+    const requestsMap = new Map<string, RequestData>();
     const responsePromises: Promise<void>[] = [];
-    let page: Page | null = null;
     const activeTimeouts = new Set<NodeJS.Timeout>();
+    let page: Page | null = null;
+    let acquired = false;
 
+    // Helper to track timeouts for easy cleanup
     const trackedTimeout = (fn: () => void, ms: number): NodeJS.Timeout => {
       const id = setTimeout(() => {
         activeTimeouts.delete(id);
@@ -42,137 +45,140 @@ export class ScraperEngine {
     const trackedSleep = (ms: number): Promise<void> =>
       new Promise((r) => trackedTimeout(r, ms));
 
-    return new Promise((resolve) => {
-      let resolved = false;
-      let acquired = false;
+    // A signal promise to resolve the function when we are done (success or timeout)
+    let resolveDone: () => void;
+    const donePromise = new Promise<void>((r) => {
+      resolveDone = r;
+    });
 
-      const cleanup = async () => {
-        for (const id of activeTimeouts) clearTimeout(id);
-        activeTimeouts.clear();
-        if (page) {
-          try {
-            await page.close();
-            page = null;
-          } catch (e) {
-            console.error(`[SCRAPER] Error closing page: ${e}`);
+    let isDone = false;
+    const markDone = () => {
+      if (isDone) return;
+      isDone = true;
+      resolveDone();
+    };
+
+    // Global safety timeout
+    trackedTimeout(() => {
+      console.log(`[SCRAPER] Global safety timeout reached for ${url}`);
+      markDone();
+    }, (timeoutSec + 10) * 1000);
+
+    try {
+      const context = await this.browserProvider.acquireContext();
+      acquired = true;
+      page = await context.newPage();
+
+      // Block ads, trackers, images, and fonts to save memory and bandwidth
+      await page.route("**/*", (route) => {
+        const req = route.request();
+        const type = req.resourceType();
+        const reqUrl = req.url().toLowerCase();
+
+        const shouldBlock =
+          type === "image" ||
+          type === "font" ||
+          reqUrl.includes("google-analytics.com") ||
+          reqUrl.includes("doubleclick.net") ||
+          reqUrl.includes("adservice") ||
+          reqUrl.includes("scorecardresearch") ||
+          reqUrl.includes("quantserve") ||
+          reqUrl.includes("popads") ||
+          reqUrl.includes("popunder") ||
+          reqUrl.includes("exoclick");
+
+        if (shouldBlock) {
+          route.abort().catch(() => {});
+        } else {
+          route.continue().catch(() => {});
+        }
+      });
+
+      // Handle requests
+      page.on("request", (req: Request) => {
+        const reqUrl = req.url();
+        if (reqUrl.includes("index.m3u8")) {
+          requestsMap.set(reqUrl, {
+            url: reqUrl,
+            method: req.method(),
+            headers: req.headers(),
+            resource_type: req.resourceType(),
+            post_data: req.postData(),
+          });
+          // Found the target m3u8 request, signal completion
+          markDone();
+        }
+      });
+
+      // Handle responses if body resolution is required
+      page.on("response", (response: Response) => {
+        const resUrl = response.url();
+        const status = response.status();
+
+        if (status >= 400) {
+          console.log(`[BROWSER HTTP ERROR] ${status} for URL: ${resUrl}`);
+        }
+
+        if (resolveM3u8Body && resUrl.includes(".m3u8")) {
+          // If the request isn't registered yet, pre-register it to avoid race condition
+          if (!requestsMap.has(resUrl)) {
+            const req = response.request();
+            requestsMap.set(resUrl, {
+              url: resUrl,
+              method: req.method(),
+              headers: req.headers(),
+              resource_type: req.resourceType(),
+              post_data: req.postData(),
+            });
           }
-        }
-        if (acquired) {
-          await this.browserProvider.releaseContext();
-          acquired = false;
-        }
-      };
 
-      const finalResolve = async () => {
-        if (resolved) return;
-        resolved = true;
-        console.log(`[SCRAPER] m3u8 captured or timeout reached for ${url}`);
-
-        await Promise.race([Promise.all(responsePromises), trackedSleep(2000)]);
-        await cleanup();
-        resolve(requests);
-      };
-
-      trackedTimeout(
-        () => {
-          console.log(`[SCRAPER] Global safety timeout reached for ${url}`);
-          finalResolve();
-        },
-        (timeoutSec + 10) * 1000,
-      );
-
-      (async () => {
-        try {
-          const context = await this.browserProvider.acquireContext();
-          acquired = true;
-          page = await context.newPage();
-
-          // Log browser console errors/warnings and uncaught page exceptions
-          page.on("console", (msg) => {
-            const type = msg.type();
-            if (type === "error" || type === "warning") {
-              console.log(
-                `[BROWSER CONSOLE] [${type.toUpperCase()}] ${msg.text()}`,
+          const p = (async () => {
+            try {
+              const text = await Promise.race([
+                response.text(),
+                new Promise<string>((_, reject) =>
+                  trackedTimeout(
+                    () => reject(new Error("Response body timeout")),
+                    5000,
+                  ),
+                ),
+              ]);
+              const reqData = requestsMap.get(resUrl);
+              if (reqData) {
+                reqData.body = text;
+              }
+            } catch (e) {
+              console.warn(
+                `[SCRAPER] Failed to get response body for ${resUrl}: ${(e as Error).message}`,
               );
             }
-          });
+          })();
+          responsePromises.push(p);
+        }
+      });
 
-          page.on("pageerror", (err) => {
-            console.error(`[BROWSER ERROR] ${err.message}`);
-          });
+      // Start play button clicker background job (polling click)
+      const clickPlayJob = async () => {
+        const selectors = [
+          ".vjs-big-play-button",
+          ".player-play-button",
+          "#play-button",
+          ".play-button",
+          '[aria-label="Play"]',
+          ".fptplay-player-play",
+          ".play-icon",
+        ];
 
-          const handleRequest = (req: Request) => {
-            const reqUrl = req.url();
-            if (reqUrl.includes("index.m3u8")) {
-              requests.push({
-                url: reqUrl,
-                method: req.method(),
-                headers: req.headers(),
-                resource_type: req.resourceType(),
-                post_data: req.postData(),
-              });
-              finalResolve();
-            }
-          };
+        // Poll and click play buttons every 500ms for up to 8 seconds
+        for (let i = 0; i < 16; i++) {
+          if (isDone || !page) break;
 
-          const handleResponse = (response: Response) => {
-            const resUrl = response.url();
-            const status = response.status();
-
-            if (status >= 400) {
-              console.log(`[BROWSER HTTP ERROR] ${status} for URL: ${resUrl}`);
-            }
-
-            if (resUrl.includes(".m3u8")) {
-              const p = (async () => {
+          try {
+            const frames = page.frames();
+            await Promise.all(
+              frames.map(async (frame) => {
                 try {
-                  const text = await Promise.race([
-                    response.text(),
-                    new Promise<string>((_, reject) =>
-                      trackedTimeout(
-                        () => reject(new Error("Response body timeout")),
-                        5000,
-                      ),
-                    ),
-                  ]);
-                  const req = requests.find((r) => r.url === resUrl);
-                  if (req) {
-                    req.body = text;
-                  }
-                } catch (e) {
-                  console.warn(
-                    `[SCRAPER] Failed to get response body for ${resUrl}: ${(e as Error).message}`,
-                  );
-                }
-              })();
-              responsePromises.push(p);
-            }
-          };
-
-          page.on("request", handleRequest);
-          page.on("response", handleResponse);
-
-          await page.goto(url, {
-            timeout: timeoutSec * 1000,
-            waitUntil: "domcontentloaded",
-          });
-
-          if (!resolved) {
-            await trackedSleep(5000);
-          }
-
-          if (!resolved) {
-            const clickPlay = async (frame: Frame) => {
-              try {
-                const selectors = [
-                  ".vjs-big-play-button",
-                  ".player-play-button",
-                  "#play-button",
-                  ".play-button",
-                  '[aria-label="Play"]',
-                ];
-                await Promise.race([
-                  frame.evaluate((selectors: string[]) => {
+                  await frame.evaluate((selectors: string[]) => {
                     for (const selector of selectors) {
                       const btns = document.querySelectorAll(selector);
                       btns.forEach((btn) => {
@@ -180,41 +186,91 @@ export class ScraperEngine {
                           btn &&
                           typeof (btn as HTMLElement).click === "function"
                         ) {
-                          (btn as HTMLElement).click();
+                          const style = window.getComputedStyle(btn);
+                          if (
+                            style.display !== "none" &&
+                            style.visibility !== "hidden"
+                          ) {
+                            (btn as HTMLElement).click();
+                          }
                         }
                       });
                     }
-                  }, selectors),
-                  new Promise((_, reject) =>
-                    setTimeout(
-                      () => reject(new Error("Frame eval timeout")),
-                      2000,
-                    ),
-                  ),
-                ]);
-              } catch (e) {
-                console.debug(
-                  `[SCRAPER] Failed to click play button in frame: ${(e as Error).message}`,
-                );
-              }
-            };
-
-            const frames = page ? page.frames() : [];
-            await Promise.all(frames.map((frame: Frame) => clickPlay(frame)));
+                  }, selectors);
+                } catch (e) {
+                  // Ignore frame evaluation errors
+                }
+              }),
+            );
+          } catch (e) {
+            // Ignore frame list retrieval errors
           }
 
-          if (!resolved && page) {
-            await trackedSleep(3000);
-          }
-
-          await finalResolve();
-        } catch (e) {
-          console.error(`[SCRAPER] Error during scraping ${url}: ${e}`);
-          await cleanup();
-          resolve([]);
+          await Promise.race([trackedSleep(500), donePromise]);
         }
-      })();
-    });
+      };
+
+      // Start page navigation
+      const navigatePromise = page
+        .goto(url, {
+          timeout: timeoutSec * 1000,
+          waitUntil: "domcontentloaded",
+        })
+        .catch((err) => {
+          if (!isDone) {
+            console.error(
+              `[SCRAPER] Navigation error for ${url}: ${err.message}`,
+            );
+          }
+        });
+
+      // Execute navigation and click-play polling in parallel, racing with donePromise
+      await Promise.race([
+        Promise.all([navigatePromise, clickPlayJob()]),
+        donePromise,
+      ]);
+
+      // If we haven't resolved yet, wait a short additional time for requests to complete
+      if (!isDone) {
+        await Promise.race([trackedSleep(3000), donePromise]);
+      }
+    } catch (e) {
+      console.error(`[SCRAPER] Error during scraping ${url}: ${e}`);
+    } finally {
+      // Mark done to release any pending promise races
+      markDone();
+
+      // Clear all active timeouts
+      for (const id of activeTimeouts) {
+        clearTimeout(id);
+      }
+      activeTimeouts.clear();
+
+      // Wait for any pending response body resolution promises to settle (or timeout after 2s)
+      if (responsePromises.length > 0) {
+        await Promise.race([
+          Promise.all(responsePromises),
+          new Promise((r) => setTimeout(r, 2000)),
+        ]).catch(() => {});
+      }
+
+      // Clean up browser page and context
+      if (page) {
+        try {
+          await page.close();
+        } catch (e) {
+          console.error(`[SCRAPER] Error closing page: ${e}`);
+        }
+      }
+      if (acquired) {
+        await this.browserProvider.releaseContext();
+      }
+    }
+
+    console.log(
+      `[SCRAPER] Finished scraping ${url}, found ${requestsMap.size} requests`,
+    );
+    return Array.from(requestsMap.values());
   }
 
   /**
@@ -223,7 +279,7 @@ export class ScraperEngine {
    * the underlying provider dedups via a promise-based singleton.
    */
   async warmup(): Promise<void> {
-    const context = await this.browserProvider.acquireContext();
+    await this.browserProvider.acquireContext();
     await this.browserProvider.releaseContext();
   }
 
