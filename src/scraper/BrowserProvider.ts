@@ -78,14 +78,8 @@ export class PlaywrightBrowserProvider {
   // each spawning a separate browser context.
   private contextPromise: Promise<BrowserContext> | null = null;
   private activeCount = 0;
-  private idleTimeout: NodeJS.Timeout | null = null;
-  private readonly IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
   async acquireContext(): Promise<BrowserContext> {
-    if (this.idleTimeout) {
-      clearTimeout(this.idleTimeout);
-      this.idleTimeout = null;
-    }
     this.activeCount++;
 
     if (!this.contextPromise) {
@@ -103,20 +97,6 @@ export class PlaywrightBrowserProvider {
 
   async releaseContext(): Promise<void> {
     this.activeCount = Math.max(0, this.activeCount - 1);
-
-    if (this.activeCount === 0 && this.contextPromise) {
-      if (this.idleTimeout) {
-        clearTimeout(this.idleTimeout);
-      }
-      this.idleTimeout = setTimeout(() => {
-        console.log(
-          "[BROWSER] Idle for 5 minutes. Closing browser context to free resources...",
-        );
-        this.close().catch((err) => {
-          console.error("[BROWSER] Error closing idle browser context:", err);
-        });
-      }, this.IDLE_TIMEOUT_MS);
-    }
   }
 
   async getBrowserContext(): Promise<BrowserContext> {
@@ -323,10 +303,6 @@ export class PlaywrightBrowserProvider {
     const promise = this.contextPromise;
     this.contextPromise = null;
     this.activeCount = 0;
-    if (this.idleTimeout) {
-      clearTimeout(this.idleTimeout);
-      this.idleTimeout = null;
-    }
     if (promise) {
       try {
         const context = await promise;
