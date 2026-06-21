@@ -19,6 +19,13 @@ import { CONFIG } from "../config";
  * Source: adapted from the debug_dlhd.ts experiment in qIPTV.
  */
 const STEALTH_INIT_SCRIPT = `
+  // Mock visibility state to prevent video players from pausing or delaying streams in headless mode
+  Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+  Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+  const blockVisibility = (e) => { e.stopImmediatePropagation(); };
+  document.addEventListener('visibilitychange', blockVisibility, true);
+  document.addEventListener('webkitvisibilitychange', blockVisibility, true);
+
   Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
   Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
@@ -116,7 +123,6 @@ export class PlaywrightBrowserProvider {
       "--disable-web-security",
       "--disable-features=IsolateOrigins,site-per-process",
       "--disable-site-isolation-trials",
-      "--disable-gpu",
       "--disable-dev-shm-usage",
       "--no-first-run",
       "--no-default-browser-check",

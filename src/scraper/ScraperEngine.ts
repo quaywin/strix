@@ -169,10 +169,8 @@ export class ScraperEngine {
           ".play-icon",
         ];
 
-        // Poll and click play buttons every 500ms for up to 8 seconds
-        for (let i = 0; i < 16; i++) {
-          if (isDone || !page) break;
-
+        // Poll and click play buttons every 500ms while scraping is active
+        while (!isDone && page) {
           try {
             const frames = page.frames();
             await Promise.all(
@@ -210,6 +208,8 @@ export class ScraperEngine {
         }
       };
 
+      const startTime = Date.now();
+
       // Start page navigation
       const navigatePromise = page
         .goto(url, {
@@ -224,15 +224,17 @@ export class ScraperEngine {
           }
         });
 
-      // Execute navigation and click-play polling in parallel, racing with donePromise
-      await Promise.race([
-        Promise.all([navigatePromise, clickPlayJob()]),
-        donePromise,
-      ]);
+      // Start clickPlayJob in background (non-blocking)
+      clickPlayJob();
 
-      // If we haven't resolved yet, wait a short additional time for requests to complete
+      // Execute navigation and wait for donePromise to resolve
+      await Promise.race([navigatePromise, donePromise]);
+
+      // If we haven't resolved yet, wait for the remaining timeout duration (minimum 3 seconds fallback)
       if (!isDone) {
-        await Promise.race([trackedSleep(3000), donePromise]);
+        const elapsed = Date.now() - startTime;
+        const remainingTimeout = Math.max(3000, (timeoutSec * 1000) - elapsed);
+        await Promise.race([trackedSleep(remainingTimeout), donePromise]);
       }
     } catch (e) {
       console.error(`[SCRAPER] Error during scraping ${url}: ${e}`);
