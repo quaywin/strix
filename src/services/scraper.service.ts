@@ -1,12 +1,17 @@
 import { CONFIG } from "../config";
 import { logger } from "../logger";
+import { StrmFreeExtractor } from "../scraper/extractors/StrmFreeExtractor";
 import { scraperEngine } from "../scraper/ScraperEngine";
+import { smartFetch } from "../utils/http";
 
 class TtlCache<T> {
   private cache = new Map<string, { value: T; expiresAt: number }>();
   private cleanupInterval: NodeJS.Timeout;
 
-  constructor(private defaultTtlMs: number) {
+  constructor(
+    private defaultTtlMs: number,
+    private maxSize: number = CONFIG.CACHE_MAX_ITEMS,
+  ) {
     // Periodic cleanup every 10 minutes to avoid memory leaks
     this.cleanupInterval = setInterval(() => this.cleanup(), 10 * 60 * 1000);
     // Allow Node/Bun process to exit even if interval is active
@@ -26,6 +31,13 @@ class TtlCache<T> {
   }
 
   set(key: string, value: T, ttlMs: number = this.defaultTtlMs): void {
+    if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
+      // Evict oldest entry (first key in Map insertion order) to cap memory usage
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.cache.delete(oldestKey);
+      }
+    }
     this.cache.set(key, { value, expiresAt: Date.now() + ttlMs });
   }
 
@@ -47,8 +59,13 @@ class TtlCache<T> {
   }
 }
 
+export interface ExtractedStreamResult {
+  url: string;
+  headers?: Record<string, string>;
+}
+
 // Global cache instance
-const streamCache = new TtlCache<string>(CONFIG.CACHE_TTL_MS);
+const streamCache = new TtlCache<ExtractedStreamResult>(CONFIG.CACHE_TTL_MS);
 
 /**
  * Thrown when the scraper could not find any playable stream URL on the
@@ -67,13 +84,18 @@ const FORBIDDEN_HEADERS = new Set([
   "connection",
   "content-length",
   "accept-encoding",
+  "transfer-encoding",
+  "keep-alive",
 ]);
 
 export class ScraperService {
+  // Deduplicates concurrent in-flight scrapes for the exact same stream (Thundering Herd protection)
+  private inFlightScrapes = new Map<string, Promise<ExtractedStreamResult>>();
+
   /**
    * Removes the cached stream URL for a given source page. Used by callers
    * (e.g. the proxy handler) when a previously cached URL turns out to be
-   * stale (e.g. upstream returned 403) so the next extractStreamUrl() call
+   * stale (e.g. upstream returned 403) so the next extractStream() call
    * performs a fresh scrape.
    */
   invalidateCache(url: string): void {
@@ -191,20 +213,94 @@ export class ScraperService {
 
   /**
    * Visits the given page in a real (stealth) browser, waits for media
-   * requests, and returns the best .m3u8 (or mp4/mkv as a fallback) URL it
-   * can find. Result is cached for CONFIG.CACHE_TTL_MS.
+   * requests, and returns the best .m3u8 (or mp4/mkv as a fallback) URL and
+   * captured dynamic request headers. Result is cached for CONFIG.CACHE_TTL_MS.
    */
-  async extractStreamUrl(url: string, sub: boolean = false): Promise<string> {
+  async extractStream(
+    url: string,
+    sub: boolean = false,
+  ): Promise<ExtractedStreamResult> {
     const cacheKey = `extract:${url}:sub:${sub}`;
     const cached = streamCache.get(cacheKey);
     if (cached) {
       return cached;
     }
 
+    // Coalesce concurrent in-flight requests for the exact same stream (Thundering Herd protection)
+    const existingInFlight = this.inFlightScrapes.get(cacheKey);
+    if (existingInFlight) {
+      logger.info(
+        `Coalescing concurrent request for: ${url} (waiting for existing in-flight scrape)`,
+        "ScraperService",
+      );
+      return existingInFlight;
+    }
+
+    const scrapePromise = this.doExtractStream(url, sub, cacheKey);
+    this.inFlightScrapes.set(cacheKey, scrapePromise);
+
+    try {
+      return await scrapePromise;
+    } finally {
+      this.inFlightScrapes.delete(cacheKey);
+    }
+  }
+
+  private async doExtractStream(
+    url: string,
+    sub: boolean,
+    cacheKey: string,
+  ): Promise<ExtractedStreamResult> {
     logger.info(
       `Extracting raw stream URL for: ${url} (sub=${sub})`,
       "ScraperService",
     );
+
+    // Fast-path: try specialized direct HTTP extractor if available
+    if (StrmFreeExtractor.canHandle(url)) {
+      try {
+        logger.info(
+          `Attempting direct HTTP extraction for: ${url}`,
+          "ScraperService",
+        );
+        const extracted = await StrmFreeExtractor.extract(url);
+        if (extracted?.url) {
+          let streamUrl = extracted.url;
+          if (sub && streamUrl.includes(".m3u8")) {
+            try {
+              const res = await smartFetch(streamUrl, {
+                headers: extracted.headers,
+                signal: AbortSignal.timeout(5000),
+              });
+              if (res.ok) {
+                const body = await res.text();
+                streamUrl = this.resolveM3u8Playlist(streamUrl, body);
+              }
+            } catch (e) {
+              logger.warn(
+                `Direct extractor sub-resolution failed: ${(e as Error).message}`,
+                "ScraperService",
+              );
+            }
+          }
+          const result: ExtractedStreamResult = {
+            url: streamUrl,
+            headers: extracted.headers,
+          };
+          streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
+          logger.info(
+            `Extracted stream URL via direct extractor: ${streamUrl}`,
+            "ScraperService",
+          );
+          return result;
+        }
+      } catch (e) {
+        logger.warn(
+          `Direct extractor failed for ${url}, falling back to browser scraper: ${(e as Error).message}`,
+          "ScraperService",
+        );
+      }
+    }
 
     const requests = await scraperEngine.collectRequests(
       url,
@@ -226,20 +322,25 @@ export class ScraperService {
       );
     }
 
+    const upstreamHeaders: Record<string, string> = {};
+    if (selectedReq.headers) {
+      for (const [key, value] of Object.entries(selectedReq.headers)) {
+        const lowerKey = key.toLowerCase();
+        if (!FORBIDDEN_HEADERS.has(lowerKey)) {
+          upstreamHeaders[key] = value;
+        }
+      }
+    }
+    // Fallback: if browser request had no referer, default to the page URL
+    if (!upstreamHeaders["referer"]) {
+      upstreamHeaders["referer"] = url;
+    }
+
     let playlistBody = selectedReq.body;
     if (sub && !playlistBody && selectedReq.url.includes(".m3u8")) {
       try {
-        const headers = new Headers();
-        if (selectedReq.headers) {
-          for (const [key, value] of Object.entries(selectedReq.headers)) {
-            const lowerKey = key.toLowerCase();
-            if (!FORBIDDEN_HEADERS.has(lowerKey)) {
-              headers.set(key, value);
-            }
-          }
-        }
-        const res = await fetch(selectedReq.url, {
-          headers,
+        const res = await smartFetch(selectedReq.url, {
+          headers: upstreamHeaders,
           signal: AbortSignal.timeout(10000),
         });
         if (res.ok) {
@@ -265,9 +366,14 @@ export class ScraperService {
       }
     }
 
-    streamCache.set(cacheKey, streamUrl, CONFIG.CACHE_TTL_MS);
+    const result: ExtractedStreamResult = {
+      url: streamUrl,
+      headers: upstreamHeaders,
+    };
+
+    streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
     logger.info(`Extracted stream URL: ${streamUrl}`, "ScraperService");
-    return streamUrl;
+    return result;
   }
 }
 

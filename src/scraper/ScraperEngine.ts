@@ -1,5 +1,6 @@
 import type { Frame, Page, Request, Response } from "playwright";
 import { CONFIG } from "../config";
+import { Semaphore } from "../utils/semaphore";
 import { PlaywrightBrowserProvider } from "./BrowserProvider";
 
 export interface RequestData {
@@ -20,17 +21,25 @@ export interface RequestData {
  */
 export class ScraperEngine {
   private browserProvider = new PlaywrightBrowserProvider();
+  private semaphore = new Semaphore(CONFIG.SCRAPER.MAX_CONCURRENT);
 
   async collectRequests(
     url: string,
     timeoutSec: number = CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
     resolveM3u8Body: boolean = false,
   ): Promise<RequestData[]> {
-    const requestsMap = new Map<string, RequestData>();
-    const responsePromises: Promise<void>[] = [];
-    const activeTimeouts = new Set<NodeJS.Timeout>();
-    let page: Page | null = null;
-    let acquired = false;
+    if (this.semaphore.activeCount >= this.semaphore.maxConcurrency) {
+      console.log(
+        `[SCRAPER] Concurrency limit (${this.semaphore.maxConcurrency}) reached. Queuing scrape for ${url} (queue position: ${this.semaphore.queuedCount + 1})...`,
+      );
+    }
+
+    return this.semaphore.run(async () => {
+      const requestsMap = new Map<string, RequestData>();
+      const responsePromises: Promise<void>[] = [];
+      const activeTimeouts = new Set<NodeJS.Timeout>();
+      let page: Page | null = null;
+      let acquired = false;
 
     // Helper to track timeouts for easy cleanup
     const trackedTimeout = (fn: () => void, ms: number): NodeJS.Timeout => {
@@ -97,7 +106,7 @@ export class ScraperEngine {
       // Handle requests
       page.on("request", (req: Request) => {
         const reqUrl = req.url();
-        if (reqUrl.includes("index.m3u8")) {
+        if (reqUrl.includes(".m3u8")) {
           requestsMap.set(reqUrl, {
             url: reqUrl,
             method: req.method(),
@@ -167,6 +176,12 @@ export class ScraperEngine {
           '[aria-label="Play"]',
           ".fptplay-player-play",
           ".play-icon",
+          // JWPlayer selectors
+          ".jw-display-icon-container",
+          ".jw-icon-display",
+          ".jw-preview",
+          ".jw-button-color",
+          ".jwplayer",
         ];
 
         // Poll and click play buttons every 500ms while scraping is active
@@ -194,6 +209,29 @@ export class ScraperEngine {
                         }
                       });
                     }
+
+                    // Check and trigger player APIs if present (e.g. JWPlayer)
+                    try {
+                      const win = window as any;
+                      if (typeof win.jwplayer === "function") {
+                        const jw =
+                          win.jwplayer("player") ||
+                          win.jwplayer("jwplayer") ||
+                          win.jwplayer();
+                        if (jw && typeof jw.play === "function") {
+                          const state =
+                            typeof jw.getState === "function"
+                              ? jw.getState()
+                              : "";
+                          if (state !== "playing" && state !== "buffering") {
+                            jw.play();
+                          }
+                        }
+                      }
+                      if (typeof win.Clappr === "object" || win.player?.play) {
+                        win.player?.play?.();
+                      }
+                    } catch (_) {}
                   }, selectors);
                 } catch (e) {
                   // Ignore frame evaluation errors
@@ -211,18 +249,26 @@ export class ScraperEngine {
       const startTime = Date.now();
 
       // Start page navigation
-      const navigatePromise = page
-        .goto(url, {
-          timeout: timeoutSec * 1000,
-          waitUntil: "domcontentloaded",
-        })
-        .catch((err) => {
-          if (!isDone) {
-            console.error(
-              `[SCRAPER] Navigation error for ${url}: ${err.message}`,
-            );
-          }
-        });
+      // If URL is an embed URL (e.g. /embed/, /e/, /player/), wrap in an iframe container
+      // to bypass anti-direct-access checks (where players require window.top !== window.self)
+      const isEmbedUrl = /\/(embed|e|player)(\/|\.php|\?|$)/i.test(url);
+      const navigatePromise = (
+        isEmbedUrl
+          ? page.setContent(
+              `<!DOCTYPE html><html><head><title>Strix Embed Loader</title></head><body style="margin:0;padding:0;overflow:hidden;background:#000;"><iframe src="${url}" width="100%" height="100%" style="border:none;width:100vw;height:100vh;" allow="autoplay; fullscreen; encrypted-media"></iframe></body></html>`,
+              { timeout: timeoutSec * 1000, waitUntil: "domcontentloaded" },
+            )
+          : page.goto(url, {
+              timeout: timeoutSec * 1000,
+              waitUntil: "domcontentloaded",
+            })
+      ).catch((err) => {
+        if (!isDone) {
+          console.error(
+            `[SCRAPER] Navigation error for ${url}: ${err.message}`,
+          );
+        }
+      });
 
       // Start clickPlayJob in background (non-blocking)
       clickPlayJob();
@@ -269,10 +315,11 @@ export class ScraperEngine {
       }
     }
 
-    console.log(
-      `[SCRAPER] Finished scraping ${url}, found ${requestsMap.size} requests`,
-    );
-    return Array.from(requestsMap.values());
+      console.log(
+        `[SCRAPER] Finished scraping ${url}, found ${requestsMap.size} requests`,
+      );
+      return Array.from(requestsMap.values());
+    });
   }
 
   /**

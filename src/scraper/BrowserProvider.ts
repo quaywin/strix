@@ -30,6 +30,15 @@ const STEALTH_INIT_SCRIPT = `
   Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
   Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
   window.chrome = { runtime: {} };
+
+  // Neutralize anti-embed sandbox detector (e.g. sandDetect object/PDF error trick)
+  try {
+    Object.defineProperty(window, 'sandDetect', {
+      get: () => () => {},
+      set: () => {},
+      configurable: true,
+    });
+  } catch (e) {}
   const originalQuery = window.navigator.permissions.query;
   window.navigator.permissions.query = (parameters) => (
     parameters.name === 'notifications'
@@ -85,9 +94,11 @@ export class PlaywrightBrowserProvider {
   // each spawning a separate browser context.
   private contextPromise: Promise<BrowserContext> | null = null;
   private activeCount = 0;
+  private totalUses = 0;
 
   async acquireContext(): Promise<BrowserContext> {
     this.activeCount++;
+    this.totalUses++;
 
     if (!this.contextPromise) {
       console.log("[BROWSER] Launching browser context...");
@@ -104,10 +115,30 @@ export class PlaywrightBrowserProvider {
 
   async releaseContext(): Promise<void> {
     this.activeCount = Math.max(0, this.activeCount - 1);
+
+    // Automatically recycle browser context when idle if it reached max allowed uses.
+    // This cleans up internal Chromium V8 heap fragmentation and prevents long-term RAM leaks.
+    if (this.activeCount === 0 && this.totalUses >= CONFIG.MAX_BROWSER_USES) {
+      console.log(
+        `[BROWSER] Context reached ${this.totalUses} uses. Recycling browser context to free RAM...`,
+      );
+      await this.recycle();
+    }
   }
 
-  async getBrowserContext(): Promise<BrowserContext> {
-    return this.acquireContext();
+  async recycle(): Promise<void> {
+    const promise = this.contextPromise;
+    this.contextPromise = null;
+    this.totalUses = 0;
+    if (promise) {
+      try {
+        const ctx = await promise;
+        await ctx.close();
+        console.log("[BROWSER] Browser context recycled successfully.");
+      } catch (e) {
+        // Ignored
+      }
+    }
   }
 
   private async createContext(): Promise<BrowserContext> {
@@ -118,6 +149,7 @@ export class PlaywrightBrowserProvider {
 
     const args = [
       "--disable-blink-features=AutomationControlled",
+      "--autoplay-policy=no-user-gesture-required",
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-web-security",

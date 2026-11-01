@@ -35,9 +35,12 @@ RUN bun install --frozen-lockfile
 
 # ---------------------------------------------------------------------------
 # 2. Install Chromium from Debian Repository (supports H.264/AAC & ARM64/AMD64)
+#    and curl for smartFetch TLS fingerprint fallback.
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y \
     chromium \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -57,10 +60,12 @@ USER appuser
 # ---------------------------------------------------------------------------
 # 4. Runtime configuration.
 # ---------------------------------------------------------------------------
-ENV PORT=3001 \
-    NODE_ENV=production
+ENV PORT=5005 \
+    NODE_ENV=production \
+    CHROME_PATH=/usr/bin/chromium \
+    USER_DATA_DIR=/app/user_data
 
-EXPOSE 3001
+EXPOSE 5005
 
 # The Elysia server reads CONFIG.PORT at startup and listens on that port.
 CMD ["bun", "run", "index.ts"]

@@ -21,10 +21,10 @@ services:
     ports:
       - "${HOST_PORT:-${PORT:-5005}}:${PORT:-5005}"
 
-    # Loads every variable in .env into the container's environment.
-    # Required: create .env first (cp .env.example .env).
+    # Loads variables from .env if present (optional).
     env_file:
-      - .env
+      - path: .env
+        required: false
 
     # Force container-friendly defaults regardless of what .env says.
     # USER_DATA_DIR must point at the mounted volume; CHROME_PATH points
@@ -38,7 +38,7 @@ services:
     # (owned by appuser), so the non-root process can write to it.
     volumes:
       - user_data:/app/user_data
-      - ./auth.json:/app/auth.json:ro
+      - ./auth:/app/auth:ro
 
     # Override the Dockerfile's healthcheck timing if you need; otherwise
     # the image's defaults apply (every 30s, 30s grace on start).
