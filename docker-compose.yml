@@ -16,6 +16,15 @@ services:
     # zombie Chromium processes get reaped.
     init: true
 
+    # Provide adequate shared memory for Chromium headless tabs
+    shm_size: '256mb'
+
+    # Hard memory safety limit to ensure Docker kernel reclaims page cache
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
     # PORT (from .env, default 5005) is the container-side port the app binds.
     # HOST_PORT optionally remaps the host side (e.g. HOST_PORT=80 -> 5005).
     ports:

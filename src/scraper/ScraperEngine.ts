@@ -13,6 +13,26 @@ export interface RequestData {
 }
 
 /**
+ * Validates whether a URL is a genuine .m3u8 playlist stream rather than
+ * a tracking beacon or analytics image (e.g. ping.gif?mu=...m3u8).
+ */
+export function isM3u8StreamUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  if (
+    lower.includes("ping.gif") ||
+    lower.endsWith(".gif") ||
+    lower.endsWith(".png") ||
+    lower.endsWith(".jpg") ||
+    lower.endsWith(".jpeg") ||
+    lower.endsWith(".webp") ||
+    lower.includes("/ping")
+  ) {
+    return false;
+  }
+  return lower.includes(".m3u8") || lower.includes("/m3u8");
+}
+
+/**
  * Captures network requests made by a page after navigation.
  *
  * This is the "generic" mode from qIPTV's ScraperEngine: it matches any
@@ -93,7 +113,7 @@ export class ScraperEngine {
         const reqUrl = req.url().toLowerCase();
 
         // Never block target m3u8 playlists
-        if (reqUrl.includes(".m3u8")) {
+        if (isM3u8StreamUrl(reqUrl)) {
           return route.continue().catch(() => {});
         }
 
@@ -113,12 +133,45 @@ export class ScraperEngine {
           reqUrl.includes(".webm?") ||
           reqUrl.endsWith(".webm");
 
-        const shouldBlock =
-          isMediaChunk ||
-          type === "image" ||
-          type === "font" ||
+        const isAdOrTracker =
+          reqUrl.includes("disable-devtool") ||
+          reqUrl.includes("connatix.com") ||
+          reqUrl.includes("rubiconproject.com") ||
+          reqUrl.includes("pubmatic.com") ||
+          reqUrl.includes("openx.net") ||
+          reqUrl.includes("criteo.com") ||
+          reqUrl.includes("adnxs.com") ||
+          reqUrl.includes("3lift.com") ||
+          reqUrl.includes("sharethrough.com") ||
+          reqUrl.includes("contextweb.com") ||
+          reqUrl.includes("bidswitch.net") ||
+          reqUrl.includes("casalemedia.com") ||
+          reqUrl.includes("sonobi.com") ||
+          reqUrl.includes("loopme.me") ||
+          reqUrl.includes("smaato.net") ||
+          reqUrl.includes("inmobi.com") ||
+          reqUrl.includes("smartadserver.com") ||
+          reqUrl.includes("fwmrm.net") ||
+          reqUrl.includes("adsco.re") ||
+          reqUrl.includes("adscale.de") ||
+          reqUrl.includes("1rx.io") ||
+          reqUrl.includes("iqm.com") ||
+          reqUrl.includes("bidgx.com") ||
+          reqUrl.includes("adform.net") ||
+          reqUrl.includes("stackadapt.com") ||
+          reqUrl.includes("adsrvr.org") ||
+          reqUrl.includes("ingage.tech") ||
+          reqUrl.includes("yellowblue.io") ||
+          reqUrl.includes("gumgum.com") ||
+          reqUrl.includes("turn.com") ||
+          reqUrl.includes("postrelease.com") ||
+          reqUrl.includes("copper6.com") ||
+          reqUrl.includes("id5-sync.com") ||
+          reqUrl.includes("trustedstack.com") ||
+          reqUrl.includes("media.net") ||
           reqUrl.includes("google-analytics.com") ||
           reqUrl.includes("doubleclick.net") ||
+          reqUrl.includes("googletagmanager.com") ||
           reqUrl.includes("adservice") ||
           reqUrl.includes("scorecardresearch") ||
           reqUrl.includes("quantserve") ||
@@ -127,6 +180,12 @@ export class ScraperEngine {
           reqUrl.includes("exoclick") ||
           reqUrl.includes("histats.com") ||
           reqUrl.includes("trafficjunky");
+
+        const shouldBlock =
+          isMediaChunk ||
+          isAdOrTracker ||
+          type === "image" ||
+          type === "font";
 
         if (shouldBlock) {
           route.abort().catch(() => {});
@@ -138,7 +197,7 @@ export class ScraperEngine {
       // Handle requests
       page.on("request", (req: Request) => {
         const reqUrl = req.url();
-        if (reqUrl.includes(".m3u8")) {
+        if (isM3u8StreamUrl(reqUrl)) {
           requestsMap.set(reqUrl, {
             url: reqUrl,
             method: req.method(),
@@ -160,7 +219,7 @@ export class ScraperEngine {
           console.log(`[BROWSER HTTP ERROR] ${status} for URL: ${resUrl}`);
         }
 
-        if (resolveM3u8Body && resUrl.includes(".m3u8")) {
+        if (resolveM3u8Body && isM3u8StreamUrl(resUrl)) {
           // If the request isn't registered yet, pre-register it to avoid race condition
           if (!requestsMap.has(resUrl)) {
             const req = response.request();
