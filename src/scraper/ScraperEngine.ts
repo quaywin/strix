@@ -38,6 +38,7 @@ export class ScraperEngine {
       const requestsMap = new Map<string, RequestData>();
       const responsePromises: Promise<void>[] = [];
       const activeTimeouts = new Set<NodeJS.Timeout>();
+      const popups = new Set<Page>();
       let page: Page | null = null;
       let acquired = false;
 
@@ -78,13 +79,42 @@ export class ScraperEngine {
       acquired = true;
       page = await context.newPage();
 
-      // Block ads, trackers, images, and fonts to save memory and bandwidth
+      // Track and immediately close any popup tabs spawned by click-jacking or target="_blank"
+      page.on("popup", (popup) => {
+        popups.add(popup);
+        popup.close().catch(() => {}).finally(() => popups.delete(popup));
+      });
+
+      // Block ads, trackers, images, fonts, and actual video/audio chunks.
+      // We only need the .m3u8 playlist URL, NOT the gigabytes of video decoding in RAM.
       await page.route("**/*", (route) => {
         const req = route.request();
         const type = req.resourceType();
         const reqUrl = req.url().toLowerCase();
 
+        // Never block target m3u8 playlists
+        if (reqUrl.includes(".m3u8")) {
+          return route.continue().catch(() => {});
+        }
+
+        // Once we've already captured the target m3u8 playlist, abort all subsequent non-m3u8 requests
+        if (isDone) {
+          return route.abort().catch(() => {});
+        }
+
+        const isMediaChunk =
+          type === "media" ||
+          reqUrl.includes(".ts?") ||
+          reqUrl.endsWith(".ts") ||
+          reqUrl.includes(".m4s?") ||
+          reqUrl.endsWith(".m4s") ||
+          reqUrl.includes(".mp4?") ||
+          reqUrl.endsWith(".mp4") ||
+          reqUrl.includes(".webm?") ||
+          reqUrl.endsWith(".webm");
+
         const shouldBlock =
+          isMediaChunk ||
           type === "image" ||
           type === "font" ||
           reqUrl.includes("google-analytics.com") ||
@@ -94,7 +124,9 @@ export class ScraperEngine {
           reqUrl.includes("quantserve") ||
           reqUrl.includes("popads") ||
           reqUrl.includes("popunder") ||
-          reqUrl.includes("exoclick");
+          reqUrl.includes("exoclick") ||
+          reqUrl.includes("histats.com") ||
+          reqUrl.includes("trafficjunky");
 
         if (shouldBlock) {
           route.abort().catch(() => {});
@@ -185,7 +217,7 @@ export class ScraperEngine {
         ];
 
         // Poll and click play buttons every 500ms while scraping is active
-        while (!isDone && page) {
+        while (!isDone && page && !page.isClosed()) {
           try {
             const frames = page.frames();
             await Promise.all(
@@ -302,8 +334,17 @@ export class ScraperEngine {
         ]).catch(() => {});
       }
 
-      // Clean up browser page and context
-      if (page) {
+      // Clean up popups, browser page, and context
+      if (popups.size > 0) {
+        for (const p of popups) {
+          if (!p.isClosed()) {
+            await p.close().catch(() => {});
+          }
+        }
+        popups.clear();
+      }
+
+      if (page && !page.isClosed()) {
         try {
           await page.close();
         } catch (e) {

@@ -30,7 +30,9 @@ Built for IPTV systems, video aggregators, and streaming apps that need reliable
 - **Production-Grade Concurrency & Memory Guard**:
   - **In-flight Deduplication (SingleFlight)**: Coalesces concurrent requests for the exact same stream into a single browser tab, completely preventing cache stampedes / thundering herd CPU spikes.
   - **Concurrency Limiter (Semaphore)**: Caps simultaneous browser tabs (`MAX_CONCURRENT_SCRAPES`) to safeguard low-memory VPS instances from OOM crashes.
-  - **Browser Context Auto-Recycle**: Automatically closes and renews the Chromium context after a configurable number of uses (`MAX_BROWSER_USES`) to eliminate long-term V8 memory fragmentation.
+  - **Ad & Popup Neutralizer**: Intercepts `window.open` and automatically terminates popup tabs opened by ad click-jacking / `target="_blank"`, preventing orphan Chromium tabs.
+  - **Headless Media Abort**: Aborts `.ts`, `.m4s`, `.mp4` chunks and media elements in Playwright to prevent Chromium from buffering and software-decoding 1080p video in RAM.
+  - **Browser Context Auto-Recycle & GC**: Automatically closes and renews the Chromium context after a configurable number of uses (`MAX_BROWSER_USES`) and triggers runtime GC (`Bun.gc`) to eliminate long-term memory fragmentation.
   - **Bounded Memory Cache**: In-memory `TtlCache` with maximum item ceiling (`CACHE_MAX_ITEMS`) and FIFO eviction.
 
 ---
@@ -115,7 +117,7 @@ You can customize the application behavior using environment variables:
 | `SCRAPER_TIMEOUT` | `20000` | Browser navigation and page loading timeout (in ms). |
 | `MAX_CONCURRENT_SCRAPES` | `3` | Maximum number of concurrent browser tabs allowed at any time. |
 | `CACHE_MAX_ITEMS` | `1000` | Maximum number of stream URLs stored in memory before FIFO eviction. |
-| `MAX_BROWSER_USES` | `300` | Number of scrape operations before automatically recycling the browser context. |
+| `MAX_BROWSER_USES` | `30` | Number of scrape operations before automatically recycling the browser context. |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Maximum wait timeout when proxying upstream data chunks (in ms). |
 
 ---

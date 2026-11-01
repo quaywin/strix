@@ -102,6 +102,32 @@ describe("rewriteM3u8Playlist", () => {
   });
 });
 
+describe("Browser popup neutralization", () => {
+  it("prevents window.open from spawning rogue background pages", async () => {
+    const { chromium } = await import("playwright");
+    const ctx = await chromium.launchPersistentContext("", {
+      headless: true,
+      args: ["--no-sandbox", "--disable-gpu"],
+    });
+
+    await ctx.addInitScript(`
+      try {
+        window.open = () => ({ closed: true, focus: () => {}, close: () => {} });
+      } catch (e) {}
+    `);
+
+    const page = await ctx.newPage();
+    const result = await page.evaluate(() => {
+      const w = window.open("https://ad-site.com");
+      return w ? w.closed : true;
+    });
+
+    expect(result).toBe(true);
+    await page.close();
+    await ctx.close();
+  });
+});
+
 
 
 

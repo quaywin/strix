@@ -17,7 +17,7 @@ export const CONFIG = {
   CACHE_TTL_MS: 50 * 60 * 1000,
   // Browser recycling: automatically close and renew browser context after
   // N scrape operations to prevent Chromium V8 memory fragmentation over time.
-  MAX_BROWSER_USES: parseInt(process.env.MAX_BROWSER_USES || "300", 10),
+  MAX_BROWSER_USES: parseInt(process.env.MAX_BROWSER_USES || "30", 10),
   // Hard cap on how long proxy mode waits for the upstream stream URL to
   // start responding. Prevents a hung upstream from pinning a client
   // connection forever.

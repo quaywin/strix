@@ -39,6 +39,11 @@ const STEALTH_INIT_SCRIPT = `
       configurable: true,
     });
   } catch (e) {}
+
+  // Disable popup window opening to block click-jack ads from spawning new tabs
+  try {
+    window.open = () => ({ closed: true, focus: () => {}, close: () => {} });
+  } catch (e) {}
   const originalQuery = window.navigator.permissions.query;
   window.navigator.permissions.query = (parameters) => (
     parameters.name === 'notifications'
@@ -116,13 +121,30 @@ export class PlaywrightBrowserProvider {
   async releaseContext(): Promise<void> {
     this.activeCount = Math.max(0, this.activeCount - 1);
 
-    // Automatically recycle browser context when idle if it reached max allowed uses.
-    // This cleans up internal Chromium V8 heap fragmentation and prevents long-term RAM leaks.
-    if (this.activeCount === 0 && this.totalUses >= CONFIG.MAX_BROWSER_USES) {
-      console.log(
-        `[BROWSER] Context reached ${this.totalUses} uses. Recycling browser context to free RAM...`,
-      );
-      await this.recycle();
+    // When completely idle (no active scrapes currently in flight)
+    if (this.activeCount === 0) {
+      if (this.totalUses >= CONFIG.MAX_BROWSER_USES) {
+        console.log(
+          `[BROWSER] Context reached ${this.totalUses} uses. Recycling browser context to free RAM...`,
+        );
+        await this.recycle();
+      } else if (this.contextPromise) {
+        // Sweep and close any leftover orphan tabs to keep Chromium at 0 open pages while idle
+        try {
+          const ctx = await this.contextPromise;
+          const pages = ctx.pages();
+          for (const p of pages) {
+            if (!p.isClosed()) {
+              await p.close().catch(() => {});
+            }
+          }
+        } catch (_) {}
+      }
+
+      // Collect memory in Bun runtime
+      if (typeof (Bun as any)?.gc === "function") {
+        (Bun as any).gc(false);
+      }
     }
   }
 
@@ -138,6 +160,10 @@ export class PlaywrightBrowserProvider {
       } catch (e) {
         // Ignored
       }
+    }
+    // Synchronous full GC in Bun to promptly return freed heap memory to OS
+    if (typeof (Bun as any)?.gc === "function") {
+      (Bun as any).gc(true);
     }
   }
 
@@ -156,9 +182,30 @@ export class PlaywrightBrowserProvider {
       "--disable-features=IsolateOrigins,site-per-process",
       "--disable-site-isolation-trials",
       "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--mute-audio",
+      "--disk-cache-size=10485760", // Cap disk cache to 10MB
+      "--media-cache-size=10485760", // Cap media cache to 10MB
+      "--js-flags=--max-old-space-size=256", // Cap V8 heap to 256MB
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-domain-reliability",
+      "--disable-extensions",
+      "--disable-sync",
+      "--disable-translate",
+      "--metrics-recording-only",
+      "--safebrowsing-disable-auto-update",
       "--no-first-run",
       "--no-default-browser-check",
       "--no-zygote",
+      "--disable-breakpad",
+      "--disable-default-apps",
+      "--disable-hang-monitor",
+      "--disable-prompt-on-repost",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--process-per-site",
       "--lang=en-US,en;q=0.9",
       "--window-size=1920,1080",
     ];
@@ -194,6 +241,11 @@ export class PlaywrightBrowserProvider {
       launchOptions,
     );
     await context.addInitScript(STEALTH_INIT_SCRIPT);
+
+    // Close initial blank page created by launchPersistentContext so Chromium starts with 0 idle tabs
+    for (const p of context.pages()) {
+      await p.close().catch(() => {});
+    }
 
     // Auto reset the singleton context when it closes or crashes
     context.on("close", () => {
