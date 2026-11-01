@@ -5,22 +5,33 @@
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-green?logo=playwright)](https://playwright.dev)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue?logo=docker)](https://www.docker.com)
 
-A tiny, high-performance Bun + Elysia + Playwright microservice designed to do exactly one thing:
-**given a video page URL, bypass bot-detection, extract its raw `.m3u8` (HLS) or video (`.mp4`/`.mkv`/etc.) stream URL, and either redirect or proxy the stream directly to the client.**
+A high-performance Bun + Elysia + Playwright microservice designed to do one thing exceptionally well:
+**given a video hosting or sports streaming page URL, bypass anti-bot and hotlink protections, extract the raw `.m3u8` (HLS) or video (`.mp4`/`.mkv`/etc.) stream URL alongside dynamic request headers, and either return JSON metadata, redirect, or proxy the stream directly to client players.**
 
-It is perfect for video streaming applications, IPTV players, and web scrapers that need to resolve protected or short-lived streaming links.
+Built for IPTV systems, video aggregators, and streaming apps that need reliable resolution of protected, token-gated, or short-lived video streams.
 
 ---
 
 ## Key Features
 
-- **Anti-Bot Stealth**: Injects advanced anti-fingerprinting overrides (masking `navigator.webdriver`, setting custom user-agent, mocking `userAgentData`, permissions API, plugins, and languages) to bypass sophisticated headless-detection scripts (e.g. on sites like `dlhd.pk`).
-- **Interactive Player Clicker**: Auto-detects and triggers play buttons inside frames/iframes to trigger underlying video streams.
-- **Smart Cache Resolution**: Caches extracted URLs for 50 minutes (TTL) to save browser resources, with an automatic cache invalidation and retry fallback.
-- **Redirect or Proxy Modes**:
-  - **Redirect mode**: Returns a HTTP `302` redirect to the raw stream URL.
-  - **Proxy mode**: Acts as an intermediary proxy, streaming the video data back to client. Handles Range requests/headers for seamless video seeking on `.mp4`/`.mkv` streams.
-- **Docker Ready**: Self-contained multi-stage Docker configuration bundling Bun, Playwright Chromium, and all system libraries.
+- **Anti-Bot Stealth Engine**:
+  - Neutralizes `navigator.webdriver`, sandbox detection tricks (`sandDetect`), and overrides `userAgentData`, permissions API, plugins, and language lists.
+  - Mimics natural visibility states (`document.visibilityState = 'visible'`) and disables autoplay restrictions (`--autoplay-policy=no-user-gesture-required`) so players initialize immediately without human interaction.
+- **Interactive Player Clicker**:
+  - Automatically searches, polls, and triggers play buttons across frames and shadow DOMs (JWPlayer, Video.js, Clappr, custom sports player buttons).
+- **Synthetic Iframe Container**:
+  - Seamlessly handles both host pages (`ppv.st/live/...`) and direct embed links (`taifood-blog.asia/embed/...`). Embed URLs are wrapped in a synthetic `<iframe>` container to bypass anti-direct-access checks (`window.top !== window.self`).
+- **Dynamic Header Forwarding**:
+  - Captures dynamic request headers (`Referer`, `User-Agent`) during scraping and forwards them when proxying streams, bypassing upstream CDN 403 Forbidden hotlink blocks.
+- **TLS Fingerprint Bypass (`smartFetch`)**:
+  - Progressive enhancement: calls native Bun `fetch()` first, and automatically falls back to native system `curl` when upstream CDN firewalls (such as "Iron Dome" / JA3 TLS ClientHello fingerprinting) block automated runtimes with 403 Forbidden.
+- **Sub-Playlist & Variant Auto-Resolution (`sub=1`)**:
+  - Resolves HLS Master Playlists (`index.m3u8`) to the highest quality variant stream (`mono.ts.m3u8`), converting relative paths into absolute segment URLs for direct client playback.
+- **Production-Grade Concurrency & Memory Guard**:
+  - **In-flight Deduplication (SingleFlight)**: Coalesces concurrent requests for the exact same stream into a single browser tab, completely preventing cache stampedes / thundering herd CPU spikes.
+  - **Concurrency Limiter (Semaphore)**: Caps simultaneous browser tabs (`MAX_CONCURRENT_SCRAPES`) to safeguard low-memory VPS instances from OOM crashes.
+  - **Browser Context Auto-Recycle**: Automatically closes and renews the Chromium context after a configurable number of uses (`MAX_BROWSER_USES`) to eliminate long-term V8 memory fragmentation.
+  - **Bounded Memory Cache**: In-memory `TtlCache` with maximum item ceiling (`CACHE_MAX_ITEMS`) and FIFO eviction.
 
 ---
 
@@ -32,136 +43,146 @@ Health check endpoint. Returns `strix`.
 ---
 
 ### `GET /scrape-stream` & `GET /scrape-stream/:filename`
-Visits the page in a stealthy headless browser, waits for media requests, and extracts the stream URL.
+Visits the target page, intercepts media requests, and resolves the stream.
 
-The variant route with `:filename` is extremely useful for players (e.g. IPTV players or Apple TV/iOS players) that require a specific file extension (like `.m3u8` or `.mp4`) at the end of the URL path to work correctly.
+The variant route with `:filename` (e.g. `/scrape-stream/live.m3u8?url=...`) provides compatibility for IPTV players and media centers (like Apple TV, Kodi, VLC, or TiviMate) that require a specific file extension at the end of the URL path.
 
-**Query Parameters:**
-- `url` (required) — The URL of the video hosting page to scrape.
-- `proxy` (optional) — If set to `true` or `1`, the service acts as a streaming proxy instead of redirecting the client to the CDN URL.
+#### Query Parameters:
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `url` | string | *required* | The URL of the video page or embed player to scrape. |
+| `proxy` | boolean | `false` | When `true` or `1`, Strix acts as a streaming proxy, piping video chunks directly to the client while forwarding dynamic headers. |
+| `sub` | boolean | `auto` | When `true` or `1`, resolves HLS Master Playlists to sub-playlist variants (highest resolution/bandwidth). Defaults to `true` when `proxy=1`. |
+| `format` | string | `""` | Set to `json` (or `json=1`) to return structured JSON containing both the stream URL and required dynamic request headers. |
 
-#### Mode 1: Redirect Mode (`proxy` is false/omitted)
-Returns a HTTP `302 Redirect` pointing directly to the resolved stream.
+---
+
+### Usage Examples
+
+#### 1. JSON Inspection Mode (`format=json`)
+Retrieve the resolved stream URL and the dynamic headers needed to play it directly:
+```http
+GET /scrape-stream?url=https://ppv.st/live/ufc-fight-night-moicano-vs-nolan-31456&format=json
+```
+
+**Response (200 OK):**
+```json
+{
+  "url": "https://netanyahu.indianservers.st/secure/.../ufc/tracks-v1a1/mono.ts.m3u8",
+  "headers": {
+    "Referer": "https://taifood-blog.asia/",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+  }
+}
+```
+
+#### 2. Direct Redirect Mode (`proxy=false`, default)
+Returns a standard HTTP `302 Found` redirect pointing directly to the resolved stream:
 ```http
 GET /scrape-stream?url=https://example.com/video-page
 ```
 
-#### Mode 2: Proxy Mode (`proxy=true`)
-Streams the target video data directly from the upstream server to the client. This is helpful if the target CDN restricts access by IP address or custom headers.
+#### 3. Proxy Streaming Mode (`proxy=true`)
+Pipes the video stream through Strix. Upstream hotlink headers (`Referer`, `User-Agent`) and HTTP `Range` headers are forwarded automatically:
 ```http
-GET /scrape-stream/playlist.m3u8?url=https://example.com/video-page&proxy=true
+GET /scrape-stream/playlist.m3u8?url=https://ppv.st/live/ufc-fight-night-moicano-vs-nolan-31456&proxy=true
 ```
 
-In proxy mode:
-- **Seek Support**: Range-related headers (`Range`, `Content-Range`, `Accept-Ranges`, `Content-Length`) are fully forwarded to support seeking in video players (e.g., MP4/MKV).
-- **Auto-Retry**: If the upstream server rejects the proxy request (e.g., returns `403` or `502` due to an expired CDN token), the service automatically invalidates the cache, performs a fresh scrape, and retries the connection once.
+- **Seek Support**: HTTP Range headers (`Range`, `Content-Range`, `Accept-Ranges`, `Content-Length`) are fully preserved for `.mp4`/`.mkv` seeking.
+- **Auto-Retry**: If upstream rejects a proxy request (e.g. 403 / 502 due to an expired token), Strix automatically invalidates the cache, performs a fresh scrape, and retries once.
 
 #### Error Responses
 - `400 Bad Request` — Missing `url` parameter.
 - `404 Not Found` — No playable video source or `.m3u8` playlist was found on the page.
-- `504 Gateway Timeout` — Upstream proxy connection timed out.
+- `502 Bad Gateway` — Upstream server returned an error during proxying.
+- `504 Gateway Timeout` — Upstream connection timed out.
 - `500 Internal Server Error` — Scraper browser crash or unexpected system error.
-
----
-
-## Setup & Local Development
-
-### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/strix.git
-   cd strix
-   ```
-2. Install dependencies:
-   ```bash
-   bun install
-   ```
-3. Install the Playwright Chromium browser binary:
-   ```bash
-   npx playwright install chromium
-   ```
-4. Copy the environment template and configure:
-   ```bash
-   cp .env.example .env
-   ```
-
-### Running
-
-To start the server in watch mode:
-```bash
-bun run dev
-```
-By default, the server will start on `http://localhost:5005`.
 
 ---
 
 ## Configuration (`.env`)
 
-You can customize the application behavior using the following environment variables:
+You can customize the application behavior using environment variables:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `PORT` | `5005` | The port on which the service will run. |
-| `CHROME_PATH` | *empty* | Path to a real, installed Chrome binary (falls back to Playwright's Chromium if empty). |
-| `USER_DATA_DIR` | `./user_data` | Directory where browser session profile cookies and cache are stored. |
-| `SCRAPER_TIMEOUT` | `15000` | Timeout in milliseconds for navigation and page loading. |
-| `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Timeout in milliseconds when waiting for the upstream proxy connection. |
+| `PORT` | `5005` | Port on which the HTTP server listens. |
+| `CHROME_PATH` | *empty* | Path to an external Chromium/Chrome executable (defaults to Playwright bundled browser). |
+| `USER_DATA_DIR` | `./user_data` | Directory for persistent browser profile, cookies, and local storage cache. |
+| `HEADLESS` | `true` | Set to `false` to display the Chromium browser window during scraping (useful for debugging). |
+| `PROXY_SERVER` | *empty* | Optional HTTP/SOCKS5 proxy for Playwright browser requests (e.g. `http://user:pass@host:port`). |
+| `SCRAPER_TIMEOUT` | `20000` | Browser navigation and page loading timeout (in ms). |
+| `MAX_CONCURRENT_SCRAPES` | `3` | Maximum number of concurrent browser tabs allowed at any time. |
+| `CACHE_MAX_ITEMS` | `1000` | Maximum number of stream URLs stored in memory before FIFO eviction. |
+| `MAX_BROWSER_USES` | `300` | Number of scrape operations before automatically recycling the browser context. |
+| `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Maximum wait timeout when proxying upstream data chunks (in ms). |
 
-### Cookie & Authentication Injection (`auth/`)
-If the target website requires specific authentication cookies or local storage states, manage them as **per-domain files** under the `auth/` directory. Each file is a Playwright `storageState` blob (`{ cookies, origins }`) named after the site hostname.
+---
+
+## Cookie & Authentication Injection (`auth/`)
+
+If a target website requires authentication cookies or local storage states, manage them as **per-domain files** under the `auth/` directory:
 
 ```bash
-# From the project root
 mkdir -p auth
-cp auth/auth.example.json auth/example.com.json   # then edit the copied file
+cp auth/auth.example.json auth/example.com.json   # edit with domain credentials
 ```
 
-On startup the browser loads every `auth/*.json` file (skipping `*.example.json`) and applies each one's cookies and local storage to the shared browser context. Cookies are scoped by their `domain` field, and local storage entries are applied only when `window.location.origin` matches, so multiple domains can coexist safely.
-
-> **Backward compatibility:** If the `auth/` directory does not exist, the service falls back to a single legacy `auth.json` at the project root (or `USER_DATA_DIR`). Prefer the per-domain layout for new setups.
-
-#### How to Export Session Data from Chrome
-You can easily export your active session's cookies and local storage directly from your browser console:
-
-1. Log in to the target website on Google Chrome.
-2. Open Developer Tools (`F12` or `Cmd + Option + I` on macOS) and click the **Console** tab.
-3. Open the file `scripts/export-auth.js` in this project, copy its entire contents, paste it into the browser console, and press **Enter**.
-4. The JSON formatted session state is automatically copied to your clipboard. Create `auth/<hostname>.json` (e.g. `auth/dlhd.pk.json`) in your project root and paste (`Ctrl+V` / `Cmd+V`) the contents there. Use `auth/auth.example.json` as a template.
-
-> ⚠️ **Note on Secure Cookies (HttpOnly)**: JavaScript cannot read cookies marked with the `HttpOnly` flag. If the target website relies on `HttpOnly` cookies for authentication, please use an extension like **Cookie-Editor** to export all cookies as JSON, and copy them directly into the `"cookies"` array of that domain's file.
+On startup, Strix loads every `auth/*.json` file (skipping `*.example.json`) and registers its cookies and local storage to the shared browser context.
 
 ---
 
 ## Production Deployment with Docker
 
-The project contains a `Dockerfile` and `docker-compose.yml` to bundle the Bun runtime, headless Playwright Chromium, and Debian-based dependencies into a single image.
+Strix includes a hardened `Dockerfile` and `docker-compose.yml` optimized for production deployment on both AMD64 and ARM64 servers.
 
-### Quick Start
+### 1. Using Docker Compose (Recommended)
 ```bash
-# Prepare env variables
+# Clone the repository
+git clone https://github.com/your-username/strix.git
+cd strix
+
+# (Optional) Copy .env if you wish to customize port or concurrency
 cp .env.example .env
 
-# Build and run containers in background
+# Build and start in background
 docker compose up --build -d
 
-# Check service logs
+# Check logs
 docker compose logs -f app
 ```
 
-### Docker Volume Persistence
-A named Docker volume `user_data` is configured to persist browser profiles, cookie state, and cached resources across container restarts.
-
-### Useful Commands
-- **Rebuild image**: `docker compose build`
-- **Stop containers**: `docker compose down`
-- **Clean start (deletes cache volume)**: `docker compose down -v && docker compose up --build -d`
+### 2. Standalone Docker Run
+```bash
+docker build -t strix:latest .
+docker run -d \
+  --name strix \
+  --init \
+  -p 5005:5005 \
+  -v strix_user_data:/app/user_data \
+  -v $(pwd)/auth:/app/auth:ro \
+  strix:latest
+```
 
 ---
 
-## Contributing
+## Local Development & Testing
 
-Contributions are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to run tests, write code, and submit pull requests.
+```bash
+# Install dependencies
+bun install
+
+# Run TypeScript type check
+bun run --bun tsc --noEmit
+
+# Run unit tests
+bun test
+
+# Start development server with hot-reload
+bun run dev
+```
+
+---
 
 ## License
 
