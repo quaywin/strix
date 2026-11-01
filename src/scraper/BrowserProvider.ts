@@ -203,11 +203,13 @@ export class PlaywrightBrowserProvider {
       "--disable-default-apps",
       "--disable-hang-monitor",
       "--disable-prompt-on-repost",
+      "--disable-webgl",
+      "--disable-3d-apis",
       "--password-store=basic",
       "--use-mock-keychain",
       "--process-per-site",
       "--lang=en-US,en;q=0.9",
-      "--window-size=1920,1080",
+      "--window-size=1280,720",
     ];
 
     if (CONFIG.HEADLESS) {

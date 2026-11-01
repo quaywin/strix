@@ -32,6 +32,11 @@ export function isM3u8StreamUrl(url: string): boolean {
   return lower.includes(".m3u8") || lower.includes("/m3u8");
 }
 
+const MEDIA_CHUNK_REGEX = /\.(ts|m4s|mp4|webm|mkv)($|\?)/i;
+
+const AD_TRACKER_REGEX =
+  /(?:disable-devtool|connatix\.com|rubiconproject\.com|pubmatic\.com|openx\.net|criteo\.com|adnxs\.com|3lift\.com|sharethrough\.com|contextweb\.com|bidswitch\.net|casalemedia\.com|sonobi\.com|loopme\.me|smaato\.net|inmobi\.com|smartadserver\.com|fwmrm\.net|adsco\.re|adscale\.de|1rx\.io|iqm\.com|bidgx\.com|adform\.net|stackadapt\.com|adsrvr\.org|ingage\.tech|yellowblue\.io|gumgum\.com|turn\.com|postrelease\.com|copper6\.com|id5-sync\.com|trustedstack\.com|media\.net|google-analytics\.com|doubleclick\.net|googletagmanager\.com|adservice|scorecardresearch|quantserve|popads|popunder|exoclick|histats\.com|trafficjunky)/i;
+
 /**
  * Captures network requests made by a page after navigation.
  *
@@ -122,70 +127,12 @@ export class ScraperEngine {
           return route.abort().catch(() => {});
         }
 
-        const isMediaChunk =
-          type === "media" ||
-          reqUrl.includes(".ts?") ||
-          reqUrl.endsWith(".ts") ||
-          reqUrl.includes(".m4s?") ||
-          reqUrl.endsWith(".m4s") ||
-          reqUrl.includes(".mp4?") ||
-          reqUrl.endsWith(".mp4") ||
-          reqUrl.includes(".webm?") ||
-          reqUrl.endsWith(".webm");
-
-        const isAdOrTracker =
-          reqUrl.includes("disable-devtool") ||
-          reqUrl.includes("connatix.com") ||
-          reqUrl.includes("rubiconproject.com") ||
-          reqUrl.includes("pubmatic.com") ||
-          reqUrl.includes("openx.net") ||
-          reqUrl.includes("criteo.com") ||
-          reqUrl.includes("adnxs.com") ||
-          reqUrl.includes("3lift.com") ||
-          reqUrl.includes("sharethrough.com") ||
-          reqUrl.includes("contextweb.com") ||
-          reqUrl.includes("bidswitch.net") ||
-          reqUrl.includes("casalemedia.com") ||
-          reqUrl.includes("sonobi.com") ||
-          reqUrl.includes("loopme.me") ||
-          reqUrl.includes("smaato.net") ||
-          reqUrl.includes("inmobi.com") ||
-          reqUrl.includes("smartadserver.com") ||
-          reqUrl.includes("fwmrm.net") ||
-          reqUrl.includes("adsco.re") ||
-          reqUrl.includes("adscale.de") ||
-          reqUrl.includes("1rx.io") ||
-          reqUrl.includes("iqm.com") ||
-          reqUrl.includes("bidgx.com") ||
-          reqUrl.includes("adform.net") ||
-          reqUrl.includes("stackadapt.com") ||
-          reqUrl.includes("adsrvr.org") ||
-          reqUrl.includes("ingage.tech") ||
-          reqUrl.includes("yellowblue.io") ||
-          reqUrl.includes("gumgum.com") ||
-          reqUrl.includes("turn.com") ||
-          reqUrl.includes("postrelease.com") ||
-          reqUrl.includes("copper6.com") ||
-          reqUrl.includes("id5-sync.com") ||
-          reqUrl.includes("trustedstack.com") ||
-          reqUrl.includes("media.net") ||
-          reqUrl.includes("google-analytics.com") ||
-          reqUrl.includes("doubleclick.net") ||
-          reqUrl.includes("googletagmanager.com") ||
-          reqUrl.includes("adservice") ||
-          reqUrl.includes("scorecardresearch") ||
-          reqUrl.includes("quantserve") ||
-          reqUrl.includes("popads") ||
-          reqUrl.includes("popunder") ||
-          reqUrl.includes("exoclick") ||
-          reqUrl.includes("histats.com") ||
-          reqUrl.includes("trafficjunky");
-
         const shouldBlock =
-          isMediaChunk ||
-          isAdOrTracker ||
           type === "image" ||
-          type === "font";
+          type === "font" ||
+          type === "media" ||
+          MEDIA_CHUNK_REGEX.test(reqUrl) ||
+          AD_TRACKER_REGEX.test(reqUrl);
 
         if (shouldBlock) {
           route.abort().catch(() => {});
