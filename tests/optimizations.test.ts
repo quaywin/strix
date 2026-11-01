@@ -53,4 +53,55 @@ describe("smartFetch curl redirect parsing", () => {
   });
 });
 
+describe("rewriteM3u8Playlist", () => {
+  it("rewrites relative segments and key URIs to absolute CDN URLs", async () => {
+    const { rewriteM3u8Playlist } = await import("../src/utils/m3u8");
+    const playlist = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:3",
+      "#EXT-X-KEY:METHOD=AES-128,URI=\"enc.key\"",
+      "#EXTINF:5.0,",
+      "segment1.ts",
+      "#EXTINF:5.0,",
+      "../chunks/segment2.ts",
+      "#EXTINF:5.0,",
+      "https://cdn.other.com/seg3.ts",
+    ].join("\n");
+
+    const baseUrl = "https://cdn.example.com/live/stream/playlist.m3u8?token=123";
+    const rewritten = rewriteM3u8Playlist(playlist, baseUrl);
+
+    expect(rewritten).toContain('URI="https://cdn.example.com/live/stream/enc.key"');
+    expect(rewritten).toContain("https://cdn.example.com/live/stream/segment1.ts");
+    expect(rewritten).toContain("https://cdn.example.com/live/chunks/segment2.ts");
+    expect(rewritten).toContain("https://cdn.other.com/seg3.ts");
+  });
+
+  it("rewrites relative numeric .js segments (like strmfree) to absolute URLs", async () => {
+    const { rewriteM3u8Playlist } = await import("../src/utils/m3u8");
+    const playlist = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:3",
+      "#EXTINF:4.004,",
+      "543728.js",
+      "#EXTINF:4.004,",
+      "543729.js",
+    ].join("\n");
+
+    const baseUrl =
+      "https://strmfree.st/live/willow1080p/index.m3u8?_t=5M_jPHrgTz0vPBuJpp46GA";
+    const rewritten = rewriteM3u8Playlist(playlist, baseUrl);
+
+    expect(rewritten).toContain(
+      "https://strmfree.st/live/willow1080p/543728.js",
+    );
+    expect(rewritten).toContain(
+      "https://strmfree.st/live/willow1080p/543729.js",
+    );
+    expect(rewritten).not.toContain("\n543728.js\n");
+  });
+});
+
+
+
 

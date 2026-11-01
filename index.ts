@@ -7,6 +7,7 @@ import {
   scraperService,
 } from "./src/services/scraper.service";
 import { smartFetch } from "./src/utils/http";
+import { rewriteM3u8Playlist } from "./src/utils/m3u8";
 
 const handleScrapeStream = async (
   query: {
@@ -15,10 +16,12 @@ const handleScrapeStream = async (
     sub?: string;
     format?: string;
     json?: string;
+    proxy_segments?: string;
+    proxy_all?: string;
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, proxy, sub, format, json } = query;
+  const { url, proxy, sub, format, json, proxy_segments, proxy_all } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -31,6 +34,11 @@ const handleScrapeStream = async (
     sub === "true" ||
     (wantProxy && sub !== "0" && sub !== "false");
   const wantJson = format === "json" || json === "1" || json === "true";
+  const wantProxySegments =
+    proxy_segments === "1" ||
+    proxy_segments === "true" ||
+    proxy_all === "1" ||
+    proxy_all === "true";
 
   // Forward the client Range header in proxy mode so mp4/mkv clients can
   // seek; ignored for non-proxy mode (we just 302 to the stream URL).
@@ -99,6 +107,41 @@ const handleScrapeStream = async (
       const contentLength = upstream.headers.get("Content-Length");
       if (contentLength) headers.set("Content-Length", contentLength);
 
+      const isM3u8 =
+        contentType?.toLowerCase().includes("mpegurl") ||
+        streamUrl.toLowerCase().includes(".m3u8");
+
+      if (isM3u8) {
+        const text = await upstream.text();
+        const requestOrigin = new URL(request.url).origin;
+
+        const proxySegmentUrl = wantProxySegments
+          ? (absUrl: string) => {
+              const params = new URLSearchParams();
+              params.set("url", absUrl);
+              if (upstreamHeaders?.["referer"]) {
+                params.set("referer", upstreamHeaders["referer"]);
+              }
+              return `${requestOrigin}/proxy-chunk?${params.toString()}`;
+            }
+          : undefined;
+
+        const rewrittenBody = rewriteM3u8Playlist(text, streamUrl, {
+          proxySegmentUrl,
+        });
+
+        if (!headers.has("Content-Type")) {
+          headers.set("Content-Type", "application/vnd.apple.mpegurl");
+        }
+        headers.delete("Content-Length"); // Length changed due to URL rewriting
+
+        return new Response(rewrittenBody, {
+          status: upstream.status,
+          headers,
+        });
+      }
+
+      // For binary video (mp4/mkv), stream directly with Range support
       return new Response(upstream.body, {
         status: upstream.status,
         headers,
@@ -145,28 +188,58 @@ const app = new Elysia()
   })
   .get("/", () => "strix")
   .get("/scrape-stream", async ({ query, request }) => {
-    return handleScrapeStream(
-      query as {
-        url?: string;
-        proxy?: string;
-        sub?: string;
-        format?: string;
-        json?: string;
-      },
-      request,
-    );
+    return handleScrapeStream(query, request);
   })
   .get("/scrape-stream/:filename", async ({ query, request }) => {
-    return handleScrapeStream(
-      query as {
-        url?: string;
-        proxy?: string;
-        sub?: string;
-        format?: string;
-        json?: string;
-      },
-      request,
-    );
+    return handleScrapeStream(query, request);
+  })
+  .get("/proxy-chunk", async ({ query, request }) => {
+    const chunkUrl = query.url;
+    if (!chunkUrl) {
+      return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const headers = new Headers();
+    if (query.referer) {
+      headers.set("referer", query.referer);
+    }
+    const range = request.headers.get("range");
+    if (range) {
+      headers.set("range", range);
+    }
+
+    try {
+      const upstream = await smartFetch(chunkUrl, {
+        signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
+        headers,
+        range,
+      });
+
+      const resHeaders = new Headers();
+      const contentType = upstream.headers.get("Content-Type") || "video/mp2t";
+      resHeaders.set("Content-Type", contentType);
+
+      const contentRange = upstream.headers.get("Content-Range");
+      if (contentRange) resHeaders.set("Content-Range", contentRange);
+      const acceptRanges = upstream.headers.get("Accept-Ranges");
+      if (acceptRanges) resHeaders.set("Accept-Ranges", acceptRanges);
+      const contentLength = upstream.headers.get("Content-Length");
+      if (contentLength) resHeaders.set("Content-Length", contentLength);
+
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: resHeaders,
+      });
+    } catch (e) {
+      const error = e as Error;
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: 502,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   })
   .listen(CONFIG.PORT);
 

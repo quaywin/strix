@@ -52,6 +52,7 @@ The variant route with `:filename` (e.g. `/scrape-stream/live.m3u8?url=...`) pro
 | :--- | :--- | :--- | :--- |
 | `url` | string | *required* | The URL of the video page or embed player to scrape. |
 | `proxy` | boolean | `false` | When `true` or `1`, Strix acts as a streaming proxy, piping video chunks directly to the client while forwarding dynamic headers. |
+| `proxy_segments` | boolean | `false` | When `true` (alongside `proxy=1`), rewrites all TS segment URLs inside `.m3u8` to route through Strix (`/proxy-chunk`) for sites with strict per-chunk hotlink protection. |
 | `sub` | boolean | `auto` | When `true` or `1`, resolves HLS Master Playlists to sub-playlist variants (highest resolution/bandwidth). Defaults to `true` when `proxy=1`. |
 | `format` | string | `""` | Set to `json` (or `json=1`) to return structured JSON containing both the stream URL and required dynamic request headers. |
 
