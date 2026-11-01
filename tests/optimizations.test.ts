@@ -128,6 +128,37 @@ describe("Browser popup neutralization", () => {
   });
 });
 
+describe("smartFetch m3u8 header guard", () => {
+  it("forces accept-encoding: identity and strips Range for m3u8 URLs to prevent ZlibError", async () => {
+    // Start a tiny local HTTP server that echoes headers back
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new Response(
+          JSON.stringify({
+            acceptEncoding: req.headers.get("accept-encoding"),
+            range: req.headers.get("range"),
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
 
+    try {
+      const { smartFetch } = await import("../src/utils/http");
+      const res = await smartFetch(
+        `http://localhost:${server.port}/stream/playlist.m3u8`,
+        {
+          headers: { "accept-encoding": "gzip, deflate" },
+          range: "bytes=0-100",
+        },
+      );
 
-
+      const data = await res.json();
+      expect(data.acceptEncoding).toBe("identity");
+      expect(data.range).toBeNull();
+    } finally {
+      server.stop(true);
+    }
+  });
+});

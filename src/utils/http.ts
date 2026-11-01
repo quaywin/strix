@@ -16,13 +16,23 @@ export async function smartFetch(
   const headers: Record<string, string> = {};
   if (options.headers instanceof Headers) {
     options.headers.forEach((value, key) => {
-      headers[key] = value;
+      headers[key.toLowerCase()] = value;
     });
   } else if (options.headers) {
-    Object.assign(headers, options.headers);
+    for (const [key, value] of Object.entries(options.headers)) {
+      headers[key.toLowerCase()] = value;
+    }
   }
 
-  if (options.range) {
+  const isM3u8 = url.toLowerCase().includes(".m3u8");
+  if (isM3u8) {
+    // For HLS playlists, force uncompressed response and strip Range headers.
+    // Upstream CDNs often return HTTP 206 Partial Content with gzip compression when
+    // Range is sent for .m3u8 playlists, causing Bun's zlib to fail with
+    // 'Decompression error: ZlibError'.
+    headers["accept-encoding"] = "identity";
+    delete headers["range"];
+  } else if (options.range) {
     headers["range"] = options.range;
   }
 

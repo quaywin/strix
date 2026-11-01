@@ -74,14 +74,21 @@ const handleScrapeStream = async (
           requestHeaders.set(key, value);
         }
       }
-      if (range) {
+
+      const isM3u8Url = streamUrl.toLowerCase().includes(".m3u8");
+      if (isM3u8Url) {
+        // Strip Range for m3u8 playlist manifests and force uncompressed delivery.
+        // Forwarding Range: bytes=0- on playlists causes upstream CDNs to reply
+        // with HTTP 206 Partial Content in gzip encoding, triggering Bun's ZlibError.
+        requestHeaders.set("accept-encoding", "identity");
+      } else if (range) {
         requestHeaders.set("range", range);
       }
 
-      const upstream = await smartFetch(streamUrl, {
+      let upstream = await smartFetch(streamUrl, {
         signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
         headers: requestHeaders,
-        range,
+        range: isM3u8Url ? null : range,
       });
       if (!upstream.ok) {
         return new Response(
@@ -112,7 +119,24 @@ const handleScrapeStream = async (
         streamUrl.toLowerCase().includes(".m3u8");
 
       if (isM3u8) {
-        const text = await upstream.text();
+        let text: string;
+        try {
+          text = await upstream.text();
+        } catch (decompError) {
+          logger.warn(
+            `Decompression error on m3u8 playlist (${(decompError as Error).message}), retrying with identity encoding...`,
+            "App",
+          );
+          requestHeaders.set("accept-encoding", "identity");
+          requestHeaders.delete("range");
+          upstream = await smartFetch(streamUrl, {
+            signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
+            headers: requestHeaders,
+            range: null,
+          });
+          text = await upstream.text();
+        }
+
         const requestOrigin = new URL(request.url).origin;
 
         const proxySegmentUrl = wantProxySegments
@@ -134,9 +158,11 @@ const handleScrapeStream = async (
           headers.set("Content-Type", "application/vnd.apple.mpegurl");
         }
         headers.delete("Content-Length"); // Length changed due to URL rewriting
+        headers.delete("Content-Range");
+        headers.delete("Content-Encoding");
 
         return new Response(rewrittenBody, {
-          status: upstream.status,
+          status: 200,
           headers,
         });
       }

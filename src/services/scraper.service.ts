@@ -269,7 +269,10 @@ export class ScraperService {
           if (sub && streamUrl.includes(".m3u8")) {
             try {
               const res = await smartFetch(streamUrl, {
-                headers: extracted.headers,
+                headers: {
+                  ...extracted.headers,
+                  "accept-encoding": "identity",
+                },
                 signal: AbortSignal.timeout(5000),
               });
               if (res.ok) {
@@ -340,7 +343,10 @@ export class ScraperService {
     if (sub && !playlistBody && selectedReq.url.includes(".m3u8")) {
       try {
         const res = await smartFetch(selectedReq.url, {
-          headers: upstreamHeaders,
+          headers: {
+            ...upstreamHeaders,
+            "accept-encoding": "identity",
+          },
           signal: AbortSignal.timeout(10000),
         });
         if (res.ok) {
