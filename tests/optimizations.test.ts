@@ -125,7 +125,7 @@ describe("rewriteM3u8Playlist", () => {
 
 describe("Browser popup neutralization", () => {
   it("prevents window.open from spawning rogue background pages", async () => {
-    const { chromium } = await import("playwright");
+    const { chromium } = await import("patchright");
     const ctx = await chromium.launchPersistentContext("", {
       headless: true,
       args: ["--no-sandbox", "--disable-gpu"],
@@ -138,10 +138,16 @@ describe("Browser popup neutralization", () => {
     `);
 
     const page = await ctx.newPage();
-    const result = await page.evaluate(() => {
-      const w = window.open("https://ad-site.com");
-      return w ? w.closed : true;
-    });
+    await page.goto("data:text/html,<html><body></body></html>");
+    const result = await page.evaluate(
+      () => {
+        const w = window.open("https://ad-site.com");
+        return w ? w.closed : true;
+      },
+      null,
+      {},
+      false,
+    );
 
     expect(result).toBe(true);
     await page.close();
@@ -284,15 +290,22 @@ describe("isEmbedPlayerUrl and stealth anti-embed bypass", () => {
     expect(isEmbedPlayerUrl("https://domain.com/cv-embed/embed/channel")).toBe(true);
     expect(isEmbedPlayerUrl("https://domain.com/live-embed/id")).toBe(true);
     expect(isEmbedPlayerUrl("https://domain.com/player.php?id=123")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/player.html?id=123")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/embed.html")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/iframe/stream")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/e/abc123")).toBe(true);
     expect(isEmbedPlayerUrl("https://domain.com/play/stream")).toBe(true);
     expect(isEmbedPlayerUrl("https://domain.com/v/xyz")).toBe(true);
+    expect(isEmbedPlayerUrl("https://ehgembxe.cfd/5evzdk49-4997")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/watch?id=123&embed=1")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/live?is_embed=true")).toBe(true);
 
     expect(isEmbedPlayerUrl("https://domain.com/watch/channel/acc-network")).toBe(false);
     expect(isEmbedPlayerUrl("https://domain.com/matches/today")).toBe(false);
     expect(isEmbedPlayerUrl("https://domain.com/channels")).toBe(false);
   });
 
-  it("emulates subframe context so window.self !== window.top in browser context", async () => {
+  it("maintains standard top-level window context to avoid frame-busting side effects", async () => {
     const { PlaywrightBrowserProvider } = await import(
       "../src/scraper/BrowserProvider"
     );
@@ -303,16 +316,14 @@ describe("isEmbedPlayerUrl and stealth anti-embed bypass", () => {
     const evaluation = await page.evaluate(() => {
       return {
         isSelfEqualTop: window.self === window.top,
-        isSelfNotTop: window.self !== window.top,
-        isParentNotSelf: window.parent !== window.self,
+        isParentEqualSelf: window.parent === window.self,
         selfType: typeof window.self,
         hasDocument: Boolean(window.self.document),
       };
     });
 
-    expect(evaluation.isSelfEqualTop).toBe(false);
-    expect(evaluation.isSelfNotTop).toBe(true);
-    expect(evaluation.isParentNotSelf).toBe(true);
+    expect(evaluation.isSelfEqualTop).toBe(true);
+    expect(evaluation.isParentEqualSelf).toBe(true);
     expect(evaluation.selfType).toBe("object");
     expect(evaluation.hasDocument).toBe(true);
 
@@ -334,7 +345,7 @@ describe("isEmbedPlayerUrl and stealth anti-embed bypass", () => {
             embedRequestedAsIframe = true;
           }
           return new Response(
-            `<!DOCTYPE html><html><body><script>fetch('/api/manifest').then(r => r.text());</script></body></html>`,
+            `<!DOCTYPE html><html><body><script>if (window.self !== window.top) { fetch('/api/manifest').then(r => r.text()); }</script></body></html>`,
             {
               headers: {
                 "Content-Type": "text/html",

@@ -104,7 +104,7 @@ export async function smartFetch(
 
   // Fallback: spawn curl which uses native OS TLS stack (passes JA3/Iron Dome checks)
   try {
-    const args = ["curl", "-s", "-i", "-L", "--max-time", "30"];
+    const args = ["curl", "-s", "-i", "-k", "-L", "--max-time", "30"];
     for (const [k, v] of Object.entries(headers)) {
       args.push("-H", `${k}: ${v}`);
     }

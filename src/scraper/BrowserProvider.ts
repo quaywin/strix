@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { BrowserContext } from "playwright";
-import { chromium } from "playwright";
+import type { BrowserContext } from "patchright";
+import { chromium } from "patchright";
 import { CONFIG } from "../config";
 
 /**
@@ -36,24 +36,6 @@ const STEALTH_INIT_SCRIPT = `
     Object.defineProperty(window, 'sandDetect', {
       get: () => () => {},
       set: () => {},
-      configurable: true,
-    });
-  } catch (e) {}
-
-  // Emulate subframe context so window.self !== window.top and window.parent !== window.self
-  // to bypass client-side anti-embed checks (if (window.self === window.top) { go(); return; })
-  try {
-    const fakeSelf = new Proxy(window, {
-      get(target, prop) {
-        if (prop === "top") return window.top;
-        if (prop === "self") return fakeSelf;
-        if (prop === "parent") return window.top;
-        const val = Reflect.get(target, prop);
-        return typeof val === "function" ? val.bind(target) : val;
-      }
-    });
-    Object.defineProperty(window, "self", {
-      get: () => fakeSelf,
       configurable: true,
     });
   } catch (e) {}
@@ -223,6 +205,7 @@ export class PlaywrightBrowserProvider {
       "--disable-prompt-on-repost",
       "--disable-webgl",
       "--disable-3d-apis",
+      "--ignore-certificate-errors",
       "--password-store=basic",
       "--use-mock-keychain",
       "--process-per-site",
@@ -237,6 +220,7 @@ export class PlaywrightBrowserProvider {
     const launchOptions = {
       headless: CONFIG.HEADLESS,
       userAgent: USER_AGENT,
+      ignoreHTTPSErrors: true,
       args,
     };
 

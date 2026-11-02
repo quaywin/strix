@@ -1,4 +1,4 @@
-import type { Frame, Page, Request, Response } from "playwright";
+import type { Frame, Page, Request, Response } from "patchright";
 import { CONFIG } from "../config";
 import { Semaphore } from "../utils/semaphore";
 import { PlaywrightBrowserProvider } from "./BrowserProvider";
@@ -37,7 +37,20 @@ export function isM3u8StreamUrl(url: string): boolean {
  * (e.g. /embed/, /cv-embed/, /live-embed/, /player/, /play/, /v/, etc.).
  */
 export function isEmbedPlayerUrl(url: string): boolean {
-  return /\/(embed|cv-embed|live-embed|player|play|v)(\/|\.php|\?|$)/i.test(
+  try {
+    const parsed = new URL(url);
+    if (/(?:^|\.)[a-z0-9-]*emb[a-z0-9-]*\.[a-z]+/i.test(parsed.hostname)) {
+      return true;
+    }
+    if (
+      parsed.searchParams.has("embed") ||
+      parsed.searchParams.has("is_embed") ||
+      parsed.searchParams.has("player")
+    ) {
+      return true;
+    }
+  } catch (_) {}
+  return /\/(embed|cv-embed|live-embed|player|play|iframe|video|v|e)(\/|\.(?:php|html?)|[?#]|$)/i.test(
     url,
   );
 }
@@ -141,7 +154,7 @@ export class ScraperEngine {
             .fulfill({
               status: 200,
               contentType: "text/html; charset=utf-8",
-              body: `<!DOCTYPE html><html><head><title>Strix Embed Loader</title></head><body style="margin:0;padding:0;overflow:hidden;background:#000;"><iframe src="${url}" width="100%" height="100%" style="border:none;width:100vw;height:100vh;" allow="autoplay; fullscreen; encrypted-media"></iframe></body></html>`,
+              body: `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Live Stream</title></head><body style="margin:0;padding:0;overflow:hidden;background:#000;"><iframe src="${url.replace(/"/g, "&quot;")}" width="100%" height="100%" style="border:none;width:100vw;height:100vh;" allow="autoplay *; fullscreen *; encrypted-media *; picture-in-picture *" loading="eager"></iframe></body></html>`,
             })
             .catch(() => {});
         }
@@ -165,20 +178,7 @@ export class ScraperEngine {
         if (shouldBlock) {
           route.abort().catch(() => {});
         } else {
-          // If this is an iframe loader and the request has no referer or referer is about:blank,
-          // inject the target embed origin as referer so upstream servers (e.g. Nginx) don't 302 redirect.
-          const reqHeaders = req.headers();
-          const curReferer = reqHeaders["referer"] || "";
-          if (
-            isEmbedUrl &&
-            targetOrigin &&
-            (!curReferer || curReferer.includes("about:blank"))
-          ) {
-            reqHeaders["referer"] = targetOrigin + "/";
-            route.continue({ headers: reqHeaders }).catch(() => {});
-          } else {
-            route.continue().catch(() => {});
-          }
+          route.continue().catch(() => {});
         }
       });
 
@@ -308,23 +308,21 @@ export class ScraperEngine {
               frames.map(async (frame) => {
                 try {
                   await frame.evaluate((selectors: string[]) => {
-                    for (const selector of selectors) {
-                      const btns = document.querySelectorAll(selector);
-                      btns.forEach((btn) => {
+                    const btns = document.querySelectorAll(selectors.join(", "));
+                    btns.forEach((btn) => {
+                      if (
+                        btn &&
+                        typeof (btn as HTMLElement).click === "function"
+                      ) {
+                        const style = window.getComputedStyle(btn);
                         if (
-                          btn &&
-                          typeof (btn as HTMLElement).click === "function"
+                          style.display !== "none" &&
+                          style.visibility !== "hidden"
                         ) {
-                          const style = window.getComputedStyle(btn);
-                          if (
-                            style.display !== "none" &&
-                            style.visibility !== "hidden"
-                          ) {
-                            (btn as HTMLElement).click();
-                          }
+                          (btn as HTMLElement).click();
                         }
-                      });
-                    }
+                      }
+                    });
 
                     // Check and trigger player APIs if present (e.g. JWPlayer)
                     try {
@@ -373,23 +371,18 @@ export class ScraperEngine {
           ? `${targetOrigin}/strix-embed-loader.html`
           : null;
 
-      const navigatePromise = (
-        loaderUrl
-          ? page.goto(loaderUrl, {
-              timeout: timeoutSec * 1000,
-              waitUntil: "domcontentloaded",
-            })
-          : page.goto(url, {
-              timeout: timeoutSec * 1000,
-              waitUntil: "domcontentloaded",
-            })
-      ).catch((err) => {
-        if (!isDone) {
-          console.error(
-            `[SCRAPER] Navigation error for ${url}: ${err.message}`,
-          );
-        }
-      });
+      const navigatePromise = page
+        .goto(loaderUrl || url, {
+          timeout: timeoutSec * 1000,
+          waitUntil: "commit",
+        })
+        .catch((err) => {
+          if (!isDone) {
+            console.error(
+              `[SCRAPER] Navigation error for ${url}: ${err.message}`,
+            );
+          }
+        });
 
       // Start clickPlayJob in background (non-blocking)
       clickPlayJob();
@@ -397,11 +390,13 @@ export class ScraperEngine {
       // Execute navigation and wait for donePromise to resolve
       await Promise.race([navigatePromise, donePromise]);
 
-      // If we haven't resolved yet, wait for the remaining timeout duration (minimum 3 seconds fallback)
+      // If we haven't resolved yet, wait for the remaining timeout duration
       if (!isDone) {
         const elapsed = Date.now() - startTime;
-        const remainingTimeout = Math.max(3000, (timeoutSec * 1000) - elapsed);
-        await Promise.race([trackedSleep(remainingTimeout), donePromise]);
+        const remainingTimeout = (timeoutSec * 1000) - elapsed;
+        if (remainingTimeout > 0) {
+          await Promise.race([trackedSleep(remainingTimeout), donePromise]);
+        }
       }
     } catch (e) {
       console.error(`[SCRAPER] Error during scraping ${url}: ${e}`);
@@ -415,8 +410,12 @@ export class ScraperEngine {
       }
       activeTimeouts.clear();
 
-      // Wait for any pending response body resolution promises to settle (or timeout after 2s)
-      if (responsePromises.length > 0) {
+      // Wait for any pending response body resolution promises to settle (or timeout after 2s).
+      // If we already captured a stream target (m3u8 or #EXTM3U), skip waiting to prevent stalling.
+      const hasCapturedStream = Array.from(requestsMap.values()).some(
+        (r) => r.body?.includes("#EXTM3U") || isM3u8StreamUrl(r.url),
+      );
+      if (responsePromises.length > 0 && !hasCapturedStream) {
         await Promise.race([
           Promise.all(responsePromises),
           new Promise((r) => setTimeout(r, 2000)),
