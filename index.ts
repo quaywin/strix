@@ -91,13 +91,16 @@ const handleScrapeStream = async (
         range: isM3u8Url ? null : range,
       });
       if (!upstream.ok) {
+        const isOffline = upstream.status === 404;
         return new Response(
           JSON.stringify({
-            error: `Upstream returned ${upstream.status}`,
+            error: isOffline
+              ? "Upstream stream is offline or ended (404 Not Found)"
+              : `Upstream returned ${upstream.status}`,
             upstreamStatus: upstream.status,
           }),
           {
-            status: 502,
+            status: isOffline ? 404 : 502,
             headers: { "Content-Type": "application/json" },
           },
         );

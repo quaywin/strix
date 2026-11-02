@@ -162,8 +162,10 @@ export class ScraperEngine {
         const resUrl = response.url();
         const status = response.status();
 
-        if (status >= 400) {
-          console.log(`[BROWSER HTTP ERROR] ${status} for URL: ${resUrl}`);
+        if (status >= 400 && isM3u8StreamUrl(resUrl)) {
+          console.log(
+            `[SCRAPER] Stream request returned HTTP ${status}: ${resUrl}`,
+          );
         }
 
         if (resolveM3u8Body && isM3u8StreamUrl(resUrl)) {
