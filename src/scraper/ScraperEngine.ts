@@ -32,6 +32,16 @@ export function isM3u8StreamUrl(url: string): boolean {
   return lower.includes(".m3u8") || lower.includes("/m3u8");
 }
 
+/**
+ * Detects whether a target URL is an embed player / stream container
+ * (e.g. /embed/, /cv-embed/, /live-embed/, /player/, /play/, /v/, etc.).
+ */
+export function isEmbedPlayerUrl(url: string): boolean {
+  return /\/(embed|cv-embed|live-embed|player|play|v)(\/|\.php|\?|$)/i.test(
+    url,
+  );
+}
+
 const MEDIA_CHUNK_REGEX = /\.(ts|m4s|mp4|webm|mkv)($|\?)/i;
 
 const AD_TRACKER_REGEX =
@@ -52,6 +62,7 @@ export class ScraperEngine {
     url: string,
     timeoutSec: number = CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
     resolveM3u8Body: boolean = false,
+    forceEmbed: boolean = false,
   ): Promise<RequestData[]> {
     if (this.semaphore.activeCount >= this.semaphore.maxConcurrency) {
       console.log(
@@ -110,12 +121,30 @@ export class ScraperEngine {
         popup.close().catch(() => {}).finally(() => popups.delete(popup));
       });
 
+      let targetOrigin = "";
+      try {
+        targetOrigin = new URL(url).origin;
+      } catch (_) {}
+
+      const isEmbedUrl = forceEmbed || isEmbedPlayerUrl(url);
+
       // Block ads, trackers, images, fonts, and actual video/audio chunks.
       // We only need the .m3u8 playlist URL, NOT the gigabytes of video decoding in RAM.
       await page.route("**/*", (route) => {
         const req = route.request();
         const type = req.resourceType();
         const reqUrl = req.url().toLowerCase();
+
+        // Fulfill virtual origin-matched loader request
+        if (isEmbedUrl && reqUrl.includes("/strix-embed-loader.html")) {
+          return route
+            .fulfill({
+              status: 200,
+              contentType: "text/html; charset=utf-8",
+              body: `<!DOCTYPE html><html><head><title>Strix Embed Loader</title></head><body style="margin:0;padding:0;overflow:hidden;background:#000;"><iframe src="${url}" width="100%" height="100%" style="border:none;width:100vw;height:100vh;" allow="autoplay; fullscreen; encrypted-media"></iframe></body></html>`,
+            })
+            .catch(() => {});
+        }
 
         // Never block target m3u8 playlists
         if (isM3u8StreamUrl(reqUrl)) {
@@ -130,14 +159,26 @@ export class ScraperEngine {
         const shouldBlock =
           type === "image" ||
           type === "font" ||
-          type === "media" ||
           MEDIA_CHUNK_REGEX.test(reqUrl) ||
           AD_TRACKER_REGEX.test(reqUrl);
 
         if (shouldBlock) {
           route.abort().catch(() => {});
         } else {
-          route.continue().catch(() => {});
+          // If this is an iframe loader and the request has no referer or referer is about:blank,
+          // inject the target embed origin as referer so upstream servers (e.g. Nginx) don't 302 redirect.
+          const reqHeaders = req.headers();
+          const curReferer = reqHeaders["referer"] || "";
+          if (
+            isEmbedUrl &&
+            targetOrigin &&
+            (!curReferer || curReferer.includes("about:blank"))
+          ) {
+            reqHeaders["referer"] = targetOrigin + "/";
+            route.continue({ headers: reqHeaders }).catch(() => {});
+          } else {
+            route.continue().catch(() => {});
+          }
         }
       });
 
@@ -157,10 +198,12 @@ export class ScraperEngine {
         }
       });
 
-      // Handle responses if body resolution is required
+      // Handle responses: detect mpegurl Content-Type or #EXTM3U text body for fetch/xhr requests
       page.on("response", (response: Response) => {
         const resUrl = response.url();
         const status = response.status();
+        const req = response.request();
+        const rType = req.resourceType();
 
         if (status >= 400 && isM3u8StreamUrl(resUrl)) {
           console.log(
@@ -168,19 +211,28 @@ export class ScraperEngine {
           );
         }
 
-        if (resolveM3u8Body && isM3u8StreamUrl(resUrl)) {
-          // If the request isn't registered yet, pre-register it to avoid race condition
-          if (!requestsMap.has(resUrl)) {
-            const req = response.request();
-            requestsMap.set(resUrl, {
-              url: resUrl,
-              method: req.method(),
-              headers: req.headers(),
-              resource_type: req.resourceType(),
-              post_data: req.postData(),
-            });
-          }
+        const contentType = (
+          response.headers()["content-type"] || ""
+        ).toLowerCase();
+        const isMpegUrl = contentType.includes("mpegurl");
+        const isKnownM3u8 = isM3u8StreamUrl(resUrl);
+        const isFetchOrXhr = rType === "fetch" || rType === "xhr";
 
+        const isMediaOrAsset =
+          contentType.includes("image/") ||
+          contentType.includes("video/") ||
+          contentType.includes("audio/") ||
+          contentType.includes("javascript") ||
+          contentType.includes("text/css") ||
+          contentType.includes("font/");
+
+        // Sniff if this is a known m3u8, mpegurl, or a candidate fetch/xhr request
+        const shouldSniff =
+          status >= 200 &&
+          status < 300 &&
+          (isKnownM3u8 || isMpegUrl || (isFetchOrXhr && !isMediaOrAsset));
+
+        if (shouldSniff) {
           const p = (async () => {
             try {
               const text = await Promise.race([
@@ -188,18 +240,42 @@ export class ScraperEngine {
                 new Promise<string>((_, reject) =>
                   trackedTimeout(
                     () => reject(new Error("Response body timeout")),
-                    5000,
+                    3000,
                   ),
                 ),
               ]);
-              const reqData = requestsMap.get(resUrl);
-              if (reqData) {
-                reqData.body = text;
+
+              const trimmed = text.trim();
+              const hasExtM3u = trimmed.startsWith("#EXTM3U");
+
+              if (hasExtM3u || isMpegUrl) {
+                // Register or update stream target with its playlist body
+                const existing = requestsMap.get(resUrl);
+                if (existing) {
+                  existing.body = text;
+                } else {
+                  requestsMap.set(resUrl, {
+                    url: resUrl,
+                    method: req.method(),
+                    headers: req.headers(),
+                    resource_type: req.resourceType(),
+                    post_data: req.postData(),
+                    body: text,
+                  });
+                }
+                console.log(
+                  `[SCRAPER] Captured stream target via response sniffing (${hasExtM3u ? "#EXTM3U" : "mpegurl"}): ${resUrl}`,
+                );
+                // Mark done immediately to complete scraping in 2-3s
+                markDone();
+              } else if (isKnownM3u8 && resolveM3u8Body) {
+                const reqData = requestsMap.get(resUrl);
+                if (reqData) {
+                  reqData.body = text;
+                }
               }
-            } catch (e) {
-              console.warn(
-                `[SCRAPER] Failed to get response body for ${resUrl}: ${(e as Error).message}`,
-              );
+            } catch (_) {
+              // Ignore body read errors for non-playlist or cancelled responses
             }
           })();
           responsePromises.push(p);
@@ -289,15 +365,20 @@ export class ScraperEngine {
       const startTime = Date.now();
 
       // Start page navigation
-      // If URL is an embed URL (e.g. /embed/, /e/, /player/), wrap in an iframe container
-      // to bypass anti-direct-access checks (where players require window.top !== window.self)
-      const isEmbedUrl = /\/(embed|e|player)(\/|\.php|\?|$)/i.test(url);
+      // If URL is an embed URL (e.g. /embed/, /cv-embed/, /player/), navigate via a virtual
+      // origin-matched iframe container to satisfy sec-fetch-dest: iframe, CSP frame-ancestors,
+      // and anti-direct-access checks.
+      const loaderUrl =
+        isEmbedUrl && targetOrigin
+          ? `${targetOrigin}/strix-embed-loader.html`
+          : null;
+
       const navigatePromise = (
-        isEmbedUrl
-          ? page.setContent(
-              `<!DOCTYPE html><html><head><title>Strix Embed Loader</title></head><body style="margin:0;padding:0;overflow:hidden;background:#000;"><iframe src="${url}" width="100%" height="100%" style="border:none;width:100vw;height:100vh;" allow="autoplay; fullscreen; encrypted-media"></iframe></body></html>`,
-              { timeout: timeoutSec * 1000, waitUntil: "domcontentloaded" },
-            )
+        loaderUrl
+          ? page.goto(loaderUrl, {
+              timeout: timeoutSec * 1000,
+              waitUntil: "domcontentloaded",
+            })
           : page.goto(url, {
               timeout: timeoutSec * 1000,
               waitUntil: "domcontentloaded",

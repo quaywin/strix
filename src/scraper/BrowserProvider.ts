@@ -40,6 +40,24 @@ const STEALTH_INIT_SCRIPT = `
     });
   } catch (e) {}
 
+  // Emulate subframe context so window.self !== window.top and window.parent !== window.self
+  // to bypass client-side anti-embed checks (if (window.self === window.top) { go(); return; })
+  try {
+    const fakeSelf = new Proxy(window, {
+      get(target, prop) {
+        if (prop === "top") return window.top;
+        if (prop === "self") return fakeSelf;
+        if (prop === "parent") return window.top;
+        const val = Reflect.get(target, prop);
+        return typeof val === "function" ? val.bind(target) : val;
+      }
+    });
+    Object.defineProperty(window, "self", {
+      get: () => fakeSelf,
+      configurable: true,
+    });
+  } catch (e) {}
+
   // Disable popup window opening to block click-jack ads from spawning new tabs
   try {
     window.open = () => ({ closed: true, focus: () => {}, close: () => {} });

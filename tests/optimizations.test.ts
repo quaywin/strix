@@ -244,3 +244,132 @@ describe("getRequestOrigin and getHeader", () => {
     expect(getHeader(headers, "missing")).toBeUndefined();
   });
 });
+
+describe("Content-based #EXTM3U stream detection and proxying", () => {
+  it("rewrites extensionless playlist URLs (like /cv/channel-name) correctly", async () => {
+    const { rewriteM3u8Playlist } = await import("../src/utils/m3u8");
+    const playlist = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:3",
+      "#EXT-X-TARGETDURATION:6",
+      "#EXTINF:6.0,",
+      "chunk-001.ts",
+      "#EXTINF:6.0,",
+      "/hls/chunk-002.ts",
+    ].join("\n");
+
+    const baseUrl = "https://sportsbite.org/cv/acc-network-usa";
+    const proxySegmentUrl = (absUrl: string) => {
+      const p = new URLSearchParams();
+      p.set("url", absUrl);
+      p.set("referer", "https://sportsbite.org/watch/channel/acc-network");
+      return `https://proxy.quaywin.com/proxy-chunk?${p.toString()}`;
+    };
+
+    const rewritten = rewriteM3u8Playlist(playlist, baseUrl, { proxySegmentUrl });
+    expect(rewritten).toContain(
+      "https://proxy.quaywin.com/proxy-chunk?url=https%3A%2F%2Fsportsbite.org%2Fcv%2Fchunk-001.ts&referer=https%3A%2F%2Fsportsbite.org%2Fwatch%2Fchannel%2Facc-network",
+    );
+    expect(rewritten).toContain(
+      "https://proxy.quaywin.com/proxy-chunk?url=https%3A%2F%2Fsportsbite.org%2Fhls%2Fchunk-002.ts&referer=https%3A%2F%2Fsportsbite.org%2Fwatch%2Fchannel%2Facc-network",
+    );
+  });
+});
+
+describe("isEmbedPlayerUrl and stealth anti-embed bypass", () => {
+  it("correctly classifies embed vs non-embed URLs", async () => {
+    const { isEmbedPlayerUrl } = await import("../src/scraper/ScraperEngine");
+
+    expect(isEmbedPlayerUrl("https://domain.com/embed/stream-1")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/cv-embed/embed/channel")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/live-embed/id")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/player.php?id=123")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/play/stream")).toBe(true);
+    expect(isEmbedPlayerUrl("https://domain.com/v/xyz")).toBe(true);
+
+    expect(isEmbedPlayerUrl("https://domain.com/watch/channel/acc-network")).toBe(false);
+    expect(isEmbedPlayerUrl("https://domain.com/matches/today")).toBe(false);
+    expect(isEmbedPlayerUrl("https://domain.com/channels")).toBe(false);
+  });
+
+  it("emulates subframe context so window.self !== window.top in browser context", async () => {
+    const { PlaywrightBrowserProvider } = await import(
+      "../src/scraper/BrowserProvider"
+    );
+    const provider = new PlaywrightBrowserProvider();
+    const context = await provider.acquireContext();
+    const page = await context.newPage();
+
+    const evaluation = await page.evaluate(() => {
+      return {
+        isSelfEqualTop: window.self === window.top,
+        isSelfNotTop: window.self !== window.top,
+        isParentNotSelf: window.parent !== window.self,
+        selfType: typeof window.self,
+        hasDocument: Boolean(window.self.document),
+      };
+    });
+
+    expect(evaluation.isSelfEqualTop).toBe(false);
+    expect(evaluation.isSelfNotTop).toBe(true);
+    expect(evaluation.isParentNotSelf).toBe(true);
+    expect(evaluation.selfType).toBe("object");
+    expect(evaluation.hasDocument).toBe(true);
+
+    await page.close();
+    await provider.releaseContext();
+  });
+
+  it("loads embed URLs via virtual origin-matched iframe loader and satisfies frame-ancestors CSP", async () => {
+    let embedRequestedAsIframe = false;
+    let streamCaptured = false;
+
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/embed/test-stream") {
+          const secFetchDest = req.headers.get("sec-fetch-dest");
+          if (secFetchDest === "iframe") {
+            embedRequestedAsIframe = true;
+          }
+          return new Response(
+            `<!DOCTYPE html><html><body><script>fetch('/api/manifest').then(r => r.text());</script></body></html>`,
+            {
+              headers: {
+                "Content-Type": "text/html",
+                "Content-Security-Policy": "frame-ancestors 'self'",
+              },
+            },
+          );
+        }
+        if (url.pathname === "/api/manifest") {
+          streamCaptured = true;
+          return new Response(
+            `#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nseg1.ts\n`,
+            {
+              headers: {
+                "Content-Type": "application/vnd.apple.mpegurl",
+              },
+            },
+          );
+        }
+        return new Response("Not found", { status: 404 });
+      },
+    });
+
+    try {
+      const { scraperEngine } = await import("../src/scraper/ScraperEngine");
+      const targetUrl = `http://localhost:${server.port}/embed/test-stream`;
+      const requests = await scraperEngine.collectRequests(targetUrl, 5, true, true);
+
+      expect(embedRequestedAsIframe).toBe(true);
+      expect(streamCaptured).toBe(true);
+      expect(requests.some((r) => r.body?.includes("#EXTM3U"))).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+

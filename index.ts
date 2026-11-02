@@ -14,7 +14,7 @@ import {
 } from "./src/utils/http";
 import { rewriteM3u8Playlist } from "./src/utils/m3u8";
 
-const handleScrapeStream = async (
+export const handleScrapeStream = async (
   query: {
     url?: string;
     proxy?: string;
@@ -23,10 +23,22 @@ const handleScrapeStream = async (
     json?: string;
     proxy_segments?: string;
     proxy_all?: string;
+    embed?: string;
+    is_embed?: string;
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, proxy, sub, format, json, proxy_segments, proxy_all } = query;
+  const {
+    url,
+    proxy,
+    sub,
+    format,
+    json,
+    proxy_segments,
+    proxy_all,
+    embed,
+    is_embed,
+  } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -44,13 +56,22 @@ const handleScrapeStream = async (
     proxy_segments === "true" ||
     proxy_all === "1" ||
     proxy_all === "true";
+  const wantEmbed =
+    embed === "1" ||
+    embed === "true" ||
+    is_embed === "1" ||
+    is_embed === "true";
 
   // Forward the client Range header in proxy mode so mp4/mkv clients can
   // seek; ignored for non-proxy mode (we just 302 to the stream URL).
   const range = request.headers.get("range");
   try {
     if (wantJson) {
-      const extracted = await scraperService.extractStream(url, wantSub);
+      const extracted = await scraperService.extractStream(
+        url,
+        wantSub,
+        wantEmbed,
+      );
       return new Response(JSON.stringify(extracted), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -61,6 +82,7 @@ const handleScrapeStream = async (
       const { url: streamUrl } = await scraperService.extractStream(
         url,
         wantSub,
+        wantEmbed,
       );
       return Response.redirect(streamUrl, 302);
     }
@@ -70,8 +92,11 @@ const handleScrapeStream = async (
     // expired); we invalidate the cache, re-scrape once, and retry exactly
     // one time. Further failures surface as a 502 to the client.
     const proxyOnce = async (): Promise<Response> => {
-      const { url: streamUrl, headers: upstreamHeaders } =
-        await scraperService.extractStream(url, wantSub);
+      const {
+        url: streamUrl,
+        headers: upstreamHeaders,
+        body: cachedBody,
+      } = await scraperService.extractStream(url, wantSub, wantEmbed);
 
       const requestHeaders = new Headers();
       if (upstreamHeaders) {
@@ -81,7 +106,10 @@ const handleScrapeStream = async (
       }
 
       const isM3u8Url = streamUrl.toLowerCase().includes(".m3u8");
-      if (isM3u8Url) {
+      const hasExtM3uBody = Boolean(cachedBody?.trim().startsWith("#EXTM3U"));
+      const isKnownM3u8 = isM3u8Url || hasExtM3uBody;
+
+      if (isKnownM3u8) {
         // Strip Range for m3u8 playlist manifests and force uncompressed delivery.
         // Forwarding Range: bytes=0- on playlists causes upstream CDNs to reply
         // with HTTP 206 Partial Content in gzip encoding, triggering Bun's ZlibError.
@@ -93,7 +121,7 @@ const handleScrapeStream = async (
       let upstream = await smartFetch(streamUrl, {
         signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
         headers: requestHeaders,
-        range: isM3u8Url ? null : range,
+        range: isKnownM3u8 ? null : range,
       });
       if (!upstream.ok) {
         const isOffline = upstream.status === 404;
@@ -132,17 +160,26 @@ const handleScrapeStream = async (
       const contentLength = upstream.headers.get("Content-Length");
       if (contentLength) headers.set("Content-Length", contentLength);
 
-      const isM3u8 =
-        contentType?.toLowerCase().includes("mpegurl") ||
-        streamUrl.toLowerCase().includes(".m3u8");
+      const contentTypeLower = contentType?.toLowerCase() || "";
+      const isMpegUrlType = contentTypeLower.includes("mpegurl");
+      const isBinaryVideoType =
+        contentTypeLower.startsWith("video/") ||
+        contentTypeLower.startsWith("audio/") ||
+        /\.(mp4|mkv|webm|ts|m4s)($|\?)/i.test(streamUrl);
 
-      if (isM3u8) {
-        let text: string;
+      // Determine if content is HLS playlist (#EXTM3U) even if URL has no .m3u8
+      let isM3u8 = isKnownM3u8 || isMpegUrlType;
+      let text: string | null = null;
+
+      if (isM3u8 || !isBinaryVideoType) {
         try {
           text = await upstream.text();
+          if (text.trim().startsWith("#EXTM3U")) {
+            isM3u8 = true;
+          }
         } catch (decompError) {
           logger.warn(
-            `Decompression error on m3u8 playlist (${(decompError as Error).message}), retrying with identity encoding...`,
+            `Decompression error on stream (${(decompError as Error).message}), retrying with identity encoding...`,
             "App",
           );
           requestHeaders.set("accept-encoding", "identity");
@@ -153,8 +190,13 @@ const handleScrapeStream = async (
             range: null,
           });
           text = await upstream.text();
+          if (text.trim().startsWith("#EXTM3U")) {
+            isM3u8 = true;
+          }
         }
+      }
 
+      if (isM3u8 && text !== null) {
         const requestOrigin = getRequestOrigin(request);
         const upstreamReferer = getHeader(upstreamHeaders, "referer");
         const upstreamUserAgent = getHeader(upstreamHeaders, "user-agent");
@@ -177,9 +219,7 @@ const handleScrapeStream = async (
           proxySegmentUrl,
         });
 
-        if (!headers.has("Content-Type")) {
-          headers.set("Content-Type", "application/vnd.apple.mpegurl");
-        }
+        headers.set("Content-Type", "application/vnd.apple.mpegurl");
         headers.delete("Content-Length"); // Length changed due to URL rewriting
         headers.delete("Content-Range");
         headers.delete("Content-Encoding");
@@ -191,7 +231,7 @@ const handleScrapeStream = async (
       }
 
       // For binary video (mp4/mkv), stream directly with Range support
-      return new Response(upstream.body, {
+      return new Response(text !== null ? text : upstream.body, {
         status: upstream.status,
         headers,
       });
@@ -225,7 +265,7 @@ const handleScrapeStream = async (
   }
 };
 
-const app = new Elysia()
+export const app = new Elysia()
   .use(cors({ origin: "*" }))
   .onError(({ code, error, request }) => {
     logger.error(`${code} on ${request.method} ${request.url}`, "App", error);

@@ -62,6 +62,7 @@ class TtlCache<T> {
 export interface ExtractedStreamResult {
   url: string;
   headers?: Record<string, string>;
+  body?: string;
 }
 
 // Global cache instance
@@ -102,6 +103,8 @@ export class ScraperService {
     streamCache.delete(`extract:${url}`);
     streamCache.delete(`extract:${url}:sub:true`);
     streamCache.delete(`extract:${url}:sub:false`);
+    streamCache.delete(`extract:${url}:sub:true:embed:true`);
+    streamCache.delete(`extract:${url}:sub:false:embed:true`);
   }
 
   /**
@@ -219,8 +222,9 @@ export class ScraperService {
   async extractStream(
     url: string,
     sub: boolean = false,
+    isEmbed: boolean = false,
   ): Promise<ExtractedStreamResult> {
-    const cacheKey = `extract:${url}:sub:${sub}`;
+    const cacheKey = `extract:${url}:sub:${sub}${isEmbed ? ":embed:true" : ""}`;
     const cached = streamCache.get(cacheKey);
     if (cached) {
       return cached;
@@ -236,7 +240,7 @@ export class ScraperService {
       return existingInFlight;
     }
 
-    const scrapePromise = this.doExtractStream(url, sub, cacheKey);
+    const scrapePromise = this.doExtractStream(url, sub, cacheKey, isEmbed);
     this.inFlightScrapes.set(cacheKey, scrapePromise);
 
     try {
@@ -250,9 +254,10 @@ export class ScraperService {
     url: string,
     sub: boolean,
     cacheKey: string,
+    isEmbed: boolean = false,
   ): Promise<ExtractedStreamResult> {
     logger.info(
-      `Extracting raw stream URL for: ${url} (sub=${sub})`,
+      `Extracting raw stream URL for: ${url} (sub=${sub}${isEmbed ? ", embed=true" : ""})`,
       "ScraperService",
     );
 
@@ -309,13 +314,23 @@ export class ScraperService {
       url,
       CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
       sub,
+      isEmbed,
     );
 
-    // Prefer master > playlist > mono > any m3u8 > mp4/mkv.
-    const selectedReq = requests.find((r) => r.url.includes(".m3u8"));
+    // Prioritize requests whose body starts with #EXTM3U, then URL with .m3u8, then direct media
+    const extm3uReq = requests.find(
+      (r) => r.body && r.body.trim().startsWith("#EXTM3U"),
+    );
+    const m3u8Req = requests.find((r) => r.url.toLowerCase().includes(".m3u8"));
+    const mediaReq = requests.find(
+      (r) =>
+        r.resource_type === "media" ||
+        /\.(mp4|mkv|webm)($|\?)/i.test(r.url),
+    );
+    const selectedReq = extm3uReq || m3u8Req || mediaReq || requests[0];
 
     logger.info(
-      `Total requests captured: ${requests.length}`,
+      `Total requests captured: ${requests.length}${extm3uReq ? " (found #EXTM3U content)" : ""}`,
       "ScraperService",
     );
 
@@ -340,7 +355,11 @@ export class ScraperService {
     }
 
     let playlistBody = selectedReq.body;
-    if (sub && !playlistBody && selectedReq.url.includes(".m3u8")) {
+    const isM3u8Content =
+      Boolean(playlistBody?.trim().startsWith("#EXTM3U")) ||
+      selectedReq.url.toLowerCase().includes(".m3u8");
+
+    if (sub && !playlistBody && isM3u8Content) {
       try {
         const res = await smartFetch(selectedReq.url, {
           headers: {
@@ -361,7 +380,7 @@ export class ScraperService {
     }
 
     let streamUrl = selectedReq.url;
-    if (sub && playlistBody) {
+    if (sub && playlistBody && playlistBody.trim().startsWith("#EXTM3U")) {
       const resolved = this.resolveM3u8Playlist(selectedReq.url, playlistBody);
       if (resolved !== selectedReq.url) {
         logger.info(
@@ -375,6 +394,7 @@ export class ScraperService {
     const result: ExtractedStreamResult = {
       url: streamUrl,
       headers: upstreamHeaders,
+      body: playlistBody,
     };
 
     streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
