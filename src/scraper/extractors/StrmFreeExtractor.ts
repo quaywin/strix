@@ -121,8 +121,9 @@ export class StrmFreeExtractor {
     return {
       url: streamUrl,
       headers: {
-        Referer: embedUrl,
-        "User-Agent": userAgent,
+        referer: embedUrl,
+        "user-agent": userAgent,
+        origin: origin,
       },
     };
   }

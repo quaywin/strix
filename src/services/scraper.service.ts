@@ -330,7 +330,7 @@ export class ScraperService {
       for (const [key, value] of Object.entries(selectedReq.headers)) {
         const lowerKey = key.toLowerCase();
         if (!FORBIDDEN_HEADERS.has(lowerKey)) {
-          upstreamHeaders[key] = value;
+          upstreamHeaders[lowerKey] = value;
         }
       }
     }

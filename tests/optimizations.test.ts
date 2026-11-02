@@ -71,9 +71,9 @@ describe("rewriteM3u8Playlist", () => {
     const baseUrl = "https://cdn.example.com/live/stream/playlist.m3u8?token=123";
     const rewritten = rewriteM3u8Playlist(playlist, baseUrl);
 
-    expect(rewritten).toContain('URI="https://cdn.example.com/live/stream/enc.key"');
-    expect(rewritten).toContain("https://cdn.example.com/live/stream/segment1.ts");
-    expect(rewritten).toContain("https://cdn.example.com/live/chunks/segment2.ts");
+    expect(rewritten).toContain('URI="https://cdn.example.com/live/stream/enc.key?token=123"');
+    expect(rewritten).toContain("https://cdn.example.com/live/stream/segment1.ts?token=123");
+    expect(rewritten).toContain("https://cdn.example.com/live/chunks/segment2.ts?token=123");
     expect(rewritten).toContain("https://cdn.other.com/seg3.ts");
   });
 
@@ -93,12 +93,33 @@ describe("rewriteM3u8Playlist", () => {
     const rewritten = rewriteM3u8Playlist(playlist, baseUrl);
 
     expect(rewritten).toContain(
-      "https://strmfree.st/live/willow1080p/543728.js",
+      "https://strmfree.st/live/willow1080p/543728.js?_t=5M_jPHrgTz0vPBuJpp46GA",
     );
     expect(rewritten).toContain(
-      "https://strmfree.st/live/willow1080p/543729.js",
+      "https://strmfree.st/live/willow1080p/543729.js?_t=5M_jPHrgTz0vPBuJpp46GA",
     );
     expect(rewritten).not.toContain("\n543728.js\n");
+  });
+
+  it("proxies chunks correctly with requestOrigin from reverse proxy and forwards referer/ua", async () => {
+    const { rewriteM3u8Playlist } = await import("../src/utils/m3u8");
+    const playlist = [
+      "#EXTM3U",
+      "#EXTINF:4.0,",
+      "chunk-1.ts",
+    ].join("\n");
+
+    const baseUrl = "https://cdn.example.com/hls/live/index.m3u8?token=xyz";
+    const proxySegmentUrl = (absUrl: string) => {
+      const p = new URLSearchParams();
+      p.set("url", absUrl);
+      p.set("referer", "https://example.com/page");
+      p.set("ua", "Mozilla/5.0 Custom");
+      return `https://proxy.quaywin.com/proxy-chunk?${p.toString()}`;
+    };
+
+    const rewritten = rewriteM3u8Playlist(playlist, baseUrl, { proxySegmentUrl });
+    expect(rewritten).toContain("https://proxy.quaywin.com/proxy-chunk?url=https%3A%2F%2Fcdn.example.com%2Fhls%2Flive%2Fchunk-1.ts%3Ftoken%3Dxyz&referer=https%3A%2F%2Fexample.com%2Fpage&ua=Mozilla%2F5.0+Custom");
   });
 });
 
@@ -160,5 +181,66 @@ describe("smartFetch m3u8 header guard", () => {
     } finally {
       server.stop(true);
     }
+  });
+
+  it("injects DEFAULT_USER_AGENT when user-agent header is omitted", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new Response(
+          JSON.stringify({
+            userAgent: req.headers.get("user-agent"),
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+
+    try {
+      const { smartFetch, DEFAULT_USER_AGENT } = await import("../src/utils/http");
+      const res = await smartFetch(`http://localhost:${server.port}/test`);
+      const data = await res.json();
+      expect(data.userAgent).toBe(DEFAULT_USER_AGENT);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("getRequestOrigin and getHeader", () => {
+  it("extracts public origin from x-forwarded-proto and x-forwarded-host", async () => {
+    const { getRequestOrigin } = await import("../src/utils/http");
+
+    const req = new Request("http://127.0.0.1:5005/scrape-stream", {
+      headers: {
+        "x-forwarded-proto": "https, http",
+        "x-forwarded-host": "proxy.quaywin.com, 10.0.0.1",
+        host: "localhost:5005",
+      },
+    });
+
+    expect(getRequestOrigin(req)).toBe("https://proxy.quaywin.com");
+  });
+
+  it("falls back to host header or request url", async () => {
+    const { getRequestOrigin } = await import("../src/utils/http");
+
+    const reqWithHost = new Request("http://127.0.0.1:5005/scrape-stream", {
+      headers: { host: "myproxy.org" },
+    });
+    expect(getRequestOrigin(reqWithHost)).toBe("https://myproxy.org");
+
+    const reqLocal = new Request("http://localhost:5005/scrape-stream");
+    expect(getRequestOrigin(reqLocal)).toBe("http://localhost:5005");
+  });
+
+  it("getHeader performs case-insensitive lookup", async () => {
+    const { getHeader } = await import("../src/utils/http");
+    const headers = { Referer: "https://example.com/embed", "User-Agent": "Browser 1.0" };
+
+    expect(getHeader(headers, "referer")).toBe("https://example.com/embed");
+    expect(getHeader(headers, "REFERER")).toBe("https://example.com/embed");
+    expect(getHeader(headers, "user-agent")).toBe("Browser 1.0");
+    expect(getHeader(headers, "missing")).toBeUndefined();
   });
 });

@@ -1,5 +1,47 @@
 import { logger } from "../logger";
 
+export const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+/**
+ * Resolves the public origin of the incoming request, taking into account
+ * reverse proxy headers (e.g. Nginx, Cloudflare, Traefik) and optional PUBLIC_URL override.
+ */
+export function getRequestOrigin(request: Request): string {
+  if (process.env.PUBLIC_URL) {
+    return process.env.PUBLIC_URL.replace(/\/+$/, "");
+  }
+  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const host = request.headers.get("host")?.split(",")[0]?.trim();
+
+  const targetHost = forwardedHost || host;
+  if (targetHost) {
+    const proto =
+      forwardedProto ||
+      (targetHost.includes("localhost") || targetHost.includes("127.0.0.1")
+        ? "http"
+        : "https");
+    return `${proto}://${targetHost}`;
+  }
+  return new URL(request.url).origin;
+}
+
+/**
+ * Case-insensitive lookup for headers stored in a Record<string, string>.
+ */
+export function getHeader(
+  headers?: Record<string, string>,
+  name?: string,
+): string | undefined {
+  if (!headers || !name) return undefined;
+  const target = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === target) return v;
+  }
+  return undefined;
+}
+
 /**
  * Enhanced fetch helper that automatically falls back to system curl if
  * standard fetch gets blocked by upstream anti-bot/TLS-fingerprint systems
@@ -22,6 +64,11 @@ export async function smartFetch(
     for (const [key, value] of Object.entries(options.headers)) {
       headers[key.toLowerCase()] = value;
     }
+  }
+
+  // Ensure default browser user-agent is present so upstream CDNs don't reject Bun/curl
+  if (!headers["user-agent"]) {
+    headers["user-agent"] = DEFAULT_USER_AGENT;
   }
 
   const isM3u8 = url.toLowerCase().includes(".m3u8");

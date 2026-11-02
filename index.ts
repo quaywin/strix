@@ -6,7 +6,12 @@ import {
   NoSourceFoundError,
   scraperService,
 } from "./src/services/scraper.service";
-import { smartFetch } from "./src/utils/http";
+import {
+  DEFAULT_USER_AGENT,
+  getHeader,
+  getRequestOrigin,
+  smartFetch,
+} from "./src/utils/http";
 import { rewriteM3u8Playlist } from "./src/utils/m3u8";
 
 const handleScrapeStream = async (
@@ -92,12 +97,22 @@ const handleScrapeStream = async (
       });
       if (!upstream.ok) {
         const isOffline = upstream.status === 404;
+        let snippet = "";
+        try {
+          const bodyText = await upstream.text();
+          snippet = bodyText.slice(0, 300);
+        } catch (_) {}
+        logger.warn(
+          `Upstream fetch failed: HTTP ${upstream.status} for ${streamUrl}${snippet ? `. Response: ${snippet}` : ""}`,
+          "App",
+        );
         return new Response(
           JSON.stringify({
             error: isOffline
               ? "Upstream stream is offline or ended (404 Not Found)"
               : `Upstream returned ${upstream.status}`,
             upstreamStatus: upstream.status,
+            upstreamSnippet: snippet || undefined,
           }),
           {
             status: isOffline ? 404 : 502,
@@ -140,14 +155,19 @@ const handleScrapeStream = async (
           text = await upstream.text();
         }
 
-        const requestOrigin = new URL(request.url).origin;
+        const requestOrigin = getRequestOrigin(request);
+        const upstreamReferer = getHeader(upstreamHeaders, "referer");
+        const upstreamUserAgent = getHeader(upstreamHeaders, "user-agent");
 
         const proxySegmentUrl = wantProxySegments
           ? (absUrl: string) => {
               const params = new URLSearchParams();
               params.set("url", absUrl);
-              if (upstreamHeaders?.["referer"]) {
-                params.set("referer", upstreamHeaders["referer"]);
+              if (upstreamReferer) {
+                params.set("referer", upstreamReferer);
+              }
+              if (upstreamUserAgent) {
+                params.set("ua", upstreamUserAgent);
               }
               return `${requestOrigin}/proxy-chunk?${params.toString()}`;
             }
@@ -235,6 +255,12 @@ const app = new Elysia()
     if (query.referer) {
       headers.set("referer", query.referer);
     }
+    const userAgent =
+      query.ua ||
+      request.headers.get("user-agent") ||
+      DEFAULT_USER_AGENT;
+    headers.set("user-agent", userAgent);
+
     const range = request.headers.get("range");
     if (range) {
       headers.set("range", range);
@@ -247,8 +273,22 @@ const app = new Elysia()
         range,
       });
 
+      if (!upstream.ok) {
+        logger.warn(
+          `Proxy-chunk upstream returned HTTP ${upstream.status} for ${chunkUrl}`,
+          "ProxyChunk",
+        );
+      }
+
       const resHeaders = new Headers();
-      const contentType = upstream.headers.get("Content-Type") || "video/mp2t";
+      let contentType = upstream.headers.get("Content-Type");
+      if (!contentType) {
+        if (chunkUrl.includes(".key") || chunkUrl.includes("/key")) {
+          contentType = "application/octet-stream";
+        } else {
+          contentType = "video/mp2t";
+        }
+      }
       resHeaders.set("Content-Type", contentType);
 
       const contentRange = upstream.headers.get("Content-Range");
@@ -264,6 +304,7 @@ const app = new Elysia()
       });
     } catch (e) {
       const error = e as Error;
+      logger.error(`Proxy-chunk failed for ${chunkUrl}: ${error.message}`, "ProxyChunk");
       return new Response(JSON.stringify({ error: error.message }), {
         status: 502,
         headers: { "Content-Type": "application/json" },
