@@ -9,16 +9,39 @@ export class Semaphore {
 
   /**
    * Acquire a slot in the semaphore. If all slots are in use, returns a promise
-   * that resolves when a slot becomes available.
+   * that resolves when a slot becomes available. Supports cancellation via AbortSignal.
    */
-  async acquire(): Promise<void> {
+  async acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+
     if (this.currentTasks < this.maxConcurrency) {
       this.currentTasks++;
       return;
     }
 
-    return new Promise<void>((resolve) => {
-      this.queue.push(resolve);
+    return new Promise<void>((resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const callback = () => {
+        if (onAbort && signal) {
+          signal.removeEventListener("abort", onAbort);
+        }
+        resolve();
+      };
+
+      if (signal) {
+        onAbort = () => {
+          const idx = this.queue.indexOf(callback);
+          if (idx !== -1) {
+            this.queue.splice(idx, 1);
+          }
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      this.queue.push(callback);
     });
   }
 
@@ -38,10 +61,14 @@ export class Semaphore {
 
   /**
    * Helper to run a task wrapped in acquire/release.
+   * If cancelled via signal while in queue or during execution, releases resources promptly.
    */
-  async run<T>(task: () => Promise<T>): Promise<T> {
-    await this.acquire();
+  async run<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    await this.acquire(signal);
     try {
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
       return await task();
     } finally {
       this.release();

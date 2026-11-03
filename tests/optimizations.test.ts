@@ -189,6 +189,34 @@ describe("smartFetch m3u8 header guard", () => {
     }
   });
 
+  it("forces cache-control: no-cache and pragma: no-cache for m3u8 requests to prevent live stalling", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new Response(
+          JSON.stringify({
+            cacheControl: req.headers.get("cache-control"),
+            pragma: req.headers.get("pragma"),
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+
+    try {
+      const { smartFetch } = await import("../src/utils/http");
+      const res = await smartFetch(
+        `http://localhost:${server.port}/stream/live.m3u8`,
+      );
+
+      const data = await res.json();
+      expect(data.cacheControl).toContain("no-cache");
+      expect(data.pragma).toBe("no-cache");
+    } finally {
+      server.stop(true);
+    }
+  });
+
   it("injects DEFAULT_USER_AGENT when user-agent header is omitted", async () => {
     const server = Bun.serve({
       port: 0,
@@ -382,5 +410,436 @@ describe("isEmbedPlayerUrl and stealth anti-embed bypass", () => {
     }
   });
 });
+
+describe("Upstream offline error handling", () => {
+  it("maps upstream 502/503/504 Bad Gateway to explicit 404 offline response", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/live/offline.m3u8") {
+          return new Response("Cloudflare error 502", { status: 502 });
+        }
+        return new Response("Not found", { status: 404 });
+      },
+    });
+
+    try {
+      const { handleScrapeStream } = await import("../index");
+      const { scraperService } = await import("../src/services/scraper.service");
+
+      // Mock extractStream to return the test stream URL
+      const origExtract = scraperService.extractStream.bind(scraperService);
+      scraperService.extractStream = async () => ({
+        url: `http://localhost:${server.port}/live/offline.m3u8`,
+        headers: {},
+      });
+
+      try {
+        const req = new Request("http://localhost:5005/scrape-stream");
+        const res = await handleScrapeStream(
+          {
+            url: "https://example.com/channel",
+            proxy: "1",
+          },
+          req,
+        );
+
+        expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error).toContain("offline or unavailable (HTTP 502)");
+        expect(data.upstreamStatus).toBe(502);
+      } finally {
+        scraperService.extractStream = origExtract;
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("sets no-cache headers on rewritten m3u8 playlist responses", async () => {
+    const playlistText = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nseg1.ts\n";
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new Response(playlistText, {
+          headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+        });
+      },
+    });
+
+    try {
+      const { handleScrapeStream } = await import("../index");
+      const { scraperService } = await import("../src/services/scraper.service");
+
+      const origExtract = scraperService.extractStream.bind(scraperService);
+      scraperService.extractStream = async () => ({
+        url: `http://localhost:${server.port}/live/test.m3u8`,
+        headers: {},
+      });
+
+      try {
+        const req = new Request("http://localhost:5005/scrape-stream");
+        const res = await handleScrapeStream(
+          {
+            url: "https://example.com/channel",
+            proxy: "1",
+          },
+          req,
+        );
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("cache-control")).toContain("no-cache");
+        expect(res.headers.get("pragma")).toBe("no-cache");
+      } finally {
+        scraperService.extractStream = origExtract;
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("recovers expired signed token streams by invalidating stale cache and re-scraping", async () => {
+    let callCount = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/live/expired.m3u8") {
+          return new Response("Not Found", { status: 404 });
+        }
+        if (url.pathname === "/live/fresh.m3u8") {
+          return new Response("#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nseg2.ts\n", {
+            headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+          });
+        }
+        return new Response("Not found", { status: 404 });
+      },
+    });
+
+    try {
+      const { handleScrapeStream } = await import("../index");
+      const { scraperService } = await import("../src/services/scraper.service");
+
+      const origExtract = scraperService.extractStream.bind(scraperService);
+      const origInvalidate = scraperService.invalidateCache.bind(scraperService);
+      let invalidated = false;
+
+      scraperService.invalidateCache = (u: string) => {
+        invalidated = true;
+        origInvalidate(u);
+      };
+
+      scraperService.extractStream = async () => {
+        callCount++;
+        if (callCount === 1) {
+          // First attempt: simulate cached stream URL with expired token (>30s old)
+          return {
+            url: `http://localhost:${server.port}/live/expired.m3u8`,
+            headers: {},
+            fromCache: true,
+            extractedAt: Date.now() - 60_000,
+          };
+        }
+        // Second attempt: fresh scrape returns new valid token URL
+        return {
+          url: `http://localhost:${server.port}/live/fresh.m3u8`,
+          headers: {},
+          fromCache: false,
+          extractedAt: Date.now(),
+        };
+      };
+
+      try {
+        const req = new Request("http://localhost:5005/scrape-stream");
+        const res = await handleScrapeStream(
+          {
+            url: "https://example.com/live-match",
+            proxy: "1",
+          },
+          req,
+        );
+
+        expect(res.status).toBe(200);
+        expect(callCount).toBe(2);
+        expect(invalidated).toBe(true);
+        const body = await res.text();
+        expect(body).toContain("#EXTM3U");
+        expect(body).toContain("seg2.ts");
+      } finally {
+        scraperService.extractStream = origExtract;
+        scraperService.invalidateCache = origInvalidate;
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("does not re-scrape freshly extracted offline streams, preventing infinite retry loops", async () => {
+    let callCount = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("Bad Gateway", { status: 502 });
+      },
+    });
+
+    try {
+      const { handleScrapeStream } = await import("../index");
+      const { scraperService } = await import("../src/services/scraper.service");
+
+      const origExtract = scraperService.extractStream.bind(scraperService);
+      scraperService.extractStream = async () => {
+        callCount++;
+        return {
+          url: `http://localhost:${server.port}/live/offline.m3u8`,
+          headers: {},
+          fromCache: true,
+          extractedAt: Date.now() - 5_000, // Extracted only 5s ago (<30s threshold)
+        };
+      };
+
+      try {
+        const req = new Request("http://localhost:5005/scrape-stream");
+        const res = await handleScrapeStream(
+          {
+            url: "https://play.blossomz.store/?ch=164",
+            proxy: "1",
+          },
+          req,
+        );
+
+        // Expect immediate 404 without re-scraping
+        expect(res.status).toBe(404);
+        expect(callCount).toBe(1);
+      } finally {
+        scraperService.extractStream = origExtract;
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("conditional invalidateCache protects newly created entries against stale evictions", async () => {
+    const { scraperService } = await import("../src/services/scraper.service");
+    const { scraperEngine } = await import("../src/scraper/ScraperEngine");
+
+    const targetUrl = "https://example.com/race-condition-test";
+    scraperService.invalidateCache(targetUrl);
+
+    const origCollect = scraperEngine.collectRequests.bind(scraperEngine);
+    let collectCount = 0;
+    scraperEngine.collectRequests = async () => {
+      collectCount++;
+      return [
+        {
+          url: "https://cdn.example.com/live.m3u8",
+          method: "GET",
+          headers: {},
+          resource_type: "media",
+          post_data: null,
+          body: "#EXTM3U\n#EXTINF:4.0,\nseg.ts\n",
+        },
+      ];
+    };
+
+    try {
+      const first = await scraperService.extractStream(targetUrl);
+      expect(collectCount).toBe(1);
+      expect(first.fromCache).toBe(false);
+      const firstExtractedAt = first.extractedAt!;
+
+      // Attempt stale invalidation: trying to invalidate an entry older than firstExtractedAt - 1000
+      const wasInvalidated = scraperService.invalidateCache(
+        targetUrl,
+        firstExtractedAt - 1000,
+      );
+      expect(wasInvalidated).toBe(false);
+
+      // Verify entry is still in cache
+      const cached = await scraperService.extractStream(targetUrl);
+      expect(cached.fromCache).toBe(true);
+      expect(collectCount).toBe(1); // No new scrape performed
+
+      // Valid invalidation: invalidate with timestamp >= firstExtractedAt
+      const nowInvalidated = scraperService.invalidateCache(
+        targetUrl,
+        firstExtractedAt,
+      );
+      expect(nowInvalidated).toBe(true);
+
+      // Next call should scrape again
+      const refreshed = await scraperService.extractStream(targetUrl);
+      expect(collectCount).toBe(2);
+      expect(refreshed.fromCache).toBe(false);
+    } finally {
+      scraperEngine.collectRequests = origCollect;
+      scraperService.invalidateCache(targetUrl);
+    }
+  });
+
+  it("negative caching prevents spamming browser launches on channels with no playable streams", async () => {
+    const { scraperService, NoSourceFoundError } = await import(
+      "../src/services/scraper.service"
+    );
+    const { scraperEngine } = await import("../src/scraper/ScraperEngine");
+
+    const deadUrl = "https://example.com/dead-channel";
+    scraperService.invalidateCache(deadUrl);
+
+    let engineCollectCalls = 0;
+    const origCollect = scraperEngine.collectRequests.bind(scraperEngine);
+    scraperEngine.collectRequests = async () => {
+      engineCollectCalls++;
+      return []; // Return no media requests
+    };
+
+    try {
+      // First attempt: triggers collectRequests and throws NoSourceFoundError
+      await expect(scraperService.extractStream(deadUrl)).rejects.toThrow(
+        NoSourceFoundError,
+      );
+      expect(engineCollectCalls).toBe(1);
+
+      // Second attempt within 30s: hits negative cache immediately without calling engine
+      await expect(scraperService.extractStream(deadUrl)).rejects.toThrow(
+        NoSourceFoundError,
+      );
+      expect(engineCollectCalls).toBe(1); // Still 1, browser was not launched again!
+    } finally {
+      scraperEngine.collectRequests = origCollect;
+      scraperService.invalidateCache(deadUrl);
+    }
+  });
+
+  describe("Rapid channel surfing & client cancellation handling", () => {
+    it("semaphore cancels queued wait immediately when AbortSignal fires", async () => {
+      const sem = new Semaphore(1);
+      const controller = new AbortController();
+
+      // Acquire the single available slot
+      await sem.acquire();
+      expect(sem.activeCount).toBe(1);
+      expect(sem.queuedCount).toBe(0);
+
+      // Second task tries to acquire and waits in queue
+      const waitingPromise = sem.acquire(controller.signal);
+      expect(sem.queuedCount).toBe(1);
+
+      // Abort second task while in queue
+      controller.abort();
+
+      await expect(waitingPromise).rejects.toThrow("aborted");
+      // Queue should immediately evict the aborted task
+      expect(sem.queuedCount).toBe(0);
+
+      // Release first task, slot should be freed
+      sem.release();
+      expect(sem.activeCount).toBe(0);
+    });
+
+    it("in-flight scrape subscriber reference counting handles channel switching safely", async () => {
+      const { scraperService } = await import("../src/services/scraper.service");
+      const { scraperEngine } = await import("../src/scraper/ScraperEngine");
+
+      const surfUrl = "https://example.com/channel-surfing-test";
+      scraperService.invalidateCache(surfUrl);
+
+      let abortedOnEngine = false;
+      let engineStarted = false;
+      const origCollect = scraperEngine.collectRequests.bind(scraperEngine);
+
+      scraperEngine.collectRequests = async (_u, _t, _s, _e, signal) => {
+        engineStarted = true;
+        if (signal) {
+          signal.addEventListener("abort", () => {
+            abortedOnEngine = true;
+          });
+        }
+        // Simulate scrape in progress
+        await new Promise((r) => setTimeout(r, 80));
+        return [
+          {
+            url: "https://cdn.example.com/surf.m3u8",
+            method: "GET",
+            headers: {},
+            resource_type: "media",
+            post_data: null,
+            body: "#EXTM3U\n#EXTINF:4.0,\nseg.ts\n",
+          },
+        ];
+      };
+
+      try {
+        const client1 = new AbortController();
+        const client2 = new AbortController();
+
+        // Client 1 starts scrape
+        const p1 = scraperService.extractStream(surfUrl, false, false, client1.signal);
+        // Client 2 joins the same in-flight scrape
+        const p2 = scraperService.extractStream(surfUrl, false, false, client2.signal);
+
+        // Client 1 switches channel (cancels client 1)
+        client1.abort();
+        await expect(p1).rejects.toThrow("aborted");
+
+        // Client 2 is still watching, so engine scrape must NOT be aborted
+        const res2 = await p2;
+        expect(res2.url).toBe("https://cdn.example.com/surf.m3u8");
+        expect(abortedOnEngine).toBe(false);
+
+        // When all clients cancel on a fresh request:
+        scraperService.invalidateCache(surfUrl);
+        const client3 = new AbortController();
+        const p3 = scraperService.extractStream(surfUrl, false, false, client3.signal);
+        client3.abort();
+
+        await p3.catch(() => {});
+        expect(abortedOnEngine).toBe(true);
+      } finally {
+        scraperEngine.collectRequests = origCollect;
+        scraperService.invalidateCache(surfUrl);
+      }
+    });
+
+    it("handleScrapeStream returns HTTP 499 when client disconnects or aborts", async () => {
+      const { handleScrapeStream } = await import("../index");
+      const { scraperService } = await import("../src/services/scraper.service");
+
+      const origExtract = scraperService.extractStream.bind(scraperService);
+      scraperService.extractStream = async (_u, _s, _e, signal) => {
+        if (signal?.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
+        throw new DOMException("The operation was aborted", "AbortError");
+      };
+
+      try {
+        const controller = new AbortController();
+        controller.abort(); // Client already disconnected
+
+        const req = new Request("http://localhost:5005/scrape-stream", {
+          signal: controller.signal,
+        });
+
+        const res = await handleScrapeStream(
+          {
+            url: "https://example.com/rapid-channel-flip",
+            proxy: "1",
+          },
+          req,
+        );
+
+        expect(res.status).toBe(499);
+        const data = await res.json();
+        expect(data.error).toBe("Client cancelled request");
+      } finally {
+        scraperService.extractStream = origExtract;
+      }
+    });
+  });
+});
+
+
 
 

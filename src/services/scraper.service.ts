@@ -1,7 +1,7 @@
 import { CONFIG } from "../config";
 import { logger } from "../logger";
 import { StrmFreeExtractor } from "../scraper/extractors/StrmFreeExtractor";
-import { scraperEngine } from "../scraper/ScraperEngine";
+import { isM3u8StreamUrl, scraperEngine } from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
 
 class TtlCache<T> {
@@ -45,12 +45,17 @@ class TtlCache<T> {
     this.cache.delete(key);
   }
 
-  deletePrefix(prefix: string): void {
-    for (const key of this.cache.keys()) {
+  deletePrefix(prefix: string, predicate?: (value: T) => boolean): boolean {
+    let deletedAny = false;
+    for (const [key, entry] of this.cache.entries()) {
       if (key.startsWith(prefix)) {
-        this.cache.delete(key);
+        if (!predicate || predicate(entry.value)) {
+          this.cache.delete(key);
+          deletedAny = true;
+        }
       }
     }
+    return deletedAny;
   }
 
   private cleanup(): void {
@@ -71,6 +76,9 @@ export interface ExtractedStreamResult {
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  extractedAt?: number;
+  fromCache?: boolean;
+  isNotFound?: boolean;
 }
 
 // Global cache instance
@@ -97,18 +105,28 @@ const FORBIDDEN_HEADERS = new Set([
   "keep-alive",
 ]);
 
+interface InFlightScrape {
+  promise: Promise<ExtractedStreamResult>;
+  controller: AbortController;
+  subscribers: number;
+}
+
 export class ScraperService {
   // Deduplicates concurrent in-flight scrapes for the exact same stream (Thundering Herd protection)
-  private inFlightScrapes = new Map<string, Promise<ExtractedStreamResult>>();
+  private inFlightScrapes = new Map<string, InFlightScrape>();
 
   /**
-   * Removes the cached stream URL for a given source page. Used by callers
-   * (e.g. the proxy handler) when a previously cached URL turns out to be
-   * stale (e.g. upstream returned 403) so the next extractStream() call
-   * performs a fresh scrape.
+   * Removes the cached stream URL for a given source page.
+   * If `ifExtractedAtOrBefore` is provided, only deletes the entry if it was
+   * extracted at or before that timestamp. This prevents a concurrent or late
+   * request from accidentally wiping out a brand-new cache entry that was
+   * literally just created by another request.
    */
-  invalidateCache(url: string): void {
-    streamCache.deletePrefix(`extract:${url}`);
+  invalidateCache(url: string, ifExtractedAtOrBefore?: number): boolean {
+    return streamCache.deletePrefix(`extract:${url}`, (val) => {
+      if (ifExtractedAtOrBefore === undefined) return true;
+      return (val.extractedAt ?? 0) <= ifExtractedAtOrBefore;
+    });
   }
 
   /**
@@ -227,30 +245,78 @@ export class ScraperService {
     url: string,
     sub: boolean = false,
     isEmbed: boolean = false,
+    signal?: AbortSignal,
   ): Promise<ExtractedStreamResult> {
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+
     const cacheKey = `extract:${url}:sub:${sub}${isEmbed ? ":embed:true" : ""}`;
     const cached = streamCache.get(cacheKey);
     if (cached) {
-      return cached;
+      if (cached.isNotFound) {
+        throw new NoSourceFoundError(
+          "No m3u8/video source found - site may be down or content removed",
+        );
+      }
+      return { ...cached, fromCache: true };
     }
 
     // Coalesce concurrent in-flight requests for the exact same stream (Thundering Herd protection)
-    const existingInFlight = this.inFlightScrapes.get(cacheKey);
-    if (existingInFlight) {
+    let inFlight = this.inFlightScrapes.get(cacheKey);
+    if (inFlight) {
       logger.info(
         `Coalescing concurrent request for: ${url} (waiting for existing in-flight scrape)`,
         "ScraperService",
       );
-      return existingInFlight;
+      inFlight.subscribers++;
+    } else {
+      const controller = new AbortController();
+      const promise = this.doExtractStream(
+        url,
+        sub,
+        cacheKey,
+        isEmbed,
+        controller.signal,
+      ).finally(() => {
+        const current = this.inFlightScrapes.get(cacheKey);
+        if (current && current.promise === promise) {
+          this.inFlightScrapes.delete(cacheKey);
+        }
+      });
+      inFlight = { promise, controller, subscribers: 1 };
+      this.inFlightScrapes.set(cacheKey, inFlight);
     }
 
-    const scrapePromise = this.doExtractStream(url, sub, cacheKey, isEmbed);
-    this.inFlightScrapes.set(cacheKey, scrapePromise);
+    // If client signal aborts (e.g. user switched channel), decrement subscriber count.
+    // If all subscribers have abandoned, abort the underlying scrape to free Chromium slot immediately.
+    let onAbort: (() => void) | undefined;
+    let abortPromise: Promise<never> | undefined;
+
+    if (signal) {
+      abortPromise = new Promise<never>((_, reject) => {
+        onAbort = () => {
+          if (inFlight) {
+            inFlight.subscribers--;
+            if (inFlight.subscribers <= 0) {
+              inFlight.controller.abort();
+              this.inFlightScrapes.delete(cacheKey);
+            }
+          }
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+    }
 
     try {
-      return await scrapePromise;
+      return await (abortPromise
+        ? Promise.race([inFlight.promise, abortPromise])
+        : inFlight.promise);
     } finally {
-      this.inFlightScrapes.delete(cacheKey);
+      if (signal && onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
     }
   }
 
@@ -259,6 +325,7 @@ export class ScraperService {
     sub: boolean,
     cacheKey: string,
     isEmbed: boolean = false,
+    signal?: AbortSignal,
   ): Promise<ExtractedStreamResult> {
     logger.info(
       `Extracting raw stream URL for: ${url} (sub=${sub}${isEmbed ? ", embed=true" : ""})`,
@@ -275,7 +342,7 @@ export class ScraperService {
         const extracted = await StrmFreeExtractor.extract(url);
         if (extracted?.url) {
           let streamUrl = extracted.url;
-          if (sub && streamUrl.includes(".m3u8")) {
+          if (sub && isM3u8StreamUrl(streamUrl)) {
             try {
               const res = await smartFetch(streamUrl, {
                 headers: {
@@ -298,13 +365,14 @@ export class ScraperService {
           const result: ExtractedStreamResult = {
             url: streamUrl,
             headers: extracted.headers,
+            extractedAt: Date.now(),
           };
           streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
           logger.info(
             `Extracted stream URL via direct extractor: ${streamUrl}`,
             "ScraperService",
           );
-          return result;
+          return { ...result, fromCache: false };
         }
       } catch (e) {
         logger.warn(
@@ -319,13 +387,14 @@ export class ScraperService {
       CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
       sub,
       isEmbed,
+      signal,
     );
 
     // Prioritize requests whose body starts with #EXTM3U, then URL with .m3u8, then direct media
     const extm3uReq = requests.find(
       (r) => r.body && r.body.trim().startsWith("#EXTM3U"),
     );
-    const m3u8Req = requests.find((r) => r.url.toLowerCase().includes(".m3u8"));
+    const m3u8Req = requests.find((r) => isM3u8StreamUrl(r.url));
     const mediaReq = requests.find(
       (r) =>
         r.resource_type === "media" ||
@@ -339,6 +408,19 @@ export class ScraperService {
     );
 
     if (!selectedReq) {
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      // Negative caching: cache the failure for 30s to prevent spamming browser launches on dead channels
+      streamCache.set(
+        cacheKey,
+        {
+          url: "",
+          isNotFound: true,
+          extractedAt: Date.now(),
+        },
+        30_000,
+      );
       throw new NoSourceFoundError(
         "No m3u8/video source found - site may be down or content removed",
       );
@@ -361,7 +443,7 @@ export class ScraperService {
     let playlistBody = selectedReq.body;
     const isM3u8Content =
       Boolean(playlistBody?.trim().startsWith("#EXTM3U")) ||
-      selectedReq.url.toLowerCase().includes(".m3u8");
+      isM3u8StreamUrl(selectedReq.url);
 
     if (sub && !playlistBody && isM3u8Content) {
       try {
@@ -399,11 +481,12 @@ export class ScraperService {
       url: streamUrl,
       headers: upstreamHeaders,
       body: playlistBody,
+      extractedAt: Date.now(),
     };
 
     streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
     logger.info(`Extracted stream URL: ${streamUrl}`, "ScraperService");
-    return result;
+    return { ...result, fromCache: false };
   }
 }
 

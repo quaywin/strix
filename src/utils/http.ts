@@ -73,11 +73,11 @@ export async function smartFetch(
 
   const isM3u8 = url.toLowerCase().includes(".m3u8");
   if (isM3u8) {
-    // For HLS playlists, force uncompressed response and strip Range headers.
-    // Upstream CDNs often return HTTP 206 Partial Content with gzip compression when
-    // Range is sent for .m3u8 playlists, causing Bun's zlib to fail with
-    // 'Decompression error: ZlibError'.
+    // For HLS playlists, force uncompressed response, strip Range headers,
+    // and bypass intermediary CDN/Cloudflare caches to prevent frozen/stalled playback.
     headers["accept-encoding"] = "identity";
+    headers["cache-control"] = "no-cache, no-store";
+    headers["pragma"] = "no-cache";
     delete headers["range"];
   } else if (options.range) {
     headers["range"] = options.range;
@@ -100,6 +100,13 @@ export async function smartFetch(
     if (options.signal?.aborted) {
       throw e;
     }
+  }
+
+  if (options.signal?.aborted) {
+    throw (
+      options.signal.reason ||
+      new DOMException("The operation was aborted", "AbortError")
+    );
   }
 
   // Fallback: spawn curl which uses native OS TLS stack (passes JA3/Iron Dome checks)
@@ -199,6 +206,12 @@ export async function smartFetch(
       headers: resHeaders,
     });
   } catch (err) {
+    if (options.signal?.aborted) {
+      throw (
+        options.signal.reason ||
+        new DOMException("The operation was aborted", "AbortError")
+      );
+    }
     logger.error("Curl fallback failed", "HttpUtil", err);
     return new Response("Upstream fetch failed", { status: 502 });
   }

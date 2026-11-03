@@ -1,4 +1,4 @@
-import type { Frame, Page, Request, Response } from "patchright";
+import type { Page, Request, Response } from "patchright";
 import { CONFIG } from "../config";
 import { Semaphore } from "../utils/semaphore";
 import { PlaywrightBrowserProvider } from "./BrowserProvider";
@@ -76,7 +76,12 @@ export class ScraperEngine {
     timeoutSec: number = CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
     resolveM3u8Body: boolean = false,
     forceEmbed: boolean = false,
+    signal?: AbortSignal,
   ): Promise<RequestData[]> {
+    if (signal?.aborted) {
+      return [];
+    }
+
     if (this.semaphore.activeCount >= this.semaphore.maxConcurrency) {
       console.log(
         `[SCRAPER] Concurrency limit (${this.semaphore.maxConcurrency}) reached. Queuing scrape for ${url} (queue position: ${this.semaphore.queuedCount + 1})...`,
@@ -116,6 +121,20 @@ export class ScraperEngine {
       isDone = true;
       resolveDone();
     };
+
+    // If client cancels/disconnects while scraping, abort immediately to free Chromium slot
+    let abortHandler: (() => void) | undefined;
+    if (signal) {
+      abortHandler = () => {
+        console.log(`[SCRAPER] Scrape cancelled/aborted by client for ${url}`);
+        markDone();
+      };
+      if (signal.aborted) {
+        abortHandler();
+      } else {
+        signal.addEventListener("abort", abortHandler, { once: true });
+      }
+    }
 
     // Global safety timeout
     trackedTimeout(() => {
@@ -442,13 +461,16 @@ export class ScraperEngine {
       if (acquired) {
         await this.browserProvider.releaseContext();
       }
+      if (signal && abortHandler) {
+        signal.removeEventListener("abort", abortHandler);
+      }
     }
 
       console.log(
         `[SCRAPER] Finished scraping ${url}, found ${requestsMap.size} requests`,
       );
       return Array.from(requestsMap.values());
-    });
+    }, signal);
   }
 
   /**

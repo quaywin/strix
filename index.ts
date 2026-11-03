@@ -2,6 +2,7 @@ import { cors } from "@elysiajs/cors";
 import { Elysia } from "elysia";
 import { CONFIG } from "./src/config";
 import { logger } from "./src/logger";
+import { isM3u8StreamUrl } from "./src/scraper/ScraperEngine";
 import {
   NoSourceFoundError,
   scraperService,
@@ -71,6 +72,7 @@ export const handleScrapeStream = async (
         url,
         wantSub,
         wantEmbed,
+        request.signal,
       );
       return new Response(JSON.stringify(extracted), {
         status: 200,
@@ -83,20 +85,33 @@ export const handleScrapeStream = async (
         url,
         wantSub,
         wantEmbed,
+        request.signal,
       );
       return Response.redirect(streamUrl, 302);
     }
 
     // Proxy mode: fetch upstream and stream the body back to the client.
-    // If upstream returns 403 the cached URL is likely stale (signed token
-    // expired); we invalidate the cache, re-scrape once, and retry exactly
-    // one time. Further failures surface as a 502 to the client.
-    const proxyOnce = async (): Promise<Response> => {
+    // If upstream returns an error (404/403/502) on a cached stream URL older than 30s,
+    // the signed token has likely expired. We invalidate the cache, re-scrape once,
+    // and retry exactly one time to seamlessly recover without stalling the player.
+    const proxyOnce = async (): Promise<{
+      response: Response;
+      fromCache: boolean;
+      extractedAt: number;
+    }> => {
+      const extracted = await scraperService.extractStream(
+        url,
+        wantSub,
+        wantEmbed,
+        request.signal,
+      );
       const {
         url: streamUrl,
         headers: upstreamHeaders,
         body: cachedBody,
-      } = await scraperService.extractStream(url, wantSub, wantEmbed);
+        fromCache = false,
+        extractedAt = Date.now(),
+      } = extracted;
 
       const requestHeaders = new Headers();
       if (upstreamHeaders) {
@@ -105,7 +120,7 @@ export const handleScrapeStream = async (
         }
       }
 
-      const isM3u8Url = streamUrl.toLowerCase().includes(".m3u8");
+      const isM3u8Url = isM3u8StreamUrl(streamUrl);
       const hasExtM3uBody = Boolean(cachedBody?.trim().startsWith("#EXTM3U"));
       const isKnownM3u8 = isM3u8Url || hasExtM3uBody;
 
@@ -118,13 +133,22 @@ export const handleScrapeStream = async (
         requestHeaders.set("range", range);
       }
 
+      const timeoutSignal = AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS);
+      const upstreamSignal = request.signal
+        ? AbortSignal.any([request.signal, timeoutSignal])
+        : timeoutSignal;
+
       let upstream = await smartFetch(streamUrl, {
-        signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
+        signal: upstreamSignal,
         headers: requestHeaders,
         range: isKnownM3u8 ? null : range,
       });
       if (!upstream.ok) {
-        const isOffline = upstream.status === 404;
+        const isOffline =
+          upstream.status === 404 ||
+          upstream.status === 502 ||
+          upstream.status === 503 ||
+          upstream.status === 504;
         let snippet = "";
         try {
           const bodyText = await upstream.text();
@@ -134,19 +158,23 @@ export const handleScrapeStream = async (
           `Upstream fetch failed: HTTP ${upstream.status} for ${streamUrl}${snippet ? `. Response: ${snippet}` : ""}`,
           "App",
         );
-        return new Response(
-          JSON.stringify({
-            error: isOffline
-              ? "Upstream stream is offline or ended (404 Not Found)"
-              : `Upstream returned ${upstream.status}`,
-            upstreamStatus: upstream.status,
-            upstreamSnippet: snippet || undefined,
-          }),
-          {
-            status: isOffline ? 404 : 502,
-            headers: { "Content-Type": "application/json" },
-          },
-        );
+        return {
+          response: new Response(
+            JSON.stringify({
+              error: isOffline
+                ? `Upstream stream is offline or unavailable (HTTP ${upstream.status})`
+                : `Upstream returned ${upstream.status}`,
+              upstreamStatus: upstream.status,
+              upstreamSnippet: snippet || undefined,
+            }),
+            {
+              status: isOffline ? 404 : 502,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+          fromCache,
+          extractedAt,
+        };
       }
       const headers = new Headers();
       const contentType = upstream.headers.get("Content-Type");
@@ -184,8 +212,12 @@ export const handleScrapeStream = async (
           );
           requestHeaders.set("accept-encoding", "identity");
           requestHeaders.delete("range");
+          const retryTimeoutSignal = AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS);
+          const retrySignal = request.signal
+            ? AbortSignal.any([request.signal, retryTimeoutSignal])
+            : retryTimeoutSignal;
           upstream = await smartFetch(streamUrl, {
-            signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
+            signal: retrySignal,
             headers: requestHeaders,
             range: null,
           });
@@ -205,6 +237,7 @@ export const handleScrapeStream = async (
           ? (absUrl: string) => {
               const params = new URLSearchParams();
               params.set("url", absUrl);
+              params.set("source", url);
               if (upstreamReferer) {
                 params.set("referer", upstreamReferer);
               }
@@ -220,48 +253,77 @@ export const handleScrapeStream = async (
         });
 
         headers.set("Content-Type", "application/vnd.apple.mpegurl");
+        headers.set("Cache-Control", "no-cache, no-store, must-revalidate");
+        headers.set("Pragma", "no-cache");
+        headers.set("Expires", "0");
         headers.delete("Content-Length"); // Length changed due to URL rewriting
         headers.delete("Content-Range");
         headers.delete("Content-Encoding");
 
-        return new Response(rewrittenBody, {
-          status: 200,
-          headers,
-        });
+        return {
+          response: new Response(rewrittenBody, {
+            status: 200,
+            headers,
+          }),
+          fromCache,
+          extractedAt,
+        };
       }
 
       // For binary video (mp4/mkv), stream directly with Range support
-      return new Response(text !== null ? text : upstream.body, {
-        status: upstream.status,
-        headers,
-      });
+      return {
+        response: new Response(text !== null ? text : upstream.body, {
+          status: upstream.status,
+          headers,
+        }),
+        fromCache,
+        extractedAt,
+      };
     };
 
-    let response = await proxyOnce();
-    if (response.status === 502) {
-      logger.warn(
-        `Proxy got upstream error for ${url}; invalidating cache and retrying once`,
-        "App",
-      );
-      scraperService.invalidateCache(url);
-      response = await proxyOnce();
+    let { response, fromCache, extractedAt } = await proxyOnce();
+
+    if (!response.ok) {
+      // If the failed upstream request was using a cached stream URL older than 30s,
+      // it is very likely a signed rolling token that expired (e.g. 404 or 403 on tims-001.sytes.net).
+      // We invalidate the cache and perform exactly ONE fresh scrape to recover the stream seamlessly.
+      const isStaleEligible = fromCache && Date.now() - extractedAt >= 30_000;
+      if (isStaleEligible) {
+        logger.warn(
+          `Proxy got upstream error (HTTP ${response.status}) on cached stream for ${url} (age: ${Math.round((Date.now() - extractedAt) / 1000)}s); invalidating cache and retrying once with fresh scrape`,
+          "App",
+        );
+        // Conditionally invalidate: only delete if the cached entry was extracted at or before this failed attempt.
+        // If a concurrent request already finished re-scraping, the new cache entry remains intact.
+        scraperService.invalidateCache(url, extractedAt);
+        const retry = await proxyOnce();
+        response = retry.response;
+      }
     }
     return response;
   } catch (e) {
     const error = e as Error;
+    // Client disconnected / switched channel -> 499 (Client Closed Request).
     // No playable source on the page -> 404 (client-side problem).
     // Upstream fetch timeout -> 504 (gateway timeout).
     // Anything else -> 500 (genuine server-side failure).
-    const status =
-      e instanceof NoSourceFoundError
+    const isAborted = request.signal.aborted || error.name === "AbortError";
+    const status = isAborted
+      ? 499
+      : e instanceof NoSourceFoundError
         ? 404
         : error.name === "TimeoutError"
           ? 504
           : 500;
-    return new Response(JSON.stringify({ error: error.message }), {
-      status,
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        error: isAborted ? "Client cancelled request" : error.message,
+      }),
+      {
+        status,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
   }
 };
 
@@ -306,9 +368,14 @@ export const app = new Elysia()
       headers.set("range", range);
     }
 
+    const chunkTimeout = AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS);
+    const chunkSignal = request.signal
+      ? AbortSignal.any([request.signal, chunkTimeout])
+      : chunkTimeout;
+
     try {
       const upstream = await smartFetch(chunkUrl, {
-        signal: AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS),
+        signal: chunkSignal,
         headers,
         range,
       });
@@ -318,6 +385,27 @@ export const app = new Elysia()
           `Proxy-chunk upstream returned HTTP ${upstream.status} for ${chunkUrl}`,
           "ProxyChunk",
         );
+        // If chunk fails with 401 Unauthorized, 403 Forbidden, or 404 Not Found, session/signed token has expired.
+        // Invalidate the source stream cache so the next playlist fetch re-extracts a fresh token.
+        // We only invalidate entries extracted at or before (now - 15s) so delayed segment failures don't wipe out
+        // a freshly refreshed stream.
+        if (
+          query.source &&
+          (upstream.status === 401 ||
+            upstream.status === 403 ||
+            upstream.status === 404)
+        ) {
+          const invalidated = scraperService.invalidateCache(
+            query.source,
+            Date.now() - 15_000,
+          );
+          if (invalidated) {
+            logger.warn(
+              `Chunk authentication failed (HTTP ${upstream.status}). Invalidating stale cache for source: ${query.source}`,
+              "ProxyChunk",
+            );
+          }
+        }
       }
 
       const resHeaders = new Headers();
@@ -344,6 +432,12 @@ export const app = new Elysia()
       });
     } catch (e) {
       const error = e as Error;
+      if (request.signal.aborted || error.name === "AbortError") {
+        return new Response(JSON.stringify({ error: "Client cancelled request" }), {
+          status: 499,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       logger.error(`Proxy-chunk failed for ${chunkUrl}: ${error.message}`, "ProxyChunk");
       return new Response(JSON.stringify({ error: error.message }), {
         status: 502,
