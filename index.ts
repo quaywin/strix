@@ -231,6 +231,50 @@ export const handleScrapeStream = async (
         }
       }
 
+      if (text !== null) {
+        const trimmed = text.trim();
+        if (trimmed.startsWith("#EXTM3U")) {
+          isM3u8 = true;
+        } else if (
+          trimmed.startsWith("<!DOCTYPE") ||
+          trimmed.startsWith("<html") ||
+          trimmed.startsWith("<meta") ||
+          trimmed.startsWith("<head") ||
+          trimmed.startsWith("<body") ||
+          trimmed.startsWith("<script")
+        ) {
+          isM3u8 = false;
+        }
+      }
+
+      // Safeguard: Never attempt to rewrite an HTML error/embed page as an M3U8 playlist
+      if (
+        !isM3u8 &&
+        text !== null &&
+        (text.trim().startsWith("<!DOCTYPE") ||
+          text.trim().startsWith("<html") ||
+          text.trim().startsWith("<meta"))
+      ) {
+        logger.warn(
+          `Upstream returned HTML document instead of M3U8 stream for ${streamUrl}`,
+          "App",
+        );
+        return {
+          response: new Response(
+            JSON.stringify({
+              error: "Upstream returned HTML document instead of M3U8 stream",
+              upstreamSnippet: text.slice(0, 300),
+            }),
+            {
+              status: 502,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+          fromCache,
+          extractedAt,
+        };
+      }
+
       if (isM3u8 && text !== null) {
         const requestOrigin = getRequestOrigin(request);
         const upstreamReferer = getHeader(upstreamHeaders, "referer");

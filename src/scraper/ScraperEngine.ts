@@ -13,26 +13,6 @@ export interface RequestData {
 }
 
 /**
- * Validates whether a URL is a genuine .m3u8 playlist stream rather than
- * a tracking beacon or analytics image (e.g. ping.gif?mu=...m3u8).
- */
-export function isM3u8StreamUrl(url: string): boolean {
-  const lower = url.toLowerCase();
-  if (
-    lower.includes("ping.gif") ||
-    lower.endsWith(".gif") ||
-    lower.endsWith(".png") ||
-    lower.endsWith(".jpg") ||
-    lower.endsWith(".jpeg") ||
-    lower.endsWith(".webp") ||
-    lower.includes("/ping")
-  ) {
-    return false;
-  }
-  return lower.includes(".m3u8") || lower.includes("/m3u8");
-}
-
-/**
  * Detects whether a target URL is an embed player / stream container
  * (e.g. /embed/, /cv-embed/, /live-embed/, /player/, /play/, /v/, etc.).
  */
@@ -53,6 +33,61 @@ export function isEmbedPlayerUrl(url: string): boolean {
   return /\/(embed|cv-embed|live-embed|player|play|iframe|video|v|e)(\/|\.(?:php|html?)|[?#]|$)/i.test(
     url,
   );
+}
+
+/**
+ * Validates whether a URL is a genuine .m3u8 playlist stream rather than
+ * a tracking beacon, analytics image, or an embed player container.
+ */
+export function isM3u8StreamUrl(url: string): boolean {
+  try {
+    if (isEmbedPlayerUrl(url)) {
+      return false;
+    }
+    const parsed = new URL(url);
+    const pathnameLower = parsed.pathname.toLowerCase();
+    if (
+      pathnameLower.includes("ping.gif") ||
+      pathnameLower.endsWith(".gif") ||
+      pathnameLower.endsWith(".png") ||
+      pathnameLower.endsWith(".jpg") ||
+      pathnameLower.endsWith(".jpeg") ||
+      pathnameLower.endsWith(".webp") ||
+      pathnameLower.includes("/ping")
+    ) {
+      return false;
+    }
+    if (
+      pathnameLower.includes(".m3u8") ||
+      pathnameLower.includes("/m3u8") ||
+      pathnameLower.includes(".m3u")
+    ) {
+      return true;
+    }
+    const format =
+      parsed.searchParams.get("format") ||
+      parsed.searchParams.get("type") ||
+      parsed.searchParams.get("ext") ||
+      parsed.searchParams.get("output");
+    if (format && format.toLowerCase().includes("m3u8")) {
+      return true;
+    }
+    return false;
+  } catch (_) {
+    const lower = url.toLowerCase();
+    if (
+      lower.includes("ping.gif") ||
+      lower.endsWith(".gif") ||
+      lower.endsWith(".png") ||
+      lower.endsWith(".jpg") ||
+      lower.endsWith(".jpeg") ||
+      lower.endsWith(".webp") ||
+      lower.includes("/ping")
+    ) {
+      return false;
+    }
+    return lower.includes(".m3u8") || lower.includes("/m3u8");
+  }
 }
 
 const MEDIA_CHUNK_REGEX = /\.(ts|m4s|mp4|webm|mkv)($|\?)/i;
@@ -205,7 +240,9 @@ export class ScraperEngine {
       // Handle requests
       page.on("request", (req: Request) => {
         const reqUrl = req.url();
-        if (isM3u8StreamUrl(reqUrl)) {
+        const rType = req.resourceType();
+        // Never treat full document/navigation requests as target stream playlists
+        if (rType !== "document" && isM3u8StreamUrl(reqUrl)) {
           requestsMap.set(reqUrl, {
             url: reqUrl,
             method: req.method(),

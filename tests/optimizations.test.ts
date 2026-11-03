@@ -840,6 +840,70 @@ describe("Upstream offline error handling", () => {
   });
 });
 
+describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
+  it("does not classify embed player container URLs containing .m3u8 in query as raw m3u8 streams", async () => {
+    const { isM3u8StreamUrl } = await import("../src/scraper/ScraperEngine");
+
+    // Player embed containers with .m3u8 in search params should NOT be treated as m3u8 streams
+    const embedUrl =
+      "https://damitv.st/player/hls/?v=540&url=%2Fc%2F32.m3u8&name=TNT%20Sports%202%20UK";
+    expect(isM3u8StreamUrl(embedUrl)).toBe(false);
+
+    // Genuine stream targets with .m3u8 in pathname
+    expect(
+      isM3u8StreamUrl(
+        "https://damitv.st/c/32.m3u8?tk=gS5CrEQrX-ABCqekVU2_oQ&e=1793764190",
+      ),
+    ).toBe(true);
+    expect(isM3u8StreamUrl("https://example.com/live/playlist.m3u8")).toBe(true);
+    expect(isM3u8StreamUrl("https://example.com/hls/channel/32.m3u8")).toBe(true);
+  });
+
+  it("safeguard returns HTTP 502 when upstream returns HTML document instead of M3U8 playlist", async () => {
+    const htmlBody =
+      "<!DOCTYPE html><html><head><title>Player</title></head><body><h1>Not stream</h1></body></html>";
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(htmlBody, {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        });
+      },
+    });
+
+    try {
+      const { handleScrapeStream } = await import("../index");
+      const { scraperService } = await import("../src/services/scraper.service");
+
+      const origExtract = scraperService.extractStream.bind(scraperService);
+      scraperService.extractStream = async () => ({
+        url: `http://localhost:${server.port}/fake-stream.m3u8`,
+        headers: {},
+      });
+
+      try {
+        const req = new Request("http://localhost:5005/scrape-stream");
+        const res = await handleScrapeStream(
+          {
+            url: "https://example.com/test-stream",
+            proxy: "1",
+          },
+          req,
+        );
+
+        expect(res.status).toBe(502);
+        const data = await res.json();
+        expect(data.error).toContain("HTML document instead of M3U8");
+      } finally {
+        scraperService.extractStream = origExtract;
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
 
 
 
