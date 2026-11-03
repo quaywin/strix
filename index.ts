@@ -404,7 +404,15 @@ export const app = new Elysia()
     }
 
     const headers = new Headers();
-    if (query.referer) {
+    const isTikTokCdn =
+      /(?:^|\.)(?:tiktokcdn(?:-us)?\.com|byteoversea\.com|ibytedtos\.com)/i.test(
+        chunkUrl,
+      );
+    if (isTikTokCdn) {
+      // TikTok CDN blocks third-party pirate/streaming referers (e.g. damitv.st) with HTTP 403.
+      // Use official TikTok origin to satisfy CDN hotlink checks.
+      headers.set("referer", "https://www.tiktok.com/");
+    } else if (query.referer) {
       headers.set("referer", query.referer);
     }
     const userAgent =
@@ -424,11 +432,26 @@ export const app = new Elysia()
       : chunkTimeout;
 
     try {
-      const upstream = await smartFetch(chunkUrl, {
+      let upstream = await smartFetch(chunkUrl, {
         signal: chunkSignal,
         headers,
         range,
       });
+
+      // Hotlink protection fallback: If upstream rejected with HTTP 403 and a Referer was present,
+      // retry once without Referer. Many CDNs permit direct requests but blacklist third-party referers.
+      if (upstream.status === 403 && headers.has("referer")) {
+        const fallbackHeaders = new Headers(headers);
+        fallbackHeaders.delete("referer");
+        const retryUpstream = await smartFetch(chunkUrl, {
+          signal: chunkSignal,
+          headers: fallbackHeaders,
+          range,
+        });
+        if (retryUpstream.ok) {
+          upstream = retryUpstream;
+        }
+      }
 
       if (!upstream.ok) {
         logger.warn(

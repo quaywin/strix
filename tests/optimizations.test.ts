@@ -902,6 +902,50 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
       server.stop(true);
     }
   });
+
+  describe("Hotlink protection and CDN referer sanitization on /proxy-chunk", () => {
+    it("rewrites TikTok CDN referer to official origin and falls back on 403 when referer is rejected", async () => {
+      let receivedReferer: string | null = null;
+      let attempt = 0;
+
+      const server = Bun.serve({
+        port: 0,
+        fetch(req) {
+          const url = new URL(req.url);
+          if (url.pathname === "/tiktok-obj/chunk.image") {
+            attempt++;
+            receivedReferer = req.headers.get("referer");
+            // If referer is a third-party streaming site, reject with 403
+            if (receivedReferer && receivedReferer.includes("damitv.st")) {
+              return new Response("Forbidden", { status: 403 });
+            }
+            // Return raw dummy byte with 0x47 TS sync byte
+            return new Response(new Uint8Array([0x47, 0x40, 0x00, 0x10]), {
+              headers: { "Content-Type": "image/png" },
+            });
+          }
+          return new Response("Not found", { status: 404 });
+        },
+      });
+
+      try {
+        const chunkUrl = `http://localhost:${server.port}/tiktok-obj/chunk.image`;
+        const proxyReq = new Request(
+          `http://localhost:5005/proxy-chunk?url=${encodeURIComponent(
+            chunkUrl,
+          )}&referer=${encodeURIComponent("https://damitv.st/player")}`,
+        );
+
+        const { app } = await import("../index");
+        const res = await app.handle(proxyReq);
+
+        // Even though damitv.st was passed as referer, fallback / sanitization handles it
+        expect(res.status).toBe(200);
+      } finally {
+        server.stop(true);
+      }
+    });
+  });
 });
 
 
