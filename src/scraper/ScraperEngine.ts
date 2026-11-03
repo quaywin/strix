@@ -191,6 +191,7 @@ export class ScraperEngine {
         const shouldBlock =
           type === "image" ||
           type === "font" ||
+          type === "stylesheet" ||
           MEDIA_CHUNK_REGEX.test(reqUrl) ||
           AD_TRACKER_REGEX.test(reqUrl);
 

@@ -1,5 +1,6 @@
 import { CONFIG } from "../config";
 import { logger } from "../logger";
+import { PitSportExtractor } from "../scraper/extractors/PitSportExtractor";
 import { StrmFreeExtractor } from "../scraper/extractors/StrmFreeExtractor";
 import { isM3u8StreamUrl, scraperEngine } from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
@@ -332,7 +333,31 @@ export class ScraperService {
       "ScraperService",
     );
 
-    // Fast-path: try specialized direct HTTP extractor if available
+    // Fast-path: try specialized direct HTTP extractors if available
+    if (PitSportExtractor.canHandle(url)) {
+      try {
+        logger.info(
+          `Attempting direct PitSport API extraction for: ${url}`,
+          "ScraperService",
+        );
+        const extracted = await PitSportExtractor.extract(url);
+        if (extracted?.url) {
+          // Point URL to the extracted embed stream URL for subsequent processing
+          url = extracted.url;
+          isEmbed = true;
+          logger.info(
+            `PitSport resolved to underlying embed: ${url}`,
+            "ScraperService",
+          );
+        }
+      } catch (e) {
+        logger.warn(
+          `PitSport direct extractor failed for ${url}: ${(e as Error).message}`,
+          "ScraperService",
+        );
+      }
+    }
+
     if (StrmFreeExtractor.canHandle(url)) {
       try {
         logger.info(

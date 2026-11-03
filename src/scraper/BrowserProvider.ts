@@ -185,6 +185,9 @@ export class PlaywrightBrowserProvider {
       "--disable-gpu",
       "--disable-software-rasterizer",
       "--mute-audio",
+      "--renderer-process-limit=2",
+      "--disable-accelerated-video-decode",
+      "--disable-webrtc",
       "--disk-cache-size=10485760", // Cap disk cache to 10MB
       "--media-cache-size=10485760", // Cap media cache to 10MB
       "--js-flags=--max-old-space-size=256", // Cap V8 heap to 256MB
