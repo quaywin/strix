@@ -903,25 +903,27 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
     }
   });
 
-  describe("Hotlink protection and CDN referer sanitization on /proxy-chunk", () => {
-    it("rewrites TikTok CDN referer to official origin and falls back on 403 when referer is rejected", async () => {
-      let receivedReferer: string | null = null;
-      let attempt = 0;
+  describe("Hotlink protection and adaptive CDN referer learning on /proxy-chunk", () => {
+    it("falls back on 403 when third-party referer is rejected and memorizes host for future chunks", async () => {
+      let serverRequests: { referer: string | null; attempt: number }[] = [];
+      let counter = 0;
 
       const server = Bun.serve({
         port: 0,
         fetch(req) {
           const url = new URL(req.url);
-          if (url.pathname === "/tiktok-obj/chunk.image") {
-            attempt++;
-            receivedReferer = req.headers.get("referer");
-            // If referer is a third-party streaming site, reject with 403
-            if (receivedReferer && receivedReferer.includes("damitv.st")) {
-              return new Response("Forbidden", { status: 403 });
+          if (url.pathname.startsWith("/cdn-obj/")) {
+            counter++;
+            const ref = req.headers.get("referer");
+            serverRequests.push({ referer: ref, attempt: counter });
+
+            // Simulating a strict CDN that returns 403 for third-party streaming sites
+            if (ref && ref.includes("damitv.st")) {
+              return new Response("Forbidden by hotlink protection", { status: 403 });
             }
-            // Return raw dummy byte with 0x47 TS sync byte
+
             return new Response(new Uint8Array([0x47, 0x40, 0x00, 0x10]), {
-              headers: { "Content-Type": "image/png" },
+              headers: { "Content-Type": "video/mp2t" },
             });
           }
           return new Response("Not found", { status: 404 });
@@ -929,18 +931,48 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
       });
 
       try {
-        const chunkUrl = `http://localhost:${server.port}/tiktok-obj/chunk.image`;
-        const proxyReq = new Request(
+        const { app, stripRefererHosts } = await import("../index");
+        const host = `localhost:${server.port}`;
+        // Clean state for test
+        stripRefererHosts.delete(host.toLowerCase());
+        stripRefererHosts.delete("localhost");
+
+        // Chunk 1: First time encountering this host with third-party referer
+        const chunk1Url = `http://localhost:${server.port}/cdn-obj/chunk-001.ts`;
+        const proxyReq1 = new Request(
           `http://localhost:5005/proxy-chunk?url=${encodeURIComponent(
-            chunkUrl,
+            chunk1Url,
           )}&referer=${encodeURIComponent("https://damitv.st/player")}`,
         );
 
-        const { app } = await import("../index");
-        const res = await app.handle(proxyReq);
+        const res1 = await app.handle(proxyReq1);
+        expect(res1.status).toBe(200);
 
-        // Even though damitv.st was passed as referer, fallback / sanitization handles it
-        expect(res.status).toBe(200);
+        // For chunk 1:
+        // Initial request sent referer (received 403 on fetch/curl), then adaptive fallback retried without referer (received 200).
+        // The first attempt had referer, the last successful attempt had NO referer.
+        expect(serverRequests[0].referer).toContain("damitv.st");
+        expect(serverRequests[serverRequests.length - 1].referer).toBeNull();
+
+        // Server should now have learned this host
+        expect(stripRefererHosts.has("localhost")).toBe(true);
+
+        const requestsBeforeChunk2 = serverRequests.length;
+
+        // Chunk 2: Next chunk on the same host should immediately skip sending referer without any 403 retry!
+        const chunk2Url = `http://localhost:${server.port}/cdn-obj/chunk-002.ts`;
+        const proxyReq2 = new Request(
+          `http://localhost:5005/proxy-chunk?url=${encodeURIComponent(
+            chunk2Url,
+          )}&referer=${encodeURIComponent("https://damitv.st/player")}`,
+        );
+
+        const res2 = await app.handle(proxyReq2);
+        expect(res2.status).toBe(200);
+
+        // Chunk 2 should only have needed exactly 1 single attempt directly without referer
+        expect(serverRequests.length).toBe(requestsBeforeChunk2 + 1);
+        expect(serverRequests[serverRequests.length - 1].referer).toBeNull();
       } finally {
         server.stop(true);
       }

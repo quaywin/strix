@@ -334,6 +334,96 @@ function extractTikTikPx(pngData: Uint8Array): Uint8Array | null {
 }
 
 /**
+ * Extracts MPEG-TS segments disguised in PNG compressed international text chunks (iTXt).
+ * Seen on Matchora / TikTok CDN repackers where TS packets are base64-encoded, zlib-compressed,
+ * and chunked into sequential `iTXt` metadata records (e.g. payload-0001 ... payload-0NNN).
+ */
+function unwrapPngITXt(pngData: Uint8Array): Uint8Array | null {
+  if (!isPng(pngData) || pngData.length < 16) return null;
+
+  let offset = 8;
+  const parts: Uint8Array[] = [];
+  let totalPartsLength = 0;
+
+  while (offset + 8 <= pngData.length) {
+    const size = readUInt32BE(pngData, offset);
+    if (offset + 12 + size > pngData.length) break;
+
+    const tag = String.fromCharCode(
+      pngData[offset + 4]!,
+      pngData[offset + 5]!,
+      pngData[offset + 6]!,
+      pngData[offset + 7]!,
+    );
+
+    if (tag === "iTXt") {
+      const payload = pngData.subarray(offset + 8, offset + 8 + size);
+      // Format: keyword (null-terminated), compFlag (1), compMethod (1),
+      // langTag (null-terminated), transKeyword (null-terminated), text
+      let p = 0;
+      while (p < payload.length && payload[p] !== 0) p++;
+      p++; // Skip null byte
+      if (p + 2 <= payload.length) {
+        const compFlag = payload[p++]!;
+        p++; // Skip compMethod
+        while (p < payload.length && payload[p] !== 0) p++;
+        p++; // Skip null byte for langTag
+        while (p < payload.length && payload[p] !== 0) p++;
+        p++; // Skip null byte for transKeyword
+
+        const textBytes = payload.subarray(p);
+        if (compFlag === 1) {
+          try {
+            const decompressed = zlib.inflateSync(textBytes);
+            parts.push(decompressed);
+            totalPartsLength += decompressed.length;
+          } catch (_) {}
+        } else {
+          parts.push(textBytes);
+          totalPartsLength += textBytes.length;
+        }
+      }
+    }
+
+    offset += 12 + size; // 4 (len) + 4 (type) + size + 4 (crc)
+  }
+
+  if (parts.length === 0 || totalPartsLength === 0) {
+    return null;
+  }
+
+  try {
+    const combined = new Uint8Array(totalPartsLength);
+    let cur = 0;
+    for (const part of parts) {
+      combined.set(part, cur);
+      cur += part.length;
+    }
+
+    // Combined payload may be raw MPEG-TS or Base64-encoded MPEG-TS
+    if (isMpegTsStream(combined, 0)) {
+      return trimToTsPackets(combined);
+    }
+
+    // Attempt Base64 decoding
+    const base64String = new TextDecoder().decode(combined);
+    const decodedTs = Buffer.from(base64String, "base64");
+    if (decodedTs.length >= TS_PACKET_SIZE) {
+      const tsArray = new Uint8Array(
+        decodedTs.buffer,
+        decodedTs.byteOffset,
+        decodedTs.byteLength,
+      );
+      if (isMpegTsStream(tsArray, 0)) {
+        return trimToTsPackets(tsArray);
+      }
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+/**
  * Unwraps MPEG-TS embedded in WebP chunks.
  */
 function unwrapWebP(data: Uint8Array): Uint8Array | null {
@@ -404,7 +494,11 @@ export function unwrapChunk(data: Uint8Array): Uint8Array {
       const pngChunkTs = unwrapPngChunks(data);
       if (pngChunkTs) return pngChunkTs;
 
-      // 2b. PNG IDAT pixel steganography (TIKTIKPX)
+      // 2b. PNG iTXt compressed text chunks (Matchora / Base64-encoded TS)
+      const pngITXtTs = unwrapPngITXt(data);
+      if (pngITXtTs) return pngITXtTs;
+
+      // 2c. PNG IDAT pixel steganography (TIKTIKPX)
       const pngPxTs = extractTikTikPx(data);
       if (pngPxTs) return pngPxTs;
     }

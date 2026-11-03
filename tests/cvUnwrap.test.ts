@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import fs from "node:fs";
+import zlib from "node:zlib";
 import { app } from "../index";
 import { isPng, isWebP, needsUnwrap, unwrapChunk } from "../src/utils/cvUnwrap";
 
@@ -101,5 +102,64 @@ describe("cvUnwrap", () => {
     } finally {
       mockServer.stop();
     }
+  });
+
+  it("unwraps Matchora disguised PNG chunk using iTXt compressed metadata into MPEG-TS", () => {
+    // Build a mock TS buffer of 2 packets
+    const mockTs = new Uint8Array(TS_PACKET * 2);
+    mockTs[0] = TS_SYNC;
+    mockTs[1] = 0x10;
+    mockTs[TS_PACKET] = TS_SYNC;
+    mockTs[TS_PACKET + 1] = 0x20;
+
+    const base64Ts = Buffer.from(mockTs).toString("base64");
+    const compressedText = zlib.deflateSync(Buffer.from(base64Ts, "utf8"));
+
+    // Construct valid PNG with IHDR, iTXt, and IEND
+    const keyword = Buffer.from("payload-0001\0", "utf8");
+    const itxtData = Buffer.concat([
+      keyword,
+      Buffer.from([1, 0, 0]), // compFlag=1, compMethod=0, langTag="" (null)
+      Buffer.from([0]), // transKeyword="" (null)
+      compressedText,
+    ]);
+
+    // PNG signature (8) + IHDR (25) + iTXt chunk + IEND (12)
+    const pngSig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const ihdr = Buffer.from([
+      0, 0, 0, 13, // length 13
+      73, 72, 68, 82, // IHDR
+      0, 0, 0, 1, // w=1
+      0, 0, 0, 1, // h=1
+      8, 6, 0, 0, 0, // 8-bit RGBA
+      0x1f, 0x15, 0xc4, 0x89, // CRC
+    ]);
+
+    const itxtLen = Buffer.alloc(4);
+    itxtLen.writeUInt32BE(itxtData.length, 0);
+    const itxtTag = Buffer.from("iTXt", "ascii");
+    const itxtCrc = Buffer.alloc(4); // Dummy CRC
+
+    const iend = Buffer.from([
+      0, 0, 0, 0,
+      73, 69, 78, 68,
+      0xae, 0x42, 0x60, 0x82,
+    ]);
+
+    const pngWithItxt = Buffer.concat([
+      pngSig,
+      ihdr,
+      itxtLen,
+      itxtTag,
+      itxtData,
+      itxtCrc,
+      iend,
+    ]);
+
+    const result = unwrapChunk(new Uint8Array(pngWithItxt));
+    expect(result.length).toBe(mockTs.length);
+    expect(result[0]).toBe(TS_SYNC);
+    expect(result[TS_PACKET]).toBe(TS_SYNC);
+    expect(Buffer.from(result).equals(Buffer.from(mockTs))).toBe(true);
   });
 });

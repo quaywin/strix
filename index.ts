@@ -377,6 +377,10 @@ export const handleScrapeStream = async (
   }
 };
 
+// In-memory cache of CDN hostnames that enforce anti-hotlinking by rejecting third-party Referers.
+// Once a host succeeds without Referer after an initial 403, we skip sending Referer for all future chunks on that host.
+export const stripRefererHosts = new Set<string>();
+
 export const app = new Elysia()
   .use(cors({ origin: "*" }))
   .onError(({ code, error, request }) => {
@@ -403,16 +407,13 @@ export const app = new Elysia()
       });
     }
 
+    let chunkHostname = "";
+    try {
+      chunkHostname = new URL(chunkUrl).hostname.toLowerCase();
+    } catch (_) {}
+
     const headers = new Headers();
-    const isTikTokCdn =
-      /(?:^|\.)(?:tiktokcdn(?:-us)?\.com|byteoversea\.com|ibytedtos\.com)/i.test(
-        chunkUrl,
-      );
-    if (isTikTokCdn) {
-      // TikTok CDN blocks third-party pirate/streaming referers (e.g. damitv.st) with HTTP 403.
-      // Use official TikTok origin to satisfy CDN hotlink checks.
-      headers.set("referer", "https://www.tiktok.com/");
-    } else if (query.referer) {
+    if (query.referer && (!chunkHostname || !stripRefererHosts.has(chunkHostname))) {
       headers.set("referer", query.referer);
     }
     const userAgent =
@@ -438,8 +439,10 @@ export const app = new Elysia()
         range,
       });
 
-      // Hotlink protection fallback: If upstream rejected with HTTP 403 and a Referer was present,
-      // retry once without Referer. Many CDNs permit direct requests but blacklist third-party referers.
+      // Adaptive Anti-Hotlink Fallback:
+      // If upstream rejected with HTTP 403 and a Referer was present, retry once without Referer.
+      // Many CDNs permit direct requests but reject third-party referers.
+      // When successful, remember this hostname so subsequent chunks skip the referer immediately.
       if (upstream.status === 403 && headers.has("referer")) {
         const fallbackHeaders = new Headers(headers);
         fallbackHeaders.delete("referer");
@@ -450,6 +453,9 @@ export const app = new Elysia()
         });
         if (retryUpstream.ok) {
           upstream = retryUpstream;
+          if (chunkHostname) {
+            stripRefererHosts.add(chunkHostname);
+          }
         }
       }
 
