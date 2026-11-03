@@ -14,6 +14,7 @@ import {
   smartFetch,
 } from "./src/utils/http";
 import { rewriteM3u8Playlist } from "./src/utils/m3u8";
+import { needsUnwrap, unwrapChunk } from "./src/utils/cvUnwrap";
 
 export const handleScrapeStream = async (
   query: {
@@ -26,6 +27,7 @@ export const handleScrapeStream = async (
     proxy_all?: string;
     embed?: string;
     is_embed?: string;
+    unwrap?: string;
   },
   request: Request,
 ): Promise<Response> => {
@@ -39,6 +41,7 @@ export const handleScrapeStream = async (
     proxy_all,
     embed,
     is_embed,
+    unwrap,
   } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
@@ -244,6 +247,9 @@ export const handleScrapeStream = async (
               if (upstreamUserAgent) {
                 params.set("ua", upstreamUserAgent);
               }
+              if (unwrap === "1" || unwrap === "true") {
+                params.set("unwrap", "1");
+              }
               return `${requestOrigin}/proxy-chunk?${params.toString()}`;
             }
           : undefined;
@@ -410,6 +416,55 @@ export const app = new Elysia()
 
       const resHeaders = new Headers();
       let contentType = upstream.headers.get("Content-Type");
+
+      const isKeyOrPlaylist =
+        chunkUrl.includes(".key") ||
+        chunkUrl.includes("/key") ||
+        chunkUrl.includes(".m3u8");
+
+      let bodyData: BodyInit | null = upstream.body;
+
+      const upstreamContentType = (
+        upstream.headers.get("Content-Type") || ""
+      ).toLowerCase();
+      const isKnownMediaExt = /\.(ts|m4s|mp4|webm|mkv)($|\?)/i.test(chunkUrl);
+      const isKnownMediaMime =
+        upstreamContentType.startsWith("video/") ||
+        upstreamContentType.startsWith("audio/");
+      const isStandardMedia = isKnownMediaExt || isKnownMediaMime;
+
+      const wantExplicitUnwrap =
+        query.unwrap === "1" || query.unwrap === "true";
+
+      // If already standard media (.ts/.m4s/video/*) and unwrap was not explicitly requested,
+      // bypass buffering and stream upstream.body directly for zero RAM overhead.
+      const shouldInspectForUnwrap =
+        !isKeyOrPlaylist &&
+        upstream.status >= 200 &&
+        upstream.status < 300 &&
+        (wantExplicitUnwrap || !isStandardMedia);
+
+      if (shouldInspectForUnwrap) {
+        const rawBytes = new Uint8Array(await upstream.arrayBuffer());
+        const shouldUnwrap = wantExplicitUnwrap || needsUnwrap(rawBytes);
+
+        if (shouldUnwrap) {
+          const finalBytes = unwrapChunk(rawBytes);
+          if (finalBytes !== rawBytes && finalBytes[0] === 0x47) {
+            contentType = "video/mp2t";
+            resHeaders.set("Content-Type", contentType);
+            resHeaders.set("Content-Length", finalBytes.byteLength.toString());
+            const cacheControl = upstream.headers.get("Cache-Control");
+            if (cacheControl) resHeaders.set("Cache-Control", cacheControl);
+            return new Response(finalBytes as BodyInit, {
+              status: 200,
+              headers: resHeaders,
+            });
+          }
+        }
+        bodyData = rawBytes as BodyInit;
+      }
+
       if (!contentType) {
         if (chunkUrl.includes(".key") || chunkUrl.includes("/key")) {
           contentType = "application/octet-stream";
@@ -425,8 +480,10 @@ export const app = new Elysia()
       if (acceptRanges) resHeaders.set("Accept-Ranges", acceptRanges);
       const contentLength = upstream.headers.get("Content-Length");
       if (contentLength) resHeaders.set("Content-Length", contentLength);
+      const cacheControl = upstream.headers.get("Cache-Control");
+      if (cacheControl) resHeaders.set("Cache-Control", cacheControl);
 
-      return new Response(upstream.body, {
+      return new Response(bodyData, {
         status: upstream.status,
         headers: resHeaders,
       });

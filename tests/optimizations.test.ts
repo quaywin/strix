@@ -525,9 +525,9 @@ describe("Upstream offline error handling", () => {
       const origInvalidate = scraperService.invalidateCache.bind(scraperService);
       let invalidated = false;
 
-      scraperService.invalidateCache = (u: string) => {
+      scraperService.invalidateCache = (u: string, t?: number) => {
         invalidated = true;
-        origInvalidate(u);
+        return origInvalidate(u, t);
       };
 
       scraperService.extractStream = async () => {
