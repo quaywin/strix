@@ -156,6 +156,13 @@ export class ScraperService {
    * Parses an HLS Master Playlist and resolves the best variant stream URL.
    */
   resolveM3u8Playlist(playlistUrl: string, body: string): string {
+    // If the playlist is already a Media Playlist (contains media segments #EXTINF),
+    // it cannot contain variant streams. Segments might have '.m3u8' in their query or path,
+    // which must never be confused with variant playlists.
+    if (/#EXTINF[:\s]/m.test(body)) {
+      return playlistUrl;
+    }
+
     const lines = body.split(/\r?\n/);
     const variants: {
       url: string;
@@ -177,7 +184,7 @@ export class ScraperService {
       if (line.startsWith("#EXT-X-STREAM-INF:")) {
         const bandwidthMatch = line.match(/BANDWIDTH=(\d+)/i);
         const resolutionMatch = line.match(/RESOLUTION=(\d+)x(\d+)/i);
-        
+
         let bandwidth = 0;
         if (bandwidthMatch && bandwidthMatch[1]) {
           bandwidth = parseInt(bandwidthMatch[1], 10);
@@ -192,22 +199,13 @@ export class ScraperService {
 
         currentStreamInf = { bandwidth, width, height };
       } else if (!line.startsWith("#")) {
-        if (line.includes(".m3u8")) {
+        if (currentStreamInf && line.includes(".m3u8")) {
           try {
             const absoluteUrl = new URL(line, playlistUrl).toString();
-            if (currentStreamInf) {
-              variants.push({
-                url: absoluteUrl,
-                ...currentStreamInf,
-              });
-            } else {
-              variants.push({
-                url: absoluteUrl,
-                bandwidth: 0,
-                width: 0,
-                height: 0,
-              });
-            }
+            variants.push({
+              url: absoluteUrl,
+              ...currentStreamInf,
+            });
           } catch (e) {
             logger.warn(
               `Failed to resolve relative URL: ${line} against ${playlistUrl}`,
@@ -230,21 +228,6 @@ export class ScraperService {
         return b.bandwidth - a.bandwidth;
       });
       return variants[0]?.url || playlistUrl;
-    }
-
-    // Fallback: check for any non-comment lines containing .m3u8
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]?.trim();
-      if (line && !line.startsWith("#") && line.includes(".m3u8")) {
-        try {
-          return new URL(line, playlistUrl).toString();
-        } catch (e) {
-          logger.warn(
-            `Failed to resolve fallback relative URL: ${line} against ${playlistUrl}`,
-            "ScraperService",
-          );
-        }
-      }
     }
 
     return playlistUrl;

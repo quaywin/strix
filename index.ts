@@ -245,14 +245,17 @@ export const handleScrapeStream = async (
       if (contentLength) headers.set("Content-Length", contentLength);
 
       const contentTypeLower = contentType?.toLowerCase() || "";
-      const isMpegUrlType = contentTypeLower.includes("mpegurl");
+      const isMpegUrlType =
+        contentTypeLower.includes("mpegurl") ||
+        contentTypeLower.includes("m3u8");
       const isBinaryVideoType =
-        contentTypeLower.startsWith("video/") ||
-        contentTypeLower.startsWith("audio/") ||
-        /\.(mp4|mkv|webm|ts|m4s)($|\?)/i.test(streamUrl);
+        !isMpegUrlType &&
+        (contentTypeLower.startsWith("video/") ||
+          contentTypeLower.startsWith("audio/") ||
+          /\.(mp4|mkv|webm|ts|m4s)($|\?)/i.test(streamUrl));
 
       // Determine if content is HLS playlist (#EXTM3U) even if URL has no .m3u8
-      let isM3u8 = isKnownM3u8 || isMpegUrlType;
+      let isM3u8 = (isKnownM3u8 || isMpegUrlType) && !isBinaryVideoType;
       let text: string | null = null;
 
       if (isM3u8 || !isBinaryVideoType) {
@@ -288,14 +291,7 @@ export const handleScrapeStream = async (
         const trimmed = text.trim();
         if (trimmed.startsWith("#EXTM3U")) {
           isM3u8 = true;
-        } else if (
-          trimmed.startsWith("<!DOCTYPE") ||
-          trimmed.startsWith("<html") ||
-          trimmed.startsWith("<meta") ||
-          trimmed.startsWith("<head") ||
-          trimmed.startsWith("<body") ||
-          trimmed.startsWith("<script")
-        ) {
+        } else {
           isM3u8 = false;
         }
       }

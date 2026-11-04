@@ -1150,6 +1150,121 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
       }
     });
   });
+
+  describe("resolveM3u8Playlist handling", () => {
+    it("does not mistake media segments containing .m3u8 in path/query for variant playlists", async () => {
+      const { scraperService } = await import(
+        "../src/services/scraper.service"
+      );
+
+      const playlistUrl =
+        "https://route.transcode.cfd/m3u8-proxy.m3u8?data=Ag-Fq_VdfT8vtv4jk2mn0wrYAnbuF1HrBB9OT9v47-TOuHoClGBBAOLv-rA2vA_tC-X5dyFlQ7zeOk7CCGyClgaSLlSjs9gEYGDMyBP7jPG4f5mRwOGnQ_Da9YMxSDNal4uH";
+
+      const mediaPlaylistBody = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:9
+#EXT-X-MEDIA-SEQUENCE:239168383
+#EXT-X-DISCONTINUITY-SEQUENCE:29896048
+#EXTINF:1.666667,
+https://route.transcode.cfd/m3u8-proxy.m3u8?data=N5zEEA5Q5tfLdixNmDkIGXfHOY3YgeyilZlslfllDP5aJVxlbowdh34otoBdDzWizl472-AncvBuwhlrFlcOUl_5GKW90IBiWB5oNzyaMNJJglUI3oGfDGbQYu1BZy7vVq7LvNoFaNuD7Gg
+#EXT-X-DISCONTINUITY
+#EXTINF:8.333333,
+https://route.transcode.cfd/m3u8-proxy.m3u8?data=Vv1tAuWbXB1uW2gYWIWD0kHB7Dq40z5nXn6ThM6rD4aldHD4Kh1eoUNOGIfACiATZnbYy_PAMDlRilFJELkBazTYCcu3n6jfS74QkhpWKnjLrZJZZBnklckkI4Qgy91vGr7AO2gG1ZCDhsU
+`;
+
+      const resolved = scraperService.resolveM3u8Playlist(
+        playlistUrl,
+        mediaPlaylistBody,
+      );
+
+      // Must return the media playlist URL itself, NEVER the segment URL
+      expect(resolved).toBe(playlistUrl);
+    });
+
+    it("resolves highest resolution and bandwidth variant from a true master playlist", async () => {
+      const { scraperService } = await import(
+        "../src/services/scraper.service"
+      );
+
+      const masterPlaylistUrl = "https://example.com/master.m3u8";
+      const masterPlaylistBody = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p.m3u8
+`;
+
+      const resolved = scraperService.resolveM3u8Playlist(
+        masterPlaylistUrl,
+        masterPlaylistBody,
+      );
+
+      expect(resolved).toBe("https://example.com/1080p.m3u8");
+    });
+
+    it("correctly handles proxying a media playlist with proxy_segments=true without corrupting to TS chunks", async () => {
+      const server = Bun.serve({
+        port: 0,
+        fetch(req) {
+          const url = new URL(req.url);
+          if (url.pathname === "/playlist.m3u8") {
+            return new Response(
+              `#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nhttp://localhost:${server.port}/chunk.m3u8?data=123\n`,
+              {
+                headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+              },
+            );
+          }
+          if (url.pathname === "/chunk.m3u8") {
+            // Returns binary TS chunk
+            return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x16]), {
+              headers: { "Content-Type": "video/mp2t" },
+            });
+          }
+          return new Response("Not Found", { status: 404 });
+        },
+      });
+
+      try {
+        const { handleScrapeStream } = await import("../index");
+        const { scraperService } = await import("../src/services/scraper.service");
+
+        const origExtract = scraperService.extractStream.bind(scraperService);
+        scraperService.extractStream = async () => ({
+          url: `http://localhost:${server.port}/playlist.m3u8`,
+          body: `#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nhttp://localhost:${server.port}/chunk.m3u8?data=123\n`,
+          headers: {},
+          fromCache: false,
+          extractedAt: Date.now(),
+        });
+
+        try {
+          const req = new Request("http://localhost:5005/scrape-stream");
+          const res = await handleScrapeStream(
+            {
+              url: "https://example.com/stream",
+              proxy: "1",
+              proxy_segments: "1",
+            },
+            req,
+          );
+
+          expect(res.status).toBe(200);
+          expect(res.headers.get("content-type")).toContain("mpegurl");
+          const text = await res.text();
+          expect(text).toContain("#EXTM3U");
+          expect(text).toContain("/proxy-chunk?url=");
+          expect(text).toContain(encodeURIComponent(`http://localhost:${server.port}/chunk.m3u8?data=123`));
+        } finally {
+          scraperService.extractStream = origExtract;
+        }
+      } finally {
+        server.stop(true);
+      }
+    });
+  });
 });
 
 
