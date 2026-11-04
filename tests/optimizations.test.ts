@@ -979,117 +979,111 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
     });
   });
 
-  describe("Rolling token dynamic TTL & upstream edge warming retry", () => {
-    it("calculateStreamTtlMs calculates safe proactive TTLs for signed and rolling token streams", async () => {
-      const { calculateStreamTtlMs } = await import(
-        "../src/services/scraper.service"
-      );
-      const defaultTtl = 50 * 60 * 1000;
-
-      // Clean static URL without token -> default TTL
-      expect(
-        calculateStreamTtlMs("https://cdn.example.com/hls/live.m3u8", defaultTtl),
-      ).toBe(defaultTtl);
-
-      // Stream with rolling token parameter -> caps at 7.5 minutes (450,000ms)
-      expect(
-        calculateStreamTtlMs(
-          "https://cdn.example.com/live.m3u8?token=xyz123abc",
-          defaultTtl,
-        ),
-      ).toBe(450_000);
-
-      // Stream with auth_key or hdnts or tk
-      expect(
-        calculateStreamTtlMs(
-          "https://cdn.example.com/live.m3u8?tk=secret_token",
-          defaultTtl,
-        ),
-      ).toBe(450_000);
-
-      // Matchora / Pecufa pipe-separated parameter
-      const nowSec = Math.floor(Date.now() / 1000);
-      const expireIn500Sec = nowSec + 500;
-      const pipeUrl = `https://e.pecufa.cyou/channel/playlist.m3u8?t=1909974|${expireIn500Sec}||||extra`;
-      const pipeTtl = calculateStreamTtlMs(pipeUrl, defaultTtl);
-      // Expected remainingMs: (500s - 60s buffer) * 1000 = ~440,000ms
-      expect(pipeTtl).toBeGreaterThanOrEqual(430_000);
-      expect(pipeTtl).toBeLessThanOrEqual(445_000);
-
-      // Explicit expires epoch param
-      const expUrl = `https://cdn.example.com/stream.m3u8?expires=${nowSec + 300}`;
-      const expTtl = calculateStreamTtlMs(expUrl, defaultTtl);
-      // (300s - 60s buffer) * 1000 = ~240,000ms
-      expect(expTtl).toBeGreaterThanOrEqual(235_000);
-      expect(expTtl).toBeLessThanOrEqual(245_000);
-    });
-
-    it("refreshes stale streams in background via Stale-While-Revalidate without blocking client response", async () => {
-      const { scraperService, streamCache } = await import(
+  describe("Standard stream caching, cache protection & edge warming resilience", () => {
+    it("preserves last known stream without negative-caching when a re-scrape captures 0 requests", async () => {
+      const { scraperService, streamCache, NoSourceFoundError } = await import(
         "../src/services/scraper.service"
       );
       const { scraperEngine } = await import("../src/scraper/ScraperEngine");
 
-      const swrTarget = "https://example.com/swr-test-channel";
-      scraperService.invalidateCache(swrTarget);
+      const channelUrl = "https://example.com/resilient-channel";
+      scraperService.invalidateCache(channelUrl);
 
+      const cacheKey = `extract:${channelUrl}:sub:false`;
+      // Simulate an established, working stream in cache
+      streamCache.set(cacheKey, {
+        url: "https://e.pecufa.cyou/hls/2151749/index.m3u8",
+        headers: {},
+        extractedAt: Date.now() - 60_000,
+      });
+
+      // Mock engine: re-scrape captures 0 requests (e.g. embed transition delay)
       let engineCalls = 0;
       const origCollect = scraperEngine.collectRequests.bind(scraperEngine);
-
       scraperEngine.collectRequests = async () => {
         engineCalls++;
-        // Small delay to simulate scraping latency
-        await new Promise((r) => setTimeout(r, 60));
-        return [
-          {
-            url: `https://cdn.example.com/stream-v${engineCalls}.m3u8?token=xyz`,
-            method: "GET",
-            headers: {},
-            resource_type: "media",
-            post_data: null,
-            body: "#EXTM3U\n#EXTINF:4.0,\nseg.ts\n",
-          },
-        ];
+        return [];
       };
 
       try {
-        const cacheKey = `extract:${swrTarget}:sub:false`;
+        // Trigger fresh re-scrape on established channel
+        await expect(
+          scraperService.extractStream(channelUrl, false, false, undefined, true),
+        ).rejects.toThrow(NoSourceFoundError);
 
-        // Pre-populate cache with a stale entry:
-        // expires in 10s (valid), but stale threshold was 1s ago (stale!)
-        streamCache.set(
-          cacheKey,
-          {
-            url: "https://cdn.example.com/stream-v0.m3u8?token=old",
-            headers: {},
-            extractedAt: Date.now() - 300_000,
-          },
-          10_000, // ttlMs: still valid for 10s
-          -1000, // staleMs: already stale
-        );
-
-        const startTime = Date.now();
-        // Client request during stale window:
-        // MUST return immediately with the stale entry (0ms wait, fromCache: true)
-        const clientRes = await scraperService.extractStream(swrTarget);
-        const elapsed = Date.now() - startTime;
-
-        expect(elapsed).toBeLessThan(40); // Returned immediately without awaiting engine (60ms)
-        expect(clientRes.fromCache).toBe(true);
-        expect(clientRes.url).toBe("https://cdn.example.com/stream-v0.m3u8?token=old");
-
-        // Wait for background SWR scrape to finish
-        await new Promise((r) => setTimeout(r, 120));
         expect(engineCalls).toBe(1);
 
-        // Next client request gets the freshly revalidated stream URL from cache
-        const nextRes = await scraperService.extractStream(swrTarget);
-        expect(nextRes.fromCache).toBe(true);
-        expect(nextRes.url).toBe("https://cdn.example.com/stream-v1.m3u8?token=xyz");
-        expect(engineCalls).toBe(1); // No new scrape triggered
+        // Crucial: streamCache must NOT be poisoned with isNotFound: true!
+        const cached = streamCache.get(cacheKey);
+        expect(cached).toBeDefined();
+        expect(cached?.isNotFound).toBeFalsy();
+        expect(cached?.url).toBe("https://e.pecufa.cyou/hls/2151749/index.m3u8");
       } finally {
         scraperEngine.collectRequests = origCollect;
-        scraperService.invalidateCache(swrTarget);
+        scraperService.invalidateCache(channelUrl);
+      }
+    });
+
+    it("absorbs multiple upstream 404 warming phases with in-place retries", async () => {
+      let upstreamAttempts = 0;
+      const server = Bun.serve({
+        port: 0,
+        fetch() {
+          upstreamAttempts++;
+          if (upstreamAttempts <= 2) {
+            // First 2 hits: edge transcoder is warming up
+            return new Response("warming", { status: 404 });
+          }
+          // 3rd hit (after in-place retries): stream is ready
+          return new Response(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nseg1.ts\n",
+            {
+              status: 200,
+              headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+            },
+          );
+        },
+      });
+
+      try {
+        const { handleScrapeStream } = await import("../index");
+        const { scraperService } = await import(
+          "../src/services/scraper.service"
+        );
+
+        const origExtract = scraperService.extractStream.bind(scraperService);
+        let extractCount = 0;
+        scraperService.extractStream = async () => {
+          extractCount++;
+          return {
+            url: `http://localhost:${server.port}/live/multi-warming.m3u8`,
+            headers: {},
+            fromCache: false,
+            extractedAt: Date.now(),
+          };
+        };
+
+        try {
+          const req = new Request("http://localhost:5005/scrape-stream");
+          const res = await handleScrapeStream(
+            {
+              url: "https://matchora.pro/embed/channel/2151749",
+              proxy: "1",
+            },
+            req,
+          );
+
+          expect(res.status).toBe(200);
+          expect(upstreamAttempts).toBe(3); // Retried twice in-place (total 3 attempts)
+          expect(extractCount).toBe(1); // Did NOT launch full scraper again!
+          const body = await res.text();
+          expect(body).toContain("#EXTM3U");
+          expect(body).toContain("seg1.ts");
+        } finally {
+          scraperService.extractStream = origExtract;
+        }
+      } finally {
+        server.stop(true);
       }
     });
 

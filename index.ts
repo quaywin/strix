@@ -94,10 +94,12 @@ export const handleScrapeStream = async (
     }
 
     // Proxy mode: fetch upstream and stream the body back to the client.
-    // If upstream returns an error (404/403/502) on a cached stream URL older than 30s,
-    // the signed token has likely expired. We invalidate the cache, re-scrape once,
-    // and retry exactly one time to seamlessly recover without stalling the player.
-    const proxyOnce = async (): Promise<{
+    // If upstream returns an error (404/403/502) on a cached stream URL older than 15s,
+    // the channel may have rotated or signed token expired. We perform a fresh scrape
+    // and retry to seamlessly recover without stalling the player.
+    const proxyOnce = async (
+      forceFresh: boolean = false,
+    ): Promise<{
       response: Response;
       fromCache: boolean;
       extractedAt: number;
@@ -107,6 +109,7 @@ export const handleScrapeStream = async (
         wantSub,
         wantEmbed,
         request.signal,
+        forceFresh,
       );
       const {
         url: streamUrl,
@@ -153,36 +156,50 @@ export const handleScrapeStream = async (
           snippet = bodyText.slice(0, 300);
         } catch (_) {}
 
-        // Handle edge transcoder warming phase (e.g. Pecufa/Matchora returns HTTP 404 with "warming" for 1-3s)
-        const isWarming =
+        // Handle edge transcoder warming phase (e.g. Pecufa/Matchora returns HTTP 404 with "warming" for 1-5s)
+        let isWarming =
           (upstream.status === 404 || upstream.status === 503) &&
           snippet.toLowerCase().includes("warming");
 
-        if (isWarming && !request.signal.aborted) {
+        let warmingRetries = 0;
+        const MAX_WARMING_RETRIES = 2; // Up to 2 retries with 1.5s delay (total 3 attempts)
+        while (
+          isWarming &&
+          warmingRetries < MAX_WARMING_RETRIES &&
+          !request.signal.aborted
+        ) {
+          warmingRetries++;
           logger.info(
-            `Upstream edge transcoder is warming (${streamUrl}), retrying in 1.5s...`,
+            `Upstream edge transcoder is warming (${streamUrl}), retrying in 1.5s (${warmingRetries}/${MAX_WARMING_RETRIES})...`,
             "App",
           );
           await Bun.sleep(1500);
-          if (!request.signal.aborted) {
-            const retryTimeoutSignal = AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS);
-            const retrySignal = request.signal
-              ? AbortSignal.any([request.signal, retryTimeoutSignal])
-              : retryTimeoutSignal;
-            const retryUpstream = await smartFetch(streamUrl, {
-              signal: retrySignal,
-              headers: requestHeaders,
-              range: isKnownM3u8 ? null : range,
-            });
-            if (retryUpstream.ok) {
-              upstream = retryUpstream;
+          if (request.signal.aborted) break;
+
+          const retryTimeoutSignal = AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS);
+          const retrySignal = request.signal
+            ? AbortSignal.any([request.signal, retryTimeoutSignal])
+            : retryTimeoutSignal;
+          const retryUpstream = await smartFetch(streamUrl, {
+            signal: retrySignal,
+            headers: requestHeaders,
+            range: isKnownM3u8 ? null : range,
+          });
+          if (retryUpstream.ok) {
+            upstream = retryUpstream;
+            snippet = "";
+            isWarming = false;
+            break;
+          } else {
+            try {
+              snippet = (await retryUpstream.text()).slice(0, 300);
+            } catch (_) {
               snippet = "";
-            } else {
-              try {
-                snippet = (await retryUpstream.text()).slice(0, 300);
-              } catch (_) {}
-              upstream = retryUpstream;
             }
+            upstream = retryUpstream;
+            isWarming =
+              (upstream.status === 404 || upstream.status === 503) &&
+              snippet.toLowerCase().includes("warming");
           }
         }
 
@@ -370,20 +387,27 @@ export const handleScrapeStream = async (
     let { response, fromCache, extractedAt } = await proxyOnce();
 
     if (!response.ok) {
-      // If the failed upstream request was using a cached stream URL older than 60s,
-      // it is very likely a signed rolling token that expired (e.g. 404 or 403 on tims-001.sytes.net).
-      // We invalidate the cache and perform exactly ONE fresh scrape to recover the stream seamlessly.
-      const isStaleEligible = fromCache && Date.now() - extractedAt >= 60_000;
+      // If the failed upstream request was using a cached stream URL older than 15s,
+      // the channel may have rotated (e.g. Pecufa/Matchora) or signed token expired (e.g. 404/403/502).
+      // We re-scrape once reactively to seamlessly recover the new stream without stalling the player.
+      const isStaleEligible = fromCache && Date.now() - extractedAt >= 15_000;
       if (isStaleEligible) {
         logger.warn(
-          `Proxy got upstream error (HTTP ${response.status}) on cached stream for ${url} (age: ${Math.round((Date.now() - extractedAt) / 1000)}s); invalidating cache and retrying once with fresh scrape`,
+          `Proxy got upstream error (HTTP ${response.status}) on cached stream for ${url} (age: ${Math.round((Date.now() - extractedAt) / 1000)}s); retrying once with fresh scrape`,
           "App",
         );
-        // Conditionally invalidate: only delete if the cached entry was extracted at or before this failed attempt.
-        // If a concurrent request already finished re-scraping, the new cache entry remains intact.
-        scraperService.invalidateCache(url, extractedAt);
-        const retry = await proxyOnce();
-        response = retry.response;
+        try {
+          const retry = await proxyOnce(true);
+          if (retry.response.ok) {
+            scraperService.invalidateCache(url, extractedAt);
+          }
+          response = retry.response;
+        } catch (e) {
+          logger.warn(
+            `Fresh scrape recovery attempt failed for ${url}: ${(e as Error).message}`,
+            "App",
+          );
+        }
       }
     }
     return response;
