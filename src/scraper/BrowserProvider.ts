@@ -161,9 +161,9 @@ export class PlaywrightBrowserProvider {
         // Ignored
       }
     }
-    // Synchronous full GC in Bun to promptly return freed heap memory to OS
+    // Non-blocking GC in Bun to reclaim memory without freezing the event loop
     if (typeof (Bun as any)?.gc === "function") {
-      (Bun as any).gc(true);
+      (Bun as any).gc(false);
     }
   }
 

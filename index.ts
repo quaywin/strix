@@ -147,37 +147,73 @@ export const handleScrapeStream = async (
         range: isKnownM3u8 ? null : range,
       });
       if (!upstream.ok) {
-        const isOffline =
-          upstream.status === 404 ||
-          upstream.status === 502 ||
-          upstream.status === 503 ||
-          upstream.status === 504;
         let snippet = "";
         try {
           const bodyText = await upstream.text();
           snippet = bodyText.slice(0, 300);
         } catch (_) {}
-        logger.warn(
-          `Upstream fetch failed: HTTP ${upstream.status} for ${streamUrl}${snippet ? `. Response: ${snippet}` : ""}`,
-          "App",
-        );
-        return {
-          response: new Response(
-            JSON.stringify({
-              error: isOffline
-                ? `Upstream stream is offline or unavailable (HTTP ${upstream.status})`
-                : `Upstream returned ${upstream.status}`,
-              upstreamStatus: upstream.status,
-              upstreamSnippet: snippet || undefined,
-            }),
-            {
-              status: isOffline ? 404 : 502,
-              headers: { "Content-Type": "application/json" },
-            },
-          ),
-          fromCache,
-          extractedAt,
-        };
+
+        // Handle edge transcoder warming phase (e.g. Pecufa/Matchora returns HTTP 404 with "warming" for 1-3s)
+        const isWarming =
+          (upstream.status === 404 || upstream.status === 503) &&
+          snippet.toLowerCase().includes("warming");
+
+        if (isWarming && !request.signal.aborted) {
+          logger.info(
+            `Upstream edge transcoder is warming (${streamUrl}), retrying in 1.5s...`,
+            "App",
+          );
+          await Bun.sleep(1500);
+          if (!request.signal.aborted) {
+            const retryTimeoutSignal = AbortSignal.timeout(CONFIG.PROXY_UPSTREAM_TIMEOUT_MS);
+            const retrySignal = request.signal
+              ? AbortSignal.any([request.signal, retryTimeoutSignal])
+              : retryTimeoutSignal;
+            const retryUpstream = await smartFetch(streamUrl, {
+              signal: retrySignal,
+              headers: requestHeaders,
+              range: isKnownM3u8 ? null : range,
+            });
+            if (retryUpstream.ok) {
+              upstream = retryUpstream;
+              snippet = "";
+            } else {
+              try {
+                snippet = (await retryUpstream.text()).slice(0, 300);
+              } catch (_) {}
+              upstream = retryUpstream;
+            }
+          }
+        }
+
+        if (!upstream.ok) {
+          const isOffline =
+            upstream.status === 404 ||
+            upstream.status === 502 ||
+            upstream.status === 503 ||
+            upstream.status === 504;
+          logger.warn(
+            `Upstream fetch failed: HTTP ${upstream.status} for ${streamUrl}${snippet ? `. Response: ${snippet}` : ""}`,
+            "App",
+          );
+          return {
+            response: new Response(
+              JSON.stringify({
+                error: isOffline
+                  ? `Upstream stream is offline or unavailable (HTTP ${upstream.status})`
+                  : `Upstream returned ${upstream.status}`,
+                upstreamStatus: upstream.status,
+                upstreamSnippet: snippet || undefined,
+              }),
+              {
+                status: isOffline ? 404 : 502,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+            fromCache,
+            extractedAt,
+          };
+        }
       }
       const headers = new Headers();
       const contentType = upstream.headers.get("Content-Type");
@@ -334,10 +370,10 @@ export const handleScrapeStream = async (
     let { response, fromCache, extractedAt } = await proxyOnce();
 
     if (!response.ok) {
-      // If the failed upstream request was using a cached stream URL older than 30s,
+      // If the failed upstream request was using a cached stream URL older than 60s,
       // it is very likely a signed rolling token that expired (e.g. 404 or 403 on tims-001.sytes.net).
       // We invalidate the cache and perform exactly ONE fresh scrape to recover the stream seamlessly.
-      const isStaleEligible = fromCache && Date.now() - extractedAt >= 30_000;
+      const isStaleEligible = fromCache && Date.now() - extractedAt >= 60_000;
       if (isStaleEligible) {
         logger.warn(
           `Proxy got upstream error (HTTP ${response.status}) on cached stream for ${url} (age: ${Math.round((Date.now() - extractedAt) / 1000)}s); invalidating cache and retrying once with fresh scrape`,

@@ -5,8 +5,15 @@ import { StrmFreeExtractor } from "../scraper/extractors/StrmFreeExtractor";
 import { isM3u8StreamUrl, scraperEngine } from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
 
+interface TtlEntry<T> {
+  value: T;
+  expiresAt: number;
+  staleAt?: number;
+  isRevalidating?: boolean;
+}
+
 class TtlCache<T> {
-  private cache = new Map<string, { value: T; expiresAt: number }>();
+  private cache = new Map<string, TtlEntry<T>>();
   private cleanupInterval: NodeJS.Timeout;
 
   constructor(
@@ -31,7 +38,36 @@ class TtlCache<T> {
     return entry.value;
   }
 
-  set(key: string, value: T, ttlMs: number = this.defaultTtlMs): void {
+  getWithStale(key: string): { value: T; isStale: boolean } | undefined {
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    const now = Date.now();
+    if (now > entry.expiresAt) {
+      this.cache.delete(key);
+      return undefined;
+    }
+    const isStale = Boolean(
+      entry.staleAt && now > entry.staleAt && !entry.isRevalidating,
+    );
+    if (isStale) {
+      entry.isRevalidating = true;
+    }
+    return { value: entry.value, isStale };
+  }
+
+  clearRevalidating(key: string): void {
+    const entry = this.cache.get(key);
+    if (entry) {
+      entry.isRevalidating = false;
+    }
+  }
+
+  set(
+    key: string,
+    value: T,
+    ttlMs: number = this.defaultTtlMs,
+    staleMs?: number,
+  ): void {
     if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
       // Evict oldest entry (first key in Map insertion order) to cap memory usage
       const oldestKey = this.cache.keys().next().value;
@@ -39,7 +75,13 @@ class TtlCache<T> {
         this.cache.delete(oldestKey);
       }
     }
-    this.cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+    const now = Date.now();
+    this.cache.set(key, {
+      value,
+      expiresAt: now + ttlMs,
+      staleAt: staleMs !== undefined ? now + staleMs : undefined,
+      isRevalidating: false,
+    });
   }
 
   delete(key: string): void {
@@ -83,7 +125,110 @@ export interface ExtractedStreamResult {
 }
 
 // Global cache instance
-const streamCache = new TtlCache<ExtractedStreamResult>(CONFIG.CACHE_TTL_MS);
+export const streamCache = new TtlCache<ExtractedStreamResult>(CONFIG.CACHE_TTL_MS);
+
+export interface StreamTtlConfig {
+  ttlMs: number;
+  staleMs?: number;
+}
+
+/**
+ * Calculates a safe cache TTL and soft stale threshold (SWR) for an extracted stream URL.
+ * Signed / rolling tokens (e.g. Pecufa, Matchora, Cinevid, Akamai HDN, CDN tokens)
+ * typically expire in 10-15 minutes. By returning both a hard ttlMs and a soft staleMs,
+ * the stream can be refreshed in the background without forcing the client to wait.
+ */
+export function calculateStreamTtl(
+  streamUrl: string,
+  defaultTtlMs: number = CONFIG.CACHE_TTL_MS,
+): StreamTtlConfig {
+  const ROLLING_TOKEN_TTL_MS = 7.5 * 60 * 1000; // 7.5 minutes (450,000ms) - hard expiry
+  const ROLLING_TOKEN_STALE_MS = 5 * 60 * 1000; // 5.0 minutes (300,000ms) - background revalidate trigger
+  const MIN_TTL_MS = 60 * 1000; // 1 minute minimum
+
+  try {
+    const parsedUrl = new URL(streamUrl);
+    const params = parsedUrl.searchParams;
+
+    const parseEpoch = (num: number): StreamTtlConfig | null => {
+      if (!isNaN(num) && num > 1_600_000_000 && num < 2_500_000_000) {
+        const remainingMs = num * 1000 - Date.now();
+        if (remainingMs > MIN_TTL_MS) {
+          const ttlMs = Math.min(defaultTtlMs, Math.max(MIN_TTL_MS, remainingMs - 60_000));
+          const staleBufferMs = Math.min(180_000, ttlMs / 2);
+          const staleMs = Math.max(30_000, ttlMs - staleBufferMs);
+          return { ttlMs, staleMs };
+        }
+      }
+      return null;
+    };
+
+    // 1. Explicit expiry parameters (seconds since epoch)
+    const expKeys = ["expires", "exp", "e", "until", "timeout", "expire"];
+    for (const key of expKeys) {
+      const val = params.get(key);
+      if (val) {
+        const result = parseEpoch(parseInt(val, 10));
+        if (result) return result;
+      }
+    }
+
+    // 2. Encoded / pipe-separated token timestamps (e.g. Pecufa/Matchora ?t=1909974|1793730554||||...)
+    for (const [_, val] of params.entries()) {
+      if (val.includes("|")) {
+        const parts = val.split("|");
+        for (const part of parts) {
+          const result = parseEpoch(parseInt(part, 10));
+          if (result) return result;
+        }
+      }
+    }
+
+    // 3. Known query parameters indicative of rolling/signed tokens
+    const tokenParamNames = [
+      "token",
+      "t",
+      "tk",
+      "sign",
+      "signature",
+      "auth_key",
+      "hdnts",
+      "st",
+      "et",
+      "h",
+      "wmsauthsign",
+      "hash",
+      "key",
+      "access_token",
+      "verify",
+    ];
+    const hasTokenParam = tokenParamNames.some((key) => params.has(key));
+
+    // Also check for signed token segments in the path (e.g. /token=.../ or /h=.../ or /live/...~exp=...)
+    const pathHasToken =
+      /\/(token|auth|sign|h|verify)[\/=]/i.test(parsedUrl.pathname) ||
+      /~exp=/i.test(parsedUrl.pathname);
+
+    if (hasTokenParam || pathHasToken) {
+      const ttlMs = Math.min(defaultTtlMs, ROLLING_TOKEN_TTL_MS);
+      return { ttlMs, staleMs: ROLLING_TOKEN_STALE_MS };
+    }
+  } catch (_) {
+    // If streamUrl cannot be parsed as a standard URL, fall back to default
+  }
+
+  return {
+    ttlMs: defaultTtlMs,
+    staleMs: Math.round(defaultTtlMs * 0.8),
+  };
+}
+
+export function calculateStreamTtlMs(
+  streamUrl: string,
+  defaultTtlMs: number = CONFIG.CACHE_TTL_MS,
+): number {
+  return calculateStreamTtl(streamUrl, defaultTtlMs).ttlMs;
+}
 
 /**
  * Thrown when the scraper could not find any playable stream URL on the
@@ -253,14 +398,51 @@ export class ScraperService {
     }
 
     const cacheKey = `extract:${url}:sub:${sub}${isEmbed ? ":embed:true" : ""}`;
-    const cached = streamCache.get(cacheKey);
-    if (cached) {
-      if (cached.isNotFound) {
+    const cacheEntry = streamCache.getWithStale(cacheKey);
+    if (cacheEntry) {
+      const { value, isStale } = cacheEntry;
+      if (value.isNotFound) {
         throw new NoSourceFoundError(
           "No m3u8/video source found - site may be down or content removed",
         );
       }
-      return { ...cached, fromCache: true };
+
+      // Stale-While-Revalidate: If stale and no revalidation is currently in flight,
+      // refresh in background without making the user wait (0ms delay for user).
+      if (isStale && !this.inFlightScrapes.has(cacheKey)) {
+        logger.info(
+          `Stream cache is stale for: ${url}, refreshing in background (SWR)`,
+          "ScraperService",
+        );
+        const bgController = new AbortController();
+        const bgPromise = this.doExtractStream(
+          url,
+          sub,
+          cacheKey,
+          isEmbed,
+          bgController.signal,
+        )
+          .catch((err) => {
+            logger.warn(
+              `Background SWR refresh failed for ${url}: ${(err as Error).message}`,
+              "ScraperService",
+            );
+            streamCache.clearRevalidating(cacheKey);
+          })
+          .finally(() => {
+            const current = this.inFlightScrapes.get(cacheKey);
+            if (current && current.promise === bgPromise) {
+              this.inFlightScrapes.delete(cacheKey);
+            }
+          });
+        this.inFlightScrapes.set(cacheKey, {
+          promise: bgPromise,
+          controller: bgController,
+          subscribers: 1,
+        });
+      }
+
+      return { ...value, fromCache: true };
     }
 
     // Coalesce concurrent in-flight requests for the exact same stream (Thundering Herd protection)
@@ -392,9 +574,10 @@ export class ScraperService {
             headers: extracted.headers,
             extractedAt: Date.now(),
           };
-          streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
+          const { ttlMs, staleMs } = calculateStreamTtl(streamUrl, CONFIG.CACHE_TTL_MS);
+          streamCache.set(cacheKey, result, ttlMs, staleMs);
           logger.info(
-            `Extracted stream URL via direct extractor: ${streamUrl}`,
+            `Extracted stream URL via direct extractor: ${streamUrl} (TTL: ${Math.round(ttlMs / 1000)}s, SWR at: ${staleMs ? Math.round(staleMs / 1000) : "none"}s)`,
             "ScraperService",
           );
           return { ...result, fromCache: false };
@@ -509,8 +692,12 @@ export class ScraperService {
       extractedAt: Date.now(),
     };
 
-    streamCache.set(cacheKey, result, CONFIG.CACHE_TTL_MS);
-    logger.info(`Extracted stream URL: ${streamUrl}`, "ScraperService");
+    const { ttlMs, staleMs } = calculateStreamTtl(streamUrl, CONFIG.CACHE_TTL_MS);
+    streamCache.set(cacheKey, result, ttlMs, staleMs);
+    logger.info(
+      `Extracted stream URL: ${streamUrl} (TTL: ${Math.round(ttlMs / 1000)}s, SWR at: ${staleMs ? Math.round(staleMs / 1000) : "none"}s)`,
+      "ScraperService",
+    );
     return { ...result, fromCache: false };
   }
 }
