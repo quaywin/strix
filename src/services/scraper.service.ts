@@ -199,7 +199,7 @@ export class ScraperService {
 
         currentStreamInf = { bandwidth, width, height };
       } else if (!line.startsWith("#")) {
-        if (currentStreamInf && line.includes(".m3u8")) {
+        if (currentStreamInf) {
           try {
             const absoluteUrl = new URL(line, playlistUrl).toString();
             variants.push({
