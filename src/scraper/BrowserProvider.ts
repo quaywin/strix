@@ -178,7 +178,6 @@ export class PlaywrightBrowserProvider {
       "--autoplay-policy=no-user-gesture-required",
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-web-security",
       "--disable-features=IsolateOrigins,site-per-process",
       "--disable-site-isolation-trials",
       "--disable-dev-shm-usage",
