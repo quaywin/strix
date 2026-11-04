@@ -2,38 +2,52 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bun Version](https://img.shields.io/badge/Bun-%3E%3D1.0.0-blue?logo=bun)](https://bun.sh)
-[![Playwright](https://img.shields.io/badge/Playwright-Chromium-green?logo=playwright)](https://playwright.dev)
+[![Patchright](https://img.shields.io/badge/Patchright-Undetected%20Chromium-green?logo=playwright)](https://github.com/kaliiiiiiiiii/patchright)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue?logo=docker)](https://www.docker.com)
 
-A high-performance Bun + Elysia + Playwright microservice designed to do one thing exceptionally well:
+A high-performance Bun + Elysia + Patchright microservice designed to do one thing exceptionally well:
 **given a video hosting or sports streaming page URL, bypass anti-bot and hotlink protections, extract the raw `.m3u8` (HLS) or video (`.mp4`/`.mkv`/etc.) stream URL alongside dynamic request headers, and either return JSON metadata, redirect, or proxy the stream directly to client players.**
 
-Built for IPTV systems, video aggregators, and streaming apps that need reliable resolution of protected, token-gated, or short-lived video streams.
+Built for IPTV systems, video aggregators, and streaming apps that need reliable resolution of protected, token-gated, disguised, or short-lived video streams.
 
 ---
 
 ## Key Features
 
-- **Anti-Bot Stealth Engine**:
+- **Anti-Bot Stealth Engine (Patchright & CDP)**:
+  - Powered by **Patchright** (undetected Chromium driver) to eliminate core automation artifacts at the binary level.
   - Neutralizes `navigator.webdriver`, sandbox detection tricks (`sandDetect`), and overrides `userAgentData`, permissions API, plugins, and language lists.
+  - Realistic desktop browser profile running natural Same-Origin Policy (SOP) without dangerous `--disable-web-security` flags, bypassing deep honeypot probes and anti-scraper traps.
   - Mimics natural visibility states (`document.visibilityState = 'visible'`) and disables autoplay restrictions (`--autoplay-policy=no-user-gesture-required`) so players initialize immediately without human interaction.
+- **Fast-Path Direct HTTP Extractors**:
+  - Automatically bypasses heavy browser launches when targeted sites support direct API extraction (e.g. PitSport, StrmFree), returning streams in milliseconds.
 - **Interactive Player Clicker**:
   - Automatically searches, polls, and triggers play buttons across frames and shadow DOMs (JWPlayer, Video.js, Clappr, custom sports player buttons).
 - **Synthetic Iframe Container**:
-  - Seamlessly handles both host pages (`ppv.st/live/...`) and direct embed links (`taifood-blog.asia/embed/...`). Embed URLs are wrapped in a synthetic `<iframe>` container to bypass anti-direct-access checks (`window.top !== window.self`).
-- **Dynamic Header Forwarding**:
-  - Captures dynamic request headers (`Referer`, `User-Agent`) during scraping and forwards them when proxying streams, bypassing upstream CDN 403 Forbidden hotlink blocks.
-- **TLS Fingerprint Bypass (`smartFetch`)**:
-  - Progressive enhancement: calls native Bun `fetch()` first, and automatically falls back to native system `curl` when upstream CDN firewalls (such as "Iron Dome" / JA3 TLS ClientHello fingerprinting) block automated runtimes with 403 Forbidden.
-- **Sub-Playlist & Variant Auto-Resolution (`sub=1`)**:
-  - Resolves HLS Master Playlists (`index.m3u8`) to the highest quality variant stream (`mono.ts.m3u8`), converting relative paths into absolute segment URLs for direct client playback.
+  - Seamlessly handles both host pages and direct embed links (`/embed/`, `/cv-embed/`, `/live-embed/`, `/player/`). Embed URLs are wrapped in a synthetic origin-matched `<iframe>` container (`/strix-embed-loader.html`) to satisfy `Sec-Fetch-Dest: iframe`, CSP frame-ancestors, and anti-direct-access checks.
+- **Disguised Chunk Unwrapping (`cvUnwrap`)**:
+  - Unwraps disguised video segments disguised as images by CDNs (such as Cinevid, TikTok CDN, Matchora, etc.):
+    - **PNG Containers**: IDAT chunks, raw MPEG-TS in Exif, compressed `iTXt` metadata packets (Base64-encoded TS), and `TIKTIKPX` pixel steganography.
+    - **WebP Containers**: Embedded MPEG-TS in RIFF/EXIF chunks.
+    - **Raw Markers**: Disguised payloads with `TIKTIKRAW` or `TIKTIKTSGZ` (gzip) headers.
+  - Zero-copy buffer pointer slices (`subarray`) ensuring near-instantaneous (sub-millisecond) unwrapping.
+- **Dynamic Header Forwarding & Adaptive Referer Sanitization**:
+  - Captures dynamic request headers (`Referer`, `User-Agent`, `Origin`) during scraping and forwards them when proxying streams.
+  - **Adaptive Anti-Hotlink Fallback**: Automatically retries without `Referer` if an upstream CDN returns `403 Forbidden` due to hotlink protection, remembering which hosts require referer stripping.
+- **RFC 8216 Compliant HLS Resolution (`sub=1`)**:
+  - Distinguishes HLS Master Playlists from Media Playlists via strict `#EXTINF` checks, preventing media segments containing `.m3u8` from being misclassified as variant streams.
+  - Sorts variant streams by visual area (`width * height`) and bandwidth to resolve the highest quality stream.
+- **Edge Transcoder Warming Retry**:
+  - Automatically handles edge transcoder warming phases (e.g. temporary 404/503 "warming" responses from edge nodes) with backoff retries before surfacing errors.
+- **Cancellation & Abortion Propagation**:
+  - Full `AbortSignal` support across the Semaphore, ScraperEngine, and Elysia routes. When a client closes the connection or switches channels, in-flight scrapes and upstream requests abort immediately, freeing Chromium slots.
 - **Production-Grade Concurrency & Memory Guard**:
   - **In-flight Deduplication (SingleFlight)**: Coalesces concurrent requests for the exact same stream into a single browser tab, completely preventing cache stampedes / thundering herd CPU spikes.
   - **Concurrency Limiter (Semaphore)**: Caps simultaneous browser tabs (`MAX_CONCURRENT_SCRAPES`) to safeguard low-memory VPS instances from OOM crashes.
   - **Ad & Popup Neutralizer**: Intercepts `window.open` and automatically terminates popup tabs opened by ad click-jacking / `target="_blank"`, preventing orphan Chromium tabs.
-  - **Headless Media Abort**: Aborts `.ts`, `.m4s`, `.mp4` chunks and media elements in Playwright to prevent Chromium from buffering and software-decoding 1080p video in RAM.
+  - **Headless Media Abort**: Aborts `.ts`, `.m4s`, `.mp4` chunks and media elements in the scraper to prevent Chromium from buffering and software-decoding video in RAM.
   - **Browser Context Auto-Recycle & GC**: Automatically closes and renews the Chromium context after a configurable number of uses (`MAX_BROWSER_USES`) and triggers runtime GC (`Bun.gc`) to eliminate long-term memory fragmentation.
-  - **Bounded Memory Cache**: In-memory `TtlCache` with maximum item ceiling (`CACHE_MAX_ITEMS`) and FIFO eviction.
+  - **Bounded Memory Cache**: In-memory `TtlCache` with maximum item ceiling (`CACHE_MAX_ITEMS`), TTL expiry, and FIFO eviction.
 
 ---
 
@@ -54,24 +68,37 @@ The variant route with `:filename` (e.g. `/scrape-stream/live.m3u8?url=...`) pro
 | :--- | :--- | :--- | :--- |
 | `url` | string | *required* | The URL of the video page or embed player to scrape. |
 | `proxy` | boolean | `false` | When `true` or `1`, Strix acts as a streaming proxy, piping video chunks directly to the client while forwarding dynamic headers. |
-| `proxy_segments` | boolean | `false` | When `true` (alongside `proxy=1`), rewrites all TS segment URLs inside `.m3u8` to route through Strix (`/proxy-chunk`) for sites with strict per-chunk hotlink protection. |
+| `proxy_segments` | boolean | `false` | When `true` (alongside `proxy=1`), rewrites all TS segment URLs inside `.m3u8` to route through Strix (`/proxy-chunk`) for sites with strict per-chunk hotlink protection or disguised chunks (`cvUnwrap`). |
 | `sub` | boolean | `auto` | When `true` or `1`, resolves HLS Master Playlists to sub-playlist variants (highest resolution/bandwidth). Defaults to `true` when `proxy=1`. |
+| `unwrap` | boolean | `false` | When `1` or `true`, explicitly forces unwrapping of disguised image segments (`.png`/`.webp`) via `/proxy-chunk`. (Auto-detected if segments are non-standard media). |
 | `format` | string | `""` | Set to `json` (or `json=1`) to return structured JSON containing both the stream URL and required dynamic request headers. |
 
 ---
 
-### Usage Examples
+### `GET /proxy-chunk`
+Proxies individual media segments, keys, and initialization chunks (`.ts`, `.m4s`, `.mp4`, `.key`, or disguised `.png`/`.webp` chunks) with hotlink referer/UA forwarding and adaptive unwrapping.
 
-#### 1. JSON Inspection Mode (`format=json`)
+#### Query Parameters:
+- `url`: The absolute target segment URL.
+- `referer`: Optional referer header required by the upstream CDN.
+- `ua`: Optional custom User-Agent string.
+- `source`: The original page URL (used for cache invalidation when signed segment tokens expire).
+- `unwrap`: When set to `1`, forces unwrapping of disguised video chunks into standard MPEG-TS.
+
+---
+
+## Usage Examples
+
+### 1. JSON Inspection Mode (`format=json`)
 Retrieve the resolved stream URL and the dynamic headers needed to play it directly:
 ```http
-GET /scrape-stream?url=https://ppv.st/live/ufc-fight-night-moicano-vs-nolan-31456&format=json
+GET /scrape-stream?url=https://ppv.st/live/ufc-fight-night-31456&format=json
 ```
 
 **Response (200 OK):**
 ```json
 {
-  "url": "https://netanyahu.indianservers.st/secure/.../ufc/tracks-v1a1/mono.ts.m3u8",
+  "url": "https://cdn.example.com/secure/.../tracks-v1a1/mono.ts.m3u8",
   "headers": {
     "Referer": "https://taifood-blog.asia/",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -79,24 +106,25 @@ GET /scrape-stream?url=https://ppv.st/live/ufc-fight-night-moicano-vs-nolan-3145
 }
 ```
 
-#### 2. Direct Redirect Mode (`proxy=false`, default)
+### 2. Direct Redirect Mode (`proxy=false`, default)
 Returns a standard HTTP `302 Found` redirect pointing directly to the resolved stream:
 ```http
 GET /scrape-stream?url=https://example.com/video-page
 ```
 
-#### 3. Proxy Streaming Mode (`proxy=true`)
-Pipes the video stream through Strix. Upstream hotlink headers (`Referer`, `User-Agent`) and HTTP `Range` headers are forwarded automatically:
+### 3. Full Proxy Streaming Mode with Segment Rewriting (`proxy=true&proxy_segments=true`)
+Pipes both the `.m3u8` playlist and all subsequent video segments through Strix, unwrapping any disguised chunks (e.g. TikTok CDN image segments) into playable MPEG-TS on the fly:
 ```http
-GET /scrape-stream/playlist.m3u8?url=https://ppv.st/live/ufc-fight-night-moicano-vs-nolan-31456&proxy=true
+GET /scrape-stream/live.m3u8?url=https://zlive.st/embed/auto-dazn-f1&proxy=true&proxy_segments=true
 ```
 
 - **Seek Support**: HTTP Range headers (`Range`, `Content-Range`, `Accept-Ranges`, `Content-Length`) are fully preserved for `.mp4`/`.mkv` seeking.
-- **Auto-Retry**: If upstream rejects a proxy request (e.g. 403 / 502 due to an expired token), Strix automatically invalidates the cache, performs a fresh scrape, and retries once.
+- **Auto-Retry & Stale Token Invalidation**: If upstream rejects a proxy request (e.g. 401/403/404 due to an expired token), Strix automatically invalidates the cache, performs a fresh scrape, and retries once seamlessly.
 
 #### Error Responses
 - `400 Bad Request` — Missing `url` parameter.
-- `404 Not Found` — No playable video source or `.m3u8` playlist was found on the page.
+- `404 Not Found` — No playable video source or `.m3u8` playlist was found on the page (or upstream stream is offline).
+- `499 Client Closed Request` — Client aborted the connection before scraping finished.
 - `502 Bad Gateway` — Upstream server returned an error during proxying.
 - `504 Gateway Timeout` — Upstream connection timed out.
 - `500 Internal Server Error` — Scraper browser crash or unexpected system error.
@@ -110,10 +138,10 @@ You can customize the application behavior using environment variables:
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `5005` | Port on which the HTTP server listens. |
-| `CHROME_PATH` | *empty* | Path to an external Chromium/Chrome executable (defaults to Playwright bundled browser). |
+| `CHROME_PATH` | *empty* | Path to an external Chromium/Chrome executable (defaults to Patchright bundled browser). |
 | `USER_DATA_DIR` | `./user_data` | Directory for persistent browser profile, cookies, and local storage cache. |
 | `HEADLESS` | `true` | Set to `false` to display the Chromium browser window during scraping (useful for debugging). |
-| `PROXY_SERVER` | *empty* | Optional HTTP/SOCKS5 proxy for Playwright browser requests (e.g. `http://user:pass@host:port`). |
+| `PROXY_SERVER` | *empty* | Optional HTTP/SOCKS5 proxy for Patchright browser requests (e.g. `http://user:pass@host:port`). |
 | `SCRAPER_TIMEOUT` | `20000` | Browser navigation and page loading timeout (in ms). |
 | `MAX_CONCURRENT_SCRAPES` | `3` | Maximum number of concurrent browser tabs allowed at any time. |
 | `CACHE_MAX_ITEMS` | `1000` | Maximum number of stream URLs stored in memory before FIFO eviction. |
@@ -178,7 +206,7 @@ bun install
 # Run TypeScript type check
 bun run --bun tsc --noEmit
 
-# Run unit tests
+# Run all unit and integration tests
 bun test
 
 # Start development server with hot-reload
