@@ -18,7 +18,7 @@ import { CONFIG } from "../config";
  *
  * Source: adapted from the debug_dlhd.ts experiment in qIPTV.
  */
-const STEALTH_INIT_SCRIPT = `
+export const STEALTH_INIT_SCRIPT = `
   // Mock visibility state to prevent video players from pausing or delaying streams in headless mode
   Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
   Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
@@ -246,7 +246,16 @@ export class PlaywrightBrowserProvider {
       userDataDir,
       launchOptions,
     );
-    await context.addInitScript(STEALTH_INIT_SCRIPT);
+
+    // Only inject the stealth script in headless mode. In headed mode the
+    // real browser fingerprint is already internally consistent, and the
+    // script's coarse overrides (fake plugins array, synthetic window.chrome,
+    // version-skewed userAgentData) create detectable inconsistencies that
+    // Cloudflare WAF flags with a hard 403 block (verified against
+    // vidfast.vc on 2026-11-05: headed+script=403, headed without=200).
+    if (CONFIG.HEADLESS) {
+      await context.addInitScript(STEALTH_INIT_SCRIPT);
+    }
 
     // Close initial blank page created by launchPersistentContext so Chromium starts with 0 idle tabs
     for (const p of context.pages()) {

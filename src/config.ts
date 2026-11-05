@@ -7,7 +7,12 @@ export const CONFIG = {
   PROXY_SERVER: process.env.PROXY_SERVER || "", // e.g. "http://123.45.67.89:8080" hoặc "http://user:pass@host:port"
   HEADLESS: process.env.HEADLESS !== "false", // Mặc định là true nếu không cấu hình là "false"
   SCRAPER: {
+    // VOD scrape timeout (/scrape-video). vidfast.vc warms up its source
+    // backend for ~15-25s per fresh session before the stream appears.
     DEFAULT_TIMEOUT: parseInt(process.env.SCRAPER_TIMEOUT || "20000", 10),
+    // Live-stream scrape timeout (/scrape-stream). Sources usually emit
+    // quickly; keep this shorter so dead links fail fast.
+    STREAM_TIMEOUT: parseInt(process.env.SCRAPER_STREAM_TIMEOUT || "30000", 10),
     MAX_CONCURRENT: parseInt(process.env.MAX_CONCURRENT_SCRAPES || "3", 10),
   },
   // Maximum number of items in the in-memory cache to prevent unbounded growth
@@ -35,4 +40,6 @@ export const CONFIG = {
     process.env.PROXY_UPSTREAM_TIMEOUT_MS || "30000",
     10,
   ),
+  // Path to ffmpeg binary (defaults to system PATH lookup or common macOS/Linux locations)
+  FFMPEG_PATH: process.env.FFMPEG_PATH || "ffmpeg",
 };

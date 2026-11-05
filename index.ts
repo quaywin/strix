@@ -442,10 +442,13 @@ export const handleScrapeVideo = async (
     json?: string;
     embed?: string;
     is_embed?: string;
+    remux?: string;
+    t?: string;
+    seek?: string;
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, proxy, format, json, embed, is_embed } = query;
+  const { url, proxy, format, json, embed, is_embed, remux, t, seek } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -454,6 +457,7 @@ export const handleScrapeVideo = async (
   }
   const wantJson = format === "json" || json === "1" || json === "true";
   const wantProxy = proxy === "1" || proxy === "true";
+  const wantRemux = remux === "1" || remux === "true";
   const wantEmbed =
     embed === "1" || embed === "true" || is_embed === "1" || is_embed === "true";
   const requestOrigin = getRequestOrigin(request);
@@ -464,6 +468,8 @@ export const handleScrapeVideo = async (
       requestOrigin,
       wantEmbed,
       request.signal,
+      false,
+      wantProxy,
     );
 
     const isM3u8 =
@@ -471,14 +477,21 @@ export const handleScrapeVideo = async (
       extracted.video.url.toLowerCase().includes(".m3u8") ||
       Boolean(extracted.video.body?.trim().startsWith("#EXTM3U"));
 
-    const directStreamUrl = wantProxy
-      ? `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(url)}`
-      : extracted.video.url;
+    // DASH manifests are returned as-is: segments inside an .mpd are resolved
+    // relative to the manifest URL and carry their own signed query params,
+    // so wrapping only the manifest in the proxy would break playback.
+    const isMpd = extracted.video.format === "mpd";
+    const directStreamUrl =
+      wantProxy && !isMpd
+        ? `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(url)}`
+        : extracted.video.url;
 
     if (wantJson) {
       const masterUrl = isM3u8
         ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(url)}${wantEmbed ? "&embed=true" : ""}${wantProxy ? "&proxy=true" : ""}`
         : undefined;
+
+      const remuxUrl = `${requestOrigin}/scrape-video/remux.mkv?url=${encodeURIComponent(url)}${wantEmbed ? "&embed=true" : ""}`;
 
       return new Response(
         JSON.stringify({
@@ -487,6 +500,7 @@ export const handleScrapeVideo = async (
           subtitles: extracted.subtitles,
           streamUrl: directStreamUrl,
           masterPlaylistUrl: masterUrl,
+          remuxStreamUrl: remuxUrl,
           extractedAt: extracted.extractedAt,
         }),
         {
@@ -497,8 +511,21 @@ export const handleScrapeVideo = async (
     }
 
     // Direct video formats (MKV, MP4, WebM):
-    // "Có sao trả ra vậy cho gọn" - redirect directly to the video stream (or proxy-chunk if proxy=true)
     if (!isM3u8) {
+      // If remux is requested (via remux=true or /remux.mkv), launch on-the-fly FFmpeg muxing
+      if (wantRemux && extracted.subtitles && extracted.subtitles.length > 0) {
+        const seekSeconds = parseFloat(seek || t || "0") || 0;
+        return videoScraperService.streamRemuxedMkv(
+          extracted.video.url,
+          extracted.subtitles,
+          {
+            seekSeconds,
+            signal: request.signal,
+          },
+        );
+      }
+
+      // Default mode for direct video: redirect to direct playable stream
       return Response.redirect(directStreamUrl, 302);
     }
 
@@ -554,8 +581,15 @@ export const app = new Elysia()
   .get("/scrape-video", async ({ query, request }) => {
     return handleScrapeVideo(query, request);
   })
-  .get("/scrape-video/:filename", async ({ query, request }) => {
-    return handleScrapeVideo(query, request);
+  .get("/scrape-video/:filename", async ({ params, query, request }) => {
+    const isRemux = params.filename?.toLowerCase().includes("remux");
+    return handleScrapeVideo(
+      {
+        ...query,
+        remux: query.remux || (isRemux ? "1" : undefined),
+      },
+      request,
+    );
   })
   .get("/proxy-sub", async ({ query, request }) => {
     const subUrl = query.url;
@@ -689,14 +723,6 @@ export const app = new Elysia()
 
       const resHeaders = new Headers();
       let contentType = upstream.headers.get("Content-Type");
-
-      const isKeyOrPlaylist =
-        chunkUrl.includes(".key") ||
-        chunkUrl.includes("/key") ||
-        chunkUrl.includes(".m3u8");
-
-      let bodyData: BodyInit | null = upstream.body;
-
       const upstreamContentType = (
         upstream.headers.get("Content-Type") || ""
       ).toLowerCase();
@@ -705,6 +731,70 @@ export const app = new Elysia()
         upstreamContentType.startsWith("video/") ||
         upstreamContentType.startsWith("audio/");
       const isStandardMedia = isKnownMediaExt || isKnownMediaMime;
+
+      let bodyData: BodyInit | null = upstream.body;
+
+      const isPlaylistCandidate =
+        chunkUrl.includes(".m3u8") ||
+        upstreamContentType.includes("mpegurl") ||
+        upstreamContentType.includes("application/x-mpegurl");
+
+      // If upstream is an M3U8 playlist, rewrite child segments through proxy-chunk
+      // so disguised media chunks (.image/PNG/WebP) and hotlink-protected segments get unwrapped and proxied.
+      if (
+        isPlaylistCandidate &&
+        upstream.status >= 200 &&
+        upstream.status < 300
+      ) {
+        const rawBuffer = await upstream.arrayBuffer();
+        const rawBytes = new Uint8Array(rawBuffer);
+        const isExtm3u =
+          rawBytes.length >= 7 &&
+          rawBytes[0] === 0x23 && // '#'
+          rawBytes[1] === 0x45 && // 'E'
+          rawBytes[2] === 0x58 && // 'X'
+          rawBytes[3] === 0x54 && // 'T'
+          rawBytes[4] === 0x4d && // 'M'
+          rawBytes[5] === 0x33 && // '3'
+          rawBytes[6] === 0x55; // 'U'
+
+        if (isExtm3u) {
+          const text = new TextDecoder().decode(rawBytes);
+          const requestOrigin = getRequestOrigin(request);
+          const rewritten = rewriteM3u8Playlist(text, chunkUrl, {
+            proxySegmentUrl: (targetUrl) => {
+              const params = new URLSearchParams({ url: targetUrl });
+              if (query.referer) {
+                params.set("referer", query.referer);
+              }
+              if (query.ua) {
+                params.set("ua", query.ua);
+              }
+              if (query.source) {
+                params.set("source", query.source);
+              }
+              return `${requestOrigin}/proxy-chunk?${params.toString()}`;
+            },
+          });
+
+          resHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
+          resHeaders.delete("Content-Length");
+          const cacheControl = upstream.headers.get("Cache-Control");
+          if (cacheControl) resHeaders.set("Cache-Control", cacheControl);
+          return new Response(rewritten, {
+            status: 200,
+            headers: resHeaders,
+          });
+        }
+
+        // If it was named .m3u8 but contains binary data, pass buffer down to unwrap logic
+        bodyData = rawBytes as BodyInit;
+      }
+
+      const isKeyOrPlaylist =
+        chunkUrl.includes(".key") ||
+        chunkUrl.includes("/key") ||
+        chunkUrl.includes(".m3u8");
 
       const wantExplicitUnwrap =
         query.unwrap === "1" || query.unwrap === "true";
@@ -718,7 +808,10 @@ export const app = new Elysia()
         (wantExplicitUnwrap || !isStandardMedia);
 
       if (shouldInspectForUnwrap) {
-        const rawBytes = new Uint8Array(await upstream.arrayBuffer());
+        const rawBytes =
+          bodyData instanceof Uint8Array
+            ? bodyData
+            : new Uint8Array(await upstream.arrayBuffer());
         const shouldUnwrap = wantExplicitUnwrap || needsUnwrap(rawBytes);
 
         if (shouldUnwrap) {
@@ -775,7 +868,14 @@ export const app = new Elysia()
       });
     }
   })
-  .listen(CONFIG.PORT);
+  // idleTimeout: Elysia's Bun adapter defaults to 30s of socket inactivity,
+  // which silently kills the client connection while a slow scrape is still
+  // running (cold vidfast scrapes take 25-30s+). Raise it so long scrapes can
+  // deliver their response (Bun's hard cap is 255s).
+  .listen({
+    port: CONFIG.PORT,
+    idleTimeout: 120,
+  });
 
 logger.info(`strix listening on http://localhost:${CONFIG.PORT}`, "App");
 
@@ -786,3 +886,5 @@ scraperService
   .warmup()
   .then(() => logger.info("Browser context ready (warmup complete)", "App"))
   .catch((e) => logger.error("Browser warmup failed", "App", e));
+
+

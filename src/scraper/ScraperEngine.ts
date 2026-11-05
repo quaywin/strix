@@ -98,6 +98,14 @@ export function isM3u8StreamUrl(url: string): boolean {
 
 const MEDIA_CHUNK_REGEX = /\.(ts|m4s|mp4|webm|mkv)($|\?)/i;
 
+/**
+ * MPEG-DASH manifest detection (e.g. vidlink.pro serves clear-DASH .mpd).
+ * Matches URLs whose path ends in .mpd (query string allowed after it).
+ */
+export function isMpdStreamUrl(url: string): boolean {
+  return /\.mpd($|\?)/i.test(url);
+}
+
 const AD_TRACKER_REGEX =
   /(?:disable-devtool|connatix\.com|rubiconproject\.com|pubmatic\.com|openx\.net|criteo\.com|adnxs\.com|3lift\.com|sharethrough\.com|contextweb\.com|bidswitch\.net|casalemedia\.com|sonobi\.com|loopme\.me|smaato\.net|inmobi\.com|smartadserver\.com|fwmrm\.net|adsco\.re|adscale\.de|1rx\.io|iqm\.com|bidgx\.com|adform\.net|stackadapt\.com|adsrvr\.org|ingage\.tech|yellowblue\.io|gumgum\.com|turn\.com|postrelease\.com|copper6\.com|id5-sync\.com|trustedstack\.com|media\.net|google-analytics\.com|doubleclick\.net|googletagmanager\.com|adservice|scorecardresearch|quantserve|popads|popunder|exoclick|histats\.com|trafficjunky)/i;
 
@@ -248,7 +256,10 @@ export class ScraperEngine {
         const reqUrl = req.url();
         const rType = req.resourceType();
         // Never treat full document/navigation requests as target stream playlists
-        if (rType !== "document" && isM3u8StreamUrl(reqUrl)) {
+        if (
+          rType !== "document" &&
+          (isM3u8StreamUrl(reqUrl) || isMpdStreamUrl(reqUrl))
+        ) {
           requestsMap.set(reqUrl, {
             url: reqUrl,
             method: req.method(),
@@ -279,6 +290,8 @@ export class ScraperEngine {
         ).toLowerCase();
         const isMpegUrl = contentType.includes("mpegurl");
         const isKnownM3u8 = isM3u8StreamUrl(resUrl);
+        const isKnownMpd = isMpdStreamUrl(resUrl) ||
+          contentType.includes("dash+xml");
         const isFetchOrXhr = rType === "fetch" || rType === "xhr";
 
         const isMediaOrAsset =
@@ -293,7 +306,7 @@ export class ScraperEngine {
         const shouldSniff =
           status >= 200 &&
           status < 300 &&
-          (isKnownM3u8 || isMpegUrl || (isFetchOrXhr && !isMediaOrAsset));
+          (isKnownM3u8 || isMpegUrl || isKnownMpd || (isFetchOrXhr && !isMediaOrAsset));
 
         if (shouldSniff) {
           const p = (async () => {
@@ -311,7 +324,7 @@ export class ScraperEngine {
               const trimmed = text.trim();
               const hasExtM3u = trimmed.startsWith("#EXTM3U");
 
-              if (hasExtM3u || isMpegUrl) {
+              if (hasExtM3u || isMpegUrl || isKnownMpd) {
                 // Register or update stream target with its playlist body
                 const existing = requestsMap.get(resUrl);
                 if (existing) {
@@ -476,7 +489,10 @@ export class ScraperEngine {
       // Wait for any pending response body resolution promises to settle (or timeout after 2s).
       // If we already captured a stream target (m3u8 or #EXTM3U), skip waiting to prevent stalling.
       const hasCapturedStream = Array.from(requestsMap.values()).some(
-        (r) => r.body?.includes("#EXTM3U") || isM3u8StreamUrl(r.url),
+        (r) =>
+          r.body?.includes("#EXTM3U") ||
+          isM3u8StreamUrl(r.url) ||
+          isMpdStreamUrl(r.url),
       );
       if (responsePromises.length > 0 && !hasCapturedStream) {
         await Promise.race([
@@ -661,7 +677,7 @@ export class ScraperEngine {
             reqUrl.includes("/tracks");
           const isM3u8 = isM3u8StreamUrl(reqUrl);
           const isDirectMedia =
-            /\.(mp4|mkv|webm)($|\?)/i.test(reqUrl) || type === "media";
+            /\.(mp4|mkv|webm|mpd)($|\?)/i.test(reqUrl) || type === "media";
           const isSegment = /\.(ts|m4s)($|\?)/i.test(reqUrl);
 
           if (isSub || isM3u8 || isDirectMedia) {
@@ -746,7 +762,8 @@ export class ScraperEngine {
             (status === 200 || status === 206) &&
             (contentType.includes("video/") ||
               contentType.includes("mpegurl") ||
-              /\.(m3u8|mp4|mkv|webm)($|\?)/i.test(resUrl) ||
+              contentType.includes("dash+xml") ||
+              /\.(m3u8|mp4|mkv|webm|mpd)($|\?)/i.test(resUrl) ||
               response.request().resourceType() === "media") &&
             !isSegment &&
             !resUrl.includes("ping") &&

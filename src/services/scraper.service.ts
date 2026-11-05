@@ -2,7 +2,11 @@ import { CONFIG } from "../config";
 import { logger } from "../logger";
 import { PitSportExtractor } from "../scraper/extractors/PitSportExtractor";
 import { StrmFreeExtractor } from "../scraper/extractors/StrmFreeExtractor";
-import { isM3u8StreamUrl, scraperEngine } from "../scraper/ScraperEngine";
+import {
+  isM3u8StreamUrl,
+  isMpdStreamUrl,
+  scraperEngine,
+} from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
 
 interface TtlEntry<T> {
@@ -408,23 +412,25 @@ export class ScraperService {
 
     const requests = await scraperEngine.collectRequests(
       url,
-      CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
+      CONFIG.SCRAPER.STREAM_TIMEOUT / 1000,
       sub,
       isEmbed,
       signal,
     );
 
-    // Prioritize requests whose body starts with #EXTM3U, then URL with .m3u8, then direct media
+    // Prioritize requests whose body starts with #EXTM3U, then URL with .m3u8,
+    // then DASH manifests, then direct media
     const extm3uReq = requests.find(
       (r) => r.body && r.body.trim().startsWith("#EXTM3U"),
     );
     const m3u8Req = requests.find((r) => isM3u8StreamUrl(r.url));
+    const mpdReq = requests.find((r) => isMpdStreamUrl(r.url));
     const mediaReq = requests.find(
       (r) =>
         r.resource_type === "media" ||
         /\.(mp4|mkv|webm)($|\?)/i.test(r.url),
     );
-    const selectedReq = extm3uReq || m3u8Req || mediaReq || requests[0];
+    const selectedReq = extm3uReq || m3u8Req || mpdReq || mediaReq || requests[0];
 
     logger.info(
       `Total requests captured: ${requests.length}${extm3uReq ? " (found #EXTM3U content)" : ""}`,
