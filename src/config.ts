@@ -15,6 +15,16 @@ export const CONFIG = {
   // 50 minutes — signed m3u8 URLs usually carry short-lived expiry tokens,
   // so we keep the cache short to avoid serving stale links.
   CACHE_TTL_MS: 50 * 60 * 1000,
+  // 6 hours for VOD media and playlists
+  VOD_CACHE_TTL_MS: parseInt(
+    process.env.VOD_CACHE_TTL_MS || String(6 * 60 * 60 * 1000),
+    10,
+  ),
+  // 6 hours for converted subtitle WebVTT files
+  SUBTITLE_CACHE_TTL_MS: parseInt(
+    process.env.SUBTITLE_CACHE_TTL_MS || String(6 * 60 * 60 * 1000),
+    10,
+  ),
   // Browser recycling: automatically close and renew browser context after
   // N scrape operations to prevent Chromium V8 memory fragmentation over time.
   MAX_BROWSER_USES: parseInt(process.env.MAX_BROWSER_USES || "30", 10),

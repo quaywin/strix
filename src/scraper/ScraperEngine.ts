@@ -1,6 +1,7 @@
 import type { Page, Request, Response } from "patchright";
 import { CONFIG } from "../config";
 import { Semaphore } from "../utils/semaphore";
+import type { RawSubtitleCandidate } from "../utils/subtitles";
 import { PlaywrightBrowserProvider } from "./BrowserProvider";
 
 export interface RequestData {
@@ -10,6 +11,11 @@ export interface RequestData {
   resource_type: string;
   post_data: string | null;
   body?: string;
+}
+
+export interface VideoScrapeCollection {
+  video: RequestData | null;
+  subtitles: RawSubtitleCandidate[];
 }
 
 /**
@@ -508,6 +514,530 @@ export class ScraperEngine {
         `[SCRAPER] Finished scraping ${url}, found ${requestsMap.size} requests`,
       );
       return Array.from(requestsMap.values());
+    }, signal);
+  }
+
+  /**
+   * VOD-specialized scraper: captures a primary video stream (m3u8, mp4, mkv, webm)
+   * along with all subtitle tracks (VTT, SRT) from network requests, DOM <track> tags,
+   * and player runtimes (JWPlayer, Artplayer, VideoJS).
+   */
+  async collectVideoAndSubtitles(
+    url: string,
+    timeoutSec: number = 20,
+    forceEmbed: boolean = false,
+    signal?: AbortSignal,
+  ): Promise<VideoScrapeCollection> {
+    if (signal?.aborted) {
+      return { video: null, subtitles: [] };
+    }
+
+    if (this.semaphore.activeCount >= this.semaphore.maxConcurrency) {
+      console.log(
+        `[SCRAPER-VOD] Concurrency limit (${this.semaphore.maxConcurrency}) reached. Queuing VOD scrape for ${url}...`,
+      );
+    }
+
+    return this.semaphore.run(async () => {
+      let capturedVideo: RequestData | null = null;
+      let domVideoFallback: RequestData | null = null;
+      const subtitleMap = new Map<string, RawSubtitleCandidate>();
+      const responsePromises: Promise<void>[] = [];
+      const activeTimeouts = new Set<NodeJS.Timeout>();
+      const popups = new Set<Page>();
+      let page: Page | null = null;
+      let acquired = false;
+
+      const trackedTimeout = (fn: () => void, ms: number): NodeJS.Timeout => {
+        const id = setTimeout(() => {
+          activeTimeouts.delete(id);
+          fn();
+        }, ms);
+        activeTimeouts.add(id);
+        return id;
+      };
+
+      const trackedSleep = (ms: number): Promise<void> =>
+        new Promise((r) => trackedTimeout(r, ms));
+
+      let resolveDone: () => void;
+      const donePromise = new Promise<void>((r) => {
+        resolveDone = r;
+      });
+
+      let isDone = false;
+      const markDone = () => {
+        if (isDone) return;
+        isDone = true;
+        resolveDone();
+      };
+
+      let abortHandler: (() => void) | undefined;
+      if (signal) {
+        abortHandler = () => {
+          console.log(`[SCRAPER-VOD] VOD scrape cancelled by client for ${url}`);
+          markDone();
+        };
+        if (signal.aborted) {
+          abortHandler();
+        } else {
+          signal.addEventListener("abort", abortHandler, { once: true });
+        }
+      }
+
+      // Settle timer management: once a video is captured, wait a short debounce for subtitles
+      let settleTimer: NodeJS.Timeout | null = null;
+      let settleStartTime: number | null = null;
+      const MAX_SETTLE_MS = 3500;
+      const DEBOUNCE_SETTLE_MS = 1200;
+
+      const triggerSettle = () => {
+        if (isDone) return;
+        if (!settleStartTime) {
+          settleStartTime = Date.now();
+        }
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+          activeTimeouts.delete(settleTimer);
+        }
+
+        const elapsed = Date.now() - settleStartTime;
+        const remainingCap = Math.max(0, MAX_SETTLE_MS - elapsed);
+        const delay = Math.min(DEBOUNCE_SETTLE_MS, remainingCap);
+
+        if (delay <= 0) {
+          markDone();
+          return;
+        }
+
+        settleTimer = trackedTimeout(() => {
+          markDone();
+        }, delay);
+      };
+
+      // Global safety timeout
+      trackedTimeout(() => {
+        console.log(`[SCRAPER-VOD] Global safety timeout reached for ${url}`);
+        markDone();
+      }, (timeoutSec + 10) * 1000);
+
+      try {
+        const context = await this.browserProvider.acquireContext();
+        acquired = true;
+        page = await context.newPage();
+
+        page.on("popup", (popup) => {
+          popups.add(popup);
+          popup.close().catch(() => {}).finally(() => popups.delete(popup));
+        });
+
+        let targetOrigin = "";
+        try {
+          targetOrigin = new URL(url).origin;
+        } catch (_) {}
+
+        const isEmbedUrl = forceEmbed || isEmbedPlayerUrl(url);
+
+        await page.route("**/*", (route) => {
+          const req = route.request();
+          const type = req.resourceType();
+          const reqUrl = req.url().toLowerCase();
+
+          if (isEmbedUrl && reqUrl.includes("/strix-embed-loader.html")) {
+            return route
+              .fulfill({
+                status: 200,
+                contentType: "text/html; charset=utf-8",
+                body: `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Video Player</title></head><body style="margin:0;padding:0;overflow:hidden;background:#000;"><iframe src="${url.replace(/"/g, "&quot;")}" width="100%" height="100%" style="border:none;width:100vw;height:100vh;" allow="autoplay *; fullscreen *; encrypted-media *; picture-in-picture *" loading="eager"></iframe></body></html>`,
+              })
+              .catch(() => {});
+          }
+
+          // Whitelist subtitles and playlists
+          const isSub =
+            /\.(vtt|srt)($|\?)/i.test(reqUrl) ||
+            type === "texttrack" ||
+            reqUrl.includes("/subtitles") ||
+            reqUrl.includes("/tracks");
+          const isM3u8 = isM3u8StreamUrl(reqUrl);
+          const isDirectMedia =
+            /\.(mp4|mkv|webm)($|\?)/i.test(reqUrl) || type === "media";
+          const isSegment = /\.(ts|m4s)($|\?)/i.test(reqUrl);
+
+          if (isSub || isM3u8 || isDirectMedia) {
+            return route.continue().catch(() => {});
+          }
+
+          // If we already verified primary video, abort all subsequent heavy video segments
+          if (capturedVideo && isSegment) {
+            return route.abort().catch(() => {});
+          }
+
+          if (isDone) {
+            return route.abort().catch(() => {});
+          }
+
+          const shouldBlock =
+            type === "image" ||
+            type === "font" ||
+            type === "stylesheet" ||
+            isSegment ||
+            AD_TRACKER_REGEX.test(reqUrl);
+
+          if (shouldBlock) {
+            route.abort().catch(() => {});
+          } else {
+            route.continue().catch(() => {});
+          }
+        });
+
+        // Handle network requests for subtitles
+        page.on("request", (req: Request) => {
+          const reqUrl = req.url();
+          const rType = req.resourceType();
+
+          if (rType === "document") return;
+
+          // Check for subtitles
+          if (
+            /\.(vtt|srt)($|\?)/i.test(reqUrl) ||
+            rType === "texttrack"
+          ) {
+            if (!subtitleMap.has(reqUrl)) {
+              subtitleMap.set(reqUrl, { url: reqUrl });
+              console.log(`[SCRAPER-VOD] Captured subtitle via network: ${reqUrl}`);
+              if (capturedVideo) {
+                triggerSettle();
+              }
+            }
+          }
+        });
+
+        // Handle network responses: only capture video streams that actually succeed (HTTP 200 / 206)
+        page.on("response", (response: Response) => {
+          const resUrl = response.url();
+          const status = response.status();
+          const contentType = (
+            response.headers()["content-type"] || ""
+          ).toLowerCase();
+
+          // Detect subtitle responses
+          if (
+            status >= 200 &&
+            status < 300 &&
+            (contentType.includes("text/vtt") ||
+              contentType.includes("application/x-subrip") ||
+              /\.(vtt|srt)($|\?)/i.test(resUrl))
+          ) {
+            if (!subtitleMap.has(resUrl)) {
+              subtitleMap.set(resUrl, { url: resUrl });
+              console.log(
+                `[SCRAPER-VOD] Captured subtitle via response header: ${resUrl}`,
+              );
+              if (capturedVideo) {
+                triggerSettle();
+              }
+            }
+          }
+
+          // Detect verified working video stream (HTTP 200 / 206)
+          const isSegment = /\.(ts|m4s)($|\?)/i.test(resUrl);
+          const isVideoResponse =
+            (status === 200 || status === 206) &&
+            (contentType.includes("video/") ||
+              contentType.includes("mpegurl") ||
+              /\.(m3u8|mp4|mkv|webm)($|\?)/i.test(resUrl) ||
+              response.request().resourceType() === "media") &&
+            !isSegment &&
+            !resUrl.includes("ping") &&
+            !resUrl.endsWith(".gif") &&
+            !resUrl.endsWith(".png");
+
+          if (!capturedVideo && isVideoResponse) {
+            capturedVideo = {
+              url: resUrl,
+              method: response.request().method(),
+              headers: response.request().headers(),
+              resource_type: response.request().resourceType(),
+              post_data: response.request().postData(),
+            };
+            console.log(
+              `[SCRAPER-VOD] Verified working video stream (HTTP ${status}): ${resUrl}`,
+            );
+            triggerSettle();
+          }
+
+          // Detect mpegurl or EXTM3U body
+          const isMpegUrl = contentType.includes("mpegurl");
+          const isKnownM3u8 = isM3u8StreamUrl(resUrl);
+
+          if (status >= 200 && status < 300 && (isKnownM3u8 || isMpegUrl)) {
+            const p = (async () => {
+              try {
+                const text = await Promise.race([
+                  response.text(),
+                  new Promise<string>((_, reject) =>
+                    trackedTimeout(
+                      () => reject(new Error("Response body timeout")),
+                      3000,
+                    ),
+                  ),
+                ]);
+                const trimmed = text.trim();
+                if (trimmed.startsWith("#EXTM3U") || isMpegUrl) {
+                  if (capturedVideo && capturedVideo.url === resUrl) {
+                    capturedVideo.body = text;
+                  } else if (!capturedVideo) {
+                    capturedVideo = {
+                      url: resUrl,
+                      method: response.request().method(),
+                      headers: response.request().headers(),
+                      resource_type: response.request().resourceType(),
+                      post_data: response.request().postData(),
+                      body: text,
+                    };
+                    console.log(
+                      `[SCRAPER-VOD] Captured m3u8 body: ${resUrl}`,
+                    );
+                    triggerSettle();
+                  }
+                }
+              } catch (_) {}
+            })();
+            responsePromises.push(p);
+          }
+        });
+
+        // Polling job: triggers play buttons and inspects DOM / Player APIs for tracks & video src
+        const clickPlayAndInspectJob = async () => {
+          const selectors = [
+            ".vjs-big-play-button",
+            ".player-play-button",
+            "#play-button",
+            ".play-button",
+            '[aria-label="Play"]',
+            ".play-icon",
+            ".jw-display-icon-container",
+            ".jwplayer",
+            ".art-video-player",
+          ];
+
+          while (!isDone && page && !page.isClosed()) {
+            try {
+              const frames = page.frames();
+              await Promise.all(
+                frames.map(async (frame) => {
+                  try {
+                    const result = await frame.evaluate((selectors: string[]) => {
+                      // Click play buttons
+                      const btns = document.querySelectorAll(selectors.join(", "));
+                      btns.forEach((btn) => {
+                        if (btn && typeof (btn as HTMLElement).click === "function") {
+                          const style = window.getComputedStyle(btn);
+                          if (style.display !== "none" && style.visibility !== "hidden") {
+                            (btn as HTMLElement).click();
+                          }
+                        }
+                      });
+
+                      // Trigger player APIs
+                      try {
+                        const win = window as any;
+                        if (typeof win.jwplayer === "function") {
+                          const jw = win.jwplayer("player") || win.jwplayer("jwplayer") || win.jwplayer();
+                          if (jw && typeof jw.play === "function") {
+                            const state = typeof jw.getState === "function" ? jw.getState() : "";
+                            if (state !== "playing" && state !== "buffering") {
+                              jw.play();
+                            }
+                          }
+                        }
+                      } catch (_) {}
+
+                      // Inspect DOM for video element src
+                      let videoSrc = "";
+                      const videoEl = document.querySelector("video");
+                      if (videoEl) {
+                        const src = videoEl.currentSrc || videoEl.src || "";
+                        if (src && src.startsWith("http") && !src.startsWith("blob:")) {
+                          videoSrc = src;
+                        }
+                      }
+
+                      // Inspect DOM for subtitle track elements
+                      const subList: Array<{
+                        url: string;
+                        label?: string;
+                        language?: string;
+                        isDefault?: boolean;
+                      }> = [];
+
+                      document.querySelectorAll("track").forEach((t) => {
+                        const src = t.src;
+                        if (src && src.startsWith("http")) {
+                          subList.push({
+                            url: src,
+                            label: t.label || t.getAttribute("label") || undefined,
+                            language: t.srclang || t.getAttribute("srclang") || undefined,
+                            isDefault: t.default || t.hasAttribute("default"),
+                          });
+                        }
+                      });
+
+                      // Inspect JWPlayer tracks
+                      try {
+                        const win = window as any;
+                        if (typeof win.jwplayer === "function") {
+                          const jw = win.jwplayer("player") || win.jwplayer("jwplayer") || win.jwplayer();
+                          const tracks = jw?.getPlaylist?.()?.[0]?.tracks || jw?.getConfig?.()?.tracks;
+                          if (Array.isArray(tracks)) {
+                            tracks.forEach((t: any) => {
+                              if ((t.kind === "captions" || t.kind === "subtitles") && t.file) {
+                                subList.push({
+                                  url: t.file,
+                                  label: t.label,
+                                  language: t.language,
+                                  isDefault: Boolean(t.default),
+                                });
+                              }
+                            });
+                          }
+                        }
+                      } catch (_) {}
+
+                      // Inspect Artplayer subtitle
+                      try {
+                        const win = window as any;
+                        const art = win.art || win.artplayer;
+                        if (art?.option?.subtitle?.url) {
+                          subList.push({
+                            url: art.option.subtitle.url,
+                            label: art.option.subtitle.name,
+                            isDefault: true,
+                          });
+                        }
+                      } catch (_) {}
+
+                      return { videoSrc, subList };
+                    }, selectors);
+
+                    if (result) {
+                      if (result.subList && result.subList.length > 0) {
+                        for (const s of result.subList) {
+                          if (s.url && !subtitleMap.has(s.url)) {
+                            subtitleMap.set(s.url, s);
+                            console.log(
+                              `[SCRAPER-VOD] Captured subtitle from DOM/Player: ${s.url} (${s.label || s.language || "und"})`,
+                            );
+                            if (capturedVideo) {
+                              triggerSettle();
+                            }
+                          }
+                        }
+                      }
+                      if (!capturedVideo && !domVideoFallback && result.videoSrc) {
+                        domVideoFallback = {
+                          url: result.videoSrc,
+                          method: "GET",
+                          headers: {},
+                          resource_type: "media",
+                          post_data: null,
+                        };
+                        console.log(
+                          `[SCRAPER-VOD] Observed video src from DOM: ${result.videoSrc}`,
+                        );
+                      }
+                    }
+                  } catch (_) {}
+                }),
+              );
+            } catch (_) {}
+
+            await Promise.race([trackedSleep(500), donePromise]);
+          }
+        };
+
+        const startTime = Date.now();
+        const loaderUrl =
+          isEmbedUrl && targetOrigin
+            ? `${targetOrigin}/strix-embed-loader.html`
+            : null;
+
+        const navigatePromise = page
+          .goto(loaderUrl || url, {
+            timeout: timeoutSec * 1000,
+            waitUntil: "commit",
+          })
+          .catch((err) => {
+            if (!isDone) {
+              console.error(
+                `[SCRAPER-VOD] Navigation error for ${url}: ${err.message}`,
+              );
+            }
+          });
+
+        clickPlayAndInspectJob();
+
+        await Promise.race([navigatePromise, donePromise]);
+
+        if (!isDone) {
+          const elapsed = Date.now() - startTime;
+          const remainingTimeout = timeoutSec * 1000 - elapsed;
+          if (remainingTimeout > 0) {
+            await Promise.race([trackedSleep(remainingTimeout), donePromise]);
+          }
+        }
+      } catch (e) {
+        console.error(`[SCRAPER-VOD] Error scraping VOD ${url}: ${e}`);
+      } finally {
+        markDone();
+
+        for (const id of activeTimeouts) {
+          clearTimeout(id);
+        }
+        activeTimeouts.clear();
+
+        if (responsePromises.length > 0) {
+          await Promise.race([
+            Promise.all(responsePromises),
+            new Promise((r) => setTimeout(r, 1000)),
+          ]).catch(() => {});
+        }
+
+        if (popups.size > 0) {
+          for (const p of popups) {
+            if (!p.isClosed()) {
+              await p.close().catch(() => {});
+            }
+          }
+          popups.clear();
+        }
+
+        if (page && !page.isClosed()) {
+          try {
+            await page.close();
+          } catch (_) {}
+        }
+        if (acquired) {
+          await this.browserProvider.releaseContext();
+        }
+        if (signal && abortHandler) {
+          signal.removeEventListener("abort", abortHandler);
+        }
+      }
+
+      if (!capturedVideo && domVideoFallback) {
+        capturedVideo = domVideoFallback;
+      }
+
+      console.log(
+        `[SCRAPER-VOD] Finished scraping VOD ${url}: video=${Boolean(capturedVideo)}, subtitles=${subtitleMap.size}`,
+      );
+
+      return {
+        video: capturedVideo,
+        subtitles: Array.from(subtitleMap.values()),
+      };
     }, signal);
   }
 

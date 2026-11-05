@@ -1,3 +1,5 @@
+import type { SubtitleTrack } from "./subtitles";
+
 /**
  * Resolves a URI relative to baseUrl, preserving query parameters
  * (such as session or expiry tokens) from baseUrl if the resolved URI lacks query parameters.
@@ -90,3 +92,121 @@ export function rewriteM3u8Playlist(
 
   return resultLines.join("\n");
 }
+
+/**
+ * Builds or augments an RFC 8216 HLS Master Playlist combining a video stream with subtitle tracks.
+ */
+export function buildMasterPlaylistWithSubtitles(
+  videoUrl: string,
+  subtitles: SubtitleTrack[],
+  options: {
+    videoBody?: string;
+    proxySegmentUrl?: (url: string) => string;
+  } = {},
+): string {
+  const hasSubtitles = subtitles && subtitles.length > 0;
+  const subMediaLines = hasSubtitles
+    ? subtitles
+        .map(
+          (t) =>
+            `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${t.label.replace(/"/g, "")}",DEFAULT=${t.default ? "YES" : "NO"},AUTOSELECT=YES,FORCED=NO,LANGUAGE="${t.language}",URI="${t.proxyUrl}"`,
+        )
+        .join("\n")
+    : "";
+
+  const isExistingMaster = Boolean(
+    options.videoBody && options.videoBody.includes("#EXT-X-STREAM-INF:"),
+  );
+
+  if (isExistingMaster && options.videoBody) {
+    const lines = options.videoBody.split(/\r?\n/);
+    const resultLines: string[] = [];
+    let insertedSubs = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === undefined) continue;
+      const trimmed = line.trim();
+
+      if (!trimmed) {
+        resultLines.push(line);
+        continue;
+      }
+
+      // Insert subtitle media lines after header/version tags
+      if (
+        !insertedSubs &&
+        hasSubtitles &&
+        !trimmed.startsWith("#EXTM3U") &&
+        !trimmed.startsWith("#EXT-X-VERSION")
+      ) {
+        resultLines.push(subMediaLines);
+        insertedSubs = true;
+      }
+
+      // Augment variant lines with SUBTITLES="subs"
+      if (trimmed.startsWith("#EXT-X-STREAM-INF:")) {
+        let streamInf = trimmed;
+        if (hasSubtitles) {
+          if (/SUBTITLES=["'][^"']*["']/i.test(streamInf)) {
+            streamInf = streamInf.replace(
+              /SUBTITLES=["'][^"']*["']/i,
+              'SUBTITLES="subs"',
+            );
+          } else {
+            streamInf = `${streamInf},SUBTITLES="subs"`;
+          }
+        }
+        resultLines.push(streamInf);
+        continue;
+      }
+
+      // Handle variant URI lines
+      if (!trimmed.startsWith("#")) {
+        try {
+          const absoluteUrl = resolveUrlWithBaseParams(trimmed, videoUrl);
+          const finalUrl = options.proxySegmentUrl
+            ? options.proxySegmentUrl(absoluteUrl)
+            : absoluteUrl;
+          resultLines.push(finalUrl);
+        } catch {
+          resultLines.push(line);
+        }
+        continue;
+      }
+
+      resultLines.push(line);
+    }
+
+    if (!insertedSubs && hasSubtitles) {
+      resultLines.push(subMediaLines);
+    }
+
+    return resultLines.join("\n");
+  }
+
+  // Fallback / Media Playlist / Direct Video: synthesize a clean Master Playlist
+  const finalVideoUrl = options.proxySegmentUrl
+    ? options.proxySegmentUrl(videoUrl)
+    : videoUrl;
+
+  const streamInfLine = hasSubtitles
+    ? '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,SUBTITLES="subs"'
+    : "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080";
+
+  const playlistParts = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:6",
+    "#EXT-X-INDEPENDENT-SEGMENTS",
+  ];
+
+  if (hasSubtitles) {
+    playlistParts.push(subMediaLines);
+  }
+
+  playlistParts.push(streamInfLine);
+  playlistParts.push(finalVideoUrl);
+
+  return playlistParts.join("\n");
+}
+

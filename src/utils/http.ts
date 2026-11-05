@@ -17,11 +17,12 @@ export function getRequestOrigin(request: Request): string {
 
   const targetHost = forwardedHost || host;
   if (targetHost) {
-    const proto =
-      forwardedProto ||
-      (targetHost.includes("localhost") || targetHost.includes("127.0.0.1")
-        ? "http"
-        : "https");
+    const isPlainHttp =
+      targetHost.includes("localhost") ||
+      targetHost.includes("127.0.0.1") ||
+      /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(targetHost);
+
+    const proto = forwardedProto || (isPlainHttp ? "http" : "https");
     return `${proto}://${targetHost}`;
   }
   return new URL(request.url).origin;

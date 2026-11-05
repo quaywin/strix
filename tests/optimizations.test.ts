@@ -951,8 +951,8 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
         // For chunk 1:
         // Initial request sent referer (received 403 on fetch/curl), then adaptive fallback retried without referer (received 200).
         // The first attempt had referer, the last successful attempt had NO referer.
-        expect(serverRequests[0].referer).toContain("damitv.st");
-        expect(serverRequests[serverRequests.length - 1].referer).toBeNull();
+        expect(serverRequests[0]?.referer).toContain("damitv.st");
+        expect(serverRequests[serverRequests.length - 1]?.referer).toBeNull();
 
         // Server should now have learned this host
         expect(stripRefererHosts.has("localhost")).toBe(true);
@@ -972,7 +972,7 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
 
         // Chunk 2 should only have needed exactly 1 single attempt directly without referer
         expect(serverRequests.length).toBe(requestsBeforeChunk2 + 1);
-        expect(serverRequests[serverRequests.length - 1].referer).toBeNull();
+        expect(serverRequests[serverRequests.length - 1]?.referer).toBeNull();
       } finally {
         server.stop(true);
       }
@@ -1205,13 +1205,14 @@ https://route.transcode.cfd/m3u8-proxy.m3u8?data=Vv1tAuWbXB1uW2gYWIWD0kHB7Dq40z5
     });
 
     it("correctly handles proxying a media playlist with proxy_segments=true without corrupting to TS chunks", async () => {
+      let serverPort = 0;
       const server = Bun.serve({
         port: 0,
-        fetch(req) {
+        fetch(req): Response {
           const url = new URL(req.url);
           if (url.pathname === "/playlist.m3u8") {
             return new Response(
-              `#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nhttp://localhost:${server.port}/chunk.m3u8?data=123\n`,
+              `#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nhttp://localhost:${serverPort}/chunk.m3u8?data=123\n`,
               {
                 headers: { "Content-Type": "application/vnd.apple.mpegurl" },
               },
@@ -1226,6 +1227,7 @@ https://route.transcode.cfd/m3u8-proxy.m3u8?data=Vv1tAuWbXB1uW2gYWIWD0kHB7Dq40z5
           return new Response("Not Found", { status: 404 });
         },
       });
+      serverPort = server.port ?? 0;
 
       try {
         const { handleScrapeStream } = await import("../index");

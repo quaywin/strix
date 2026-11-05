@@ -7,6 +7,7 @@ import {
   NoSourceFoundError,
   scraperService,
 } from "./src/services/scraper.service";
+import { videoScraperService } from "./src/services/videoScraper.service";
 import {
   DEFAULT_USER_AGENT,
   getHeader,
@@ -433,6 +434,102 @@ export const handleScrapeStream = async (
   }
 };
 
+export const handleScrapeVideo = async (
+  query: {
+    url?: string;
+    proxy?: string;
+    format?: string;
+    json?: string;
+    embed?: string;
+    is_embed?: string;
+  },
+  request: Request,
+): Promise<Response> => {
+  const { url, proxy, format, json, embed, is_embed } = query;
+  if (!url) {
+    return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const wantJson = format === "json" || json === "1" || json === "true";
+  const wantProxy = proxy === "1" || proxy === "true";
+  const wantEmbed =
+    embed === "1" || embed === "true" || is_embed === "1" || is_embed === "true";
+  const requestOrigin = getRequestOrigin(request);
+
+  try {
+    const extracted = await videoScraperService.extractVideo(
+      url,
+      requestOrigin,
+      wantEmbed,
+      request.signal,
+    );
+
+    const isM3u8 =
+      extracted.video.format === "m3u8" ||
+      extracted.video.url.toLowerCase().includes(".m3u8") ||
+      Boolean(extracted.video.body?.trim().startsWith("#EXTM3U"));
+
+    const directStreamUrl = wantProxy
+      ? `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(url)}`
+      : extracted.video.url;
+
+    if (wantJson) {
+      const masterUrl = isM3u8
+        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(url)}${wantEmbed ? "&embed=true" : ""}${wantProxy ? "&proxy=true" : ""}`
+        : undefined;
+
+      return new Response(
+        JSON.stringify({
+          format: isM3u8 ? "m3u8" : extracted.video.format,
+          video: extracted.video,
+          subtitles: extracted.subtitles,
+          streamUrl: directStreamUrl,
+          masterPlaylistUrl: masterUrl,
+          extractedAt: extracted.extractedAt,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    // Direct video formats (MKV, MP4, WebM):
+    // "Có sao trả ra vậy cho gọn" - redirect directly to the video stream (or proxy-chunk if proxy=true)
+    if (!isM3u8) {
+      return Response.redirect(directStreamUrl, 302);
+    }
+
+    // HLS Stream (M3U8): Return synthesized HLS Master Playlist combining video variants + subtitles
+    const playlistContent = extracted.masterPlaylist || "";
+    return new Response(playlistContent, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Cache-Control": "public, max-age=21600",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (err: any) {
+    if (request.signal?.aborted || err.name === "AbortError") {
+      return new Response(JSON.stringify({ error: "Client aborted request" }), {
+        status: 499,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const isNotFound = err.message?.includes("No playable video source");
+    return new Response(
+      JSON.stringify({ error: err.message || "Failed to scrape video" }),
+      {
+        status: isNotFound ? 404 : 500,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+  }
+};
+
 // In-memory cache of CDN hostnames that enforce anti-hotlinking by rejecting third-party Referers.
 // Once a host succeeds without Referer after an initial 403, we skip sending Referer for all future chunks on that host.
 export const stripRefererHosts = new Set<string>();
@@ -453,6 +550,53 @@ export const app = new Elysia()
   })
   .get("/scrape-stream/:filename", async ({ query, request }) => {
     return handleScrapeStream(query, request);
+  })
+  .get("/scrape-video", async ({ query, request }) => {
+    return handleScrapeVideo(query, request);
+  })
+  .get("/scrape-video/:filename", async ({ query, request }) => {
+    return handleScrapeVideo(query, request);
+  })
+  .get("/proxy-sub", async ({ query, request }) => {
+    const subUrl = query.url;
+    if (!subUrl) {
+      return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const referer = query.referer;
+    const userAgent =
+      query.ua || request.headers.get("user-agent") || DEFAULT_USER_AGENT;
+
+    try {
+      const vtt = await videoScraperService.getSubtitle(
+        subUrl,
+        referer,
+        userAgent,
+        request.signal,
+      );
+      return new Response(vtt, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/vtt; charset=utf-8",
+          "Cache-Control": "public, max-age=21600",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        },
+      });
+    } catch (e: any) {
+      if (request.signal?.aborted || e.name === "AbortError") {
+        return new Response(null, { status: 499 });
+      }
+      return new Response(
+        JSON.stringify({ error: e.message || "Failed to load subtitle" }),
+        {
+          status: 502,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
   })
   .get("/proxy-chunk", async ({ query, request }) => {
     const chunkUrl = query.url;

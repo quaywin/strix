@@ -43,8 +43,9 @@ bun run dev
 
 | Your Use Case | Recommended Endpoint / URL | What Strix Does |
 | :--- | :--- | :--- |
+| **🎬 VOD & Movies**<br>*(VLC, Infuse, Safari, Kodi)* | `http://localhost:5005/scrape-video?url=<MOVIE_PAGE>` | Resolves movie stream: For **HLS (.m3u8)**, generates an RFC 8216 HLS Master Playlist bundling video & subtitles. For direct containers (**MKV / MP4**), redirects 302 directly to the playable video stream (or `/proxy-chunk` when `proxy=true`). |
 | **📺 IPTV Players / Smart TV**<br>*(TiviMate, VLC, Kodi, Apple TV)* | `http://localhost:5005/scrape-stream/live.m3u8?url=<TARGET_PAGE>&proxy=true&proxy_segments=true` | Proxies both playlist and segments. Automatically bypasses CDN hotlink referer checks and unpacks disguised image chunks into standard MPEG-TS. |
-| **🤖 Backend API Integration**<br>*(Microservices, Aggregators)* | `http://localhost:5005/scrape-stream?url=<TARGET_PAGE>&format=json` | Scrapes the page and returns clean JSON containing the stream URL and required dynamic headers (`Referer`, `User-Agent`). |
+| **🤖 Backend API Integration**<br>*(Microservices, Aggregators)* | `http://localhost:5005/scrape-stream?url=<TARGET_PAGE>&format=json` (Live)<br>`http://localhost:5005/scrape-video?url=<MOVIE_PAGE>&json=1` (VOD) | Scrapes the page and returns clean JSON containing the stream URL, subtitle tracks, and required dynamic headers (`Referer`, `User-Agent`). |
 | **⚡ Fast Direct Playback**<br>*(Direct Client)* | `http://localhost:5005/scrape-stream?url=<TARGET_PAGE>` | Resolves the stream and issues an immediate `HTTP 302 Found` redirect to the upstream URL. |
 
 ---
@@ -68,12 +69,31 @@ Visits the target page, intercepts media requests, and resolves the stream.
 
 ---
 
-### 2. `GET /proxy-chunk`
+### 2. `GET /scrape-video` & `GET /scrape-video/:filename`
+Visits a VOD / movie page and resolves the video stream:
+- **HLS Streams (`.m3u8`)**: Automatically bundles all multilingual subtitles (`.vtt`, `.srt`) into a standard RFC 8216 HLS Master Playlist.
+- **Direct Video Containers (`.mkv`, `.mp4`)**: Issues an immediate `HTTP 302 Found` redirect to the playable stream (or routes via `/proxy-chunk` when `proxy=true` is requested), allowing native players to stream and seek with full byte-range support.
+
+#### Query Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `url` | `string` | **Required** | The target movie or video embed page URL. |
+| `proxy` | `boolean` | `false` | When `true`, routes direct MKV/MP4 stream through `/proxy-chunk` with upstream hotlink headers. |
+| `format` / `json` | `string` / `boolean` | `""` | Set to `json` or `json=1` to return structured JSON containing video stream info, subtitle track array, and direct stream URLs. |
+
+---
+
+### 3. `GET /proxy-sub`
+Proxies external subtitle tracks (`.vtt`, `.srt`), automatically converts SubRip (`.srt`) to WebVTT (`.vtt`), normalizes timestamps and styling, and returns subtitles with `Access-Control-Allow-Origin: *` headers for browser players and video apps.
+
+---
+
+### 4. `GET /proxy-chunk`
 Internal endpoint used automatically when `proxy_segments=true` is enabled. Proxies individual media chunks (`.ts`, `.m4s`, `.mp4`) and unwraps disguised image segments on the fly.
 
 ---
 
-### 3. `GET /`
+### 5. `GET /`
 Health check endpoint. Returns `strix`.
 
 ---
@@ -142,6 +162,8 @@ Many modern streaming providers disguise video segments as image files (`.png` /
 | `MAX_CONCURRENT_SCRAPES` | `3` | Maximum concurrent browser tabs allowed at any given time. |
 | `SCRAPER_TIMEOUT` | `20000` | Browser scrape timeout in milliseconds. |
 | `CACHE_MAX_ITEMS` | `1000` | Maximum number of stream URLs stored in memory cache. |
+| `VOD_CACHE_TTL_MS` | `21600000` (6 hrs) | Cache TTL in milliseconds for resolved VOD movie streams and playlists. |
+| `SUBTITLE_CACHE_TTL_MS` | `21600000` (6 hrs) | Cache TTL in milliseconds for converted WebVTT subtitles. |
 | `MAX_BROWSER_USES` | `30` | Number of scrapes before recycling the Chromium context. |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Upstream proxy timeout in milliseconds. |
 | `HEADLESS` | `true` | Set to `false` to show browser UI (useful for debugging). |
