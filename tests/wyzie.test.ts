@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
-import { missingLanguages } from "../src/utils/subtitles";
+import { missingLanguages, srtToVtt, isSubtitleAd } from "../src/utils/subtitles";
 import { fetchWyzieSubtitles, wyzieToCandidates } from "../src/utils/wyzie";
 
 describe("missingLanguages", () => {
@@ -101,5 +101,61 @@ describe("wyzieToCandidates", () => {
     expect(candidates.length).toBe(1);
     expect(candidates[0]!.language).toBe("vi");
     expect(candidates[0]!.format).toBe("srt");
+  });
+});
+
+describe("srtToVtt ad filtering", () => {
+  it("drops Wyzie free plan watermark and renumbers remaining cues", () => {
+    const raw = [
+      "1",
+      "00:00:00,000 --> 00:00:06,000",
+      "You're on the free plan. Unlock every source, AI translation & ad-free subs → sub.wyzie.io",
+      "",
+      "2",
+      "00:01:07,520 --> 00:01:09.120",
+      "Anh yêu em bằng hơi thở,",
+      "",
+      "3",
+      "00:01:10,080 --> 00:01:12,860",
+      "nụ cười, nước mắt, của cả cuộc đời anh.",
+    ].join("\n");
+
+    const vtt = srtToVtt(raw);
+    expect(vtt).toContain("WEBVTT");
+    expect(vtt).not.toContain("sub.wyzie.io");
+    expect(vtt).not.toContain("You're on the free plan");
+    // Cue 2 was renumbered to cue 1
+    expect(vtt).toContain("1\n00:01:07.520 --> 00:01:09.120\nAnh yêu em bằng hơi thở,");
+    // Cue 3 was renumbered to cue 2
+    expect(vtt).toContain("2\n00:01:10.080 --> 00:01:12.860\nnụ cười, nước mắt, của cả cuộc đời anh.");
+  });
+
+  it("drops OpenSubtitles VIP / site promo cues", () => {
+    const raw = [
+      "WEBVTT",
+      "",
+      "1",
+      "00:00:01.000 --> 00:00:05.000",
+      "Support us and become VIP member at opensubtitles.org",
+      "",
+      "2",
+      "00:00:10.000 --> 00:00:15.000",
+      "Hello world!",
+    ].join("\n");
+
+    const vtt = srtToVtt(raw);
+    expect(vtt).not.toContain("opensubtitles.org");
+    expect(vtt).toContain("1\n00:00:10.000 --> 00:00:15.000\nHello world!");
+  });
+
+  it("preserves dialogue mentioning free words without false positives", () => {
+    const raw = [
+      "1",
+      "00:00:10,000 --> 00:00:12,000",
+      "Are you free tomorrow?",
+    ].join("\n");
+
+    const vtt = srtToVtt(raw);
+    expect(vtt).toContain("Are you free tomorrow?");
   });
 });

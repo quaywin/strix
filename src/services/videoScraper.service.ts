@@ -363,44 +363,15 @@ export class VideoScraperService {
       } catch (_) {}
     }
 
-    // vidnest-family static caption cache: headers-only probe keyed by the
-    // embed's TMDB identity, so the result rides the same VOD cache as the
-    // video payload.
+    // Subtitle resolution: Wyzie Subtitles API is called directly by TMDB identity.
+    // It returns direct SRT links via a single fast JSON call (100-200ms) without pre-downloading
+    // full subtitle files during the scrape, maximizing speed.
     if (format === "m3u8") {
-      try {
-        const cacheCandidates = await this.probeVdrkSubtitleCache(
-          url,
-          signal,
-          CONFIG.SUBTITLE_LANGUAGES,
-        );
-        payload.subCandidates = [
-          ...(payload.subCandidates || []),
-          ...cacheCandidates,
-        ];
-        if (cacheCandidates.length > 0) {
-          logger.info(
-            `Subtitle cache probe: ${cacheCandidates.length} track(s) for: ${url}`,
-            "VideoScraperService",
-          );
-        }
-      } catch (_) {
-        payload.subCandidates = payload.subCandidates || [];
-      }
-
-      // Wyzie fallback (L2): fills whatever languages the vdrk probe missed
-      // — either everything (brand-new releases) or a single gap (vdrk has
-      // en but not vi). Wyzie returns direct SRT links — registered as
-      // candidates without any download; /proxy-sub fetches+converts
-      // lazily when a player selects the track.
       const identity = parseEmbedVideoIdentity(url);
-      if (
-        CONFIG.WYZIE_API_KEY &&
-        identity &&
-        payload.subCandidates !== undefined
-      ) {
+      if (CONFIG.WYZIE_API_KEY && identity) {
         const missing = missingLanguages(
           CONFIG.SUBTITLE_LANGUAGES,
-          payload.subCandidates,
+          payload.subCandidates || [],
         );
         if (missing.length > 0) {
           try {
@@ -415,7 +386,7 @@ export class VideoScraperService {
                 ...wyzieCandidates,
               ];
               logger.info(
-                `Wyzie fallback: +${wyzieCandidates.length} track(s) (missing: ${missing.join(",")}) for: ${url}`,
+                `Wyzie subtitles: +${wyzieCandidates.length} track(s) (missing: ${missing.join(",")}) for: ${url}`,
                 "VideoScraperService",
               );
             }

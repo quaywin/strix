@@ -104,25 +104,45 @@ export function maybeFixMojibake(text: string): string {
   return text;
 }
 
+/** Known promotional / watermark ad patterns in subtitles. */
+export const SUBTITLE_AD_PATTERNS: RegExp[] = [
+  // Wyzie promotion & free-tier watermark
+  /sub\.wyzie\.io/i,
+  /wyzie\.io/i,
+  /you'?re on the free plan/i,
+  // OpenSubtitles ads & VIP promos
+  /opensubtitles(?:\.org|\.com)/i,
+  /osdb\.link/i,
+  /advertised sites are not endorsed/i,
+  /support us and become VIP/i,
+  /become a? VIP member/i,
+  // Subscene & common rip site ads
+  /subscene\.(?:com|org|icu)/i,
+  // Generic subtitle downloader/uploader watermarks
+  /downloaded from (?:www\.)?(?:opensubtitles|subscene|yifysubtitles)/i,
+];
+
+/** Checks if a subtitle text block contains promotional / ad content. */
+export function isSubtitleAd(text: string): boolean {
+  return SUBTITLE_AD_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 /**
- * Converts SubRip (SRT) format to WebVTT format.
+ * Converts SubRip (SRT) format to WebVTT format and purges promotional/ad cues:
  * - Strips UTF-8 BOM if present
  * - Normalizes line breaks to LF (\n)
  * - Converts comma millisecond separators to periods (00:00:00,000 -> 00:00:00.000)
  * - Normalizes mm:ss,ms to 00:mm:ss.ms
  * - Strips unsupported HTML tags (<font>, etc.) while preserving <i>, <b>, <u>
+ * - Drops known ad / promotional watermark cues (Wyzie free plan, OpenSubtitles, etc.)
+ * - Renumbers cues sequentially if numeric counters were present
  * - Ensures output begins with WEBVTT header
  */
 export function srtToVtt(content: string): string {
   if (!content) return "WEBVTT\n\n";
 
-  // Remove UTF-8 BOM if present
+  // Remove UTF-8 BOM if present and normalize line endings
   let normalized = content.replace(/^﻿/, "").replace(/\r\n|\r/g, "\n").trim();
-
-  // If already WebVTT, return directly with normalized header
-  if (normalized.startsWith("WEBVTT")) {
-    return normalized + "\n";
-  }
 
   // Remove <font> tags while preserving inner text
   normalized = normalized.replace(/<\/?font[^>]*>/gi, "");
@@ -141,7 +161,43 @@ export function srtToVtt(content: string): string {
     },
   );
 
-  return `WEBVTT\n\n${normalized}\n`;
+  const rawBlocks = normalized.split(/\n\s*\n+/);
+  const cleanedBlocks: string[] = [];
+  let cueCounter = 1;
+
+  for (const block of rawBlocks) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+
+    // Drop repeated or standalone WEBVTT header lines in inner content
+    if (/^WEBVTT(?:\s.*)?$/i.test(trimmed)) {
+      continue;
+    }
+
+    const hasTimecode = trimmed.includes("-->");
+    if (!hasTimecode) {
+      // Retain NOTE, STYLE, REGION blocks
+      cleanedBlocks.push(trimmed);
+      continue;
+    }
+
+    // Filter out promotional / watermark ad cues
+    if (isSubtitleAd(trimmed)) {
+      continue;
+    }
+
+    const lines = trimmed.split("\n");
+    // If the cue starts with a numeric counter line (SRT style), renumber it sequentially
+    if (/^\d+$/.test(lines[0]!.trim())) {
+      lines[0] = String(cueCounter++);
+      cleanedBlocks.push(lines.join("\n"));
+    } else {
+      cueCounter++;
+      cleanedBlocks.push(trimmed);
+    }
+  }
+
+  return `WEBVTT\n\n${cleanedBlocks.join("\n\n")}\n`;
 }
 
 /**
@@ -322,6 +378,7 @@ export function mergeHlsVttSegments(segments: string[]): string {
       if (newEnd <= newStart) continue;
 
       const body = filtered.slice(timingIdx + 1).join("\n");
+      if (isSubtitleAd(body)) continue;
       const key = `${newStart.toFixed(3)}|${newEnd.toFixed(3)}|${body}`;
       if (seen.has(key)) continue;
       seen.add(key);

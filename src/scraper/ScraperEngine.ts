@@ -720,47 +720,64 @@ export class ScraperEngine {
 
             // Capture video streams that actually succeed (HTTP 200 / 206)
             s.page.on("response", (response: Response) => {
-              const resUrl = response.url();
               const status = response.status();
+              if (status < 200 || status >= 300) return;
+
+              const resUrl = response.url();
+              const isSegment = /\.(ts|m4s)($|\?)/i.test(resUrl);
+              if (isSegment) return;
+
+              const req = response.request();
+              const rType = req.resourceType();
+              const isStaticAsset =
+                rType === "image" ||
+                rType === "font" ||
+                rType === "stylesheet" ||
+                rType === "script" ||
+                /\.(png|jpe?g|gif|webp|ico|svg|woff2?|ttf|eot|css|js)($|\?)/i.test(resUrl) ||
+                resUrl.includes("/ping");
+              if (isStaticAsset) return;
+
               const contentType = (
                 response.headers()["content-type"] || ""
               ).toLowerCase();
 
-              const isSegment = /\.(ts|m4s)($|\?)/i.test(resUrl);
-              const isVideoResponse =
-                (status === 200 || status === 206) &&
-                (contentType.includes("video/") ||
-                  contentType.includes("mpegurl") ||
-                  contentType.includes("dash+xml") ||
-                  /\.(m3u8|mp4|mkv|webm|mpd)($|\?)/i.test(resUrl) ||
-                  isM3u8StreamUrl(resUrl) ||
-                  isMpdStreamUrl(resUrl) ||
-                  (domVideoFallback && resUrl === domVideoFallback.url) ||
-                  response.request().resourceType() === "media") &&
-                !isSegment &&
-                !resUrl.includes("ping") &&
-                !resUrl.endsWith(".gif") &&
-                !resUrl.endsWith(".png");
+              // Direct media files (mp4, mkv, webm, or native media resource type)
+              const isDirectMedia =
+                /\.(mp4|mkv|webm)($|\?)/i.test(resUrl) ||
+                rType === "media" ||
+                (contentType.startsWith("video/") && !contentType.includes("mpegurl"));
 
-              if (!capturedVideo && isVideoResponse) {
+              if (!capturedVideo && isDirectMedia) {
                 capturedVideo = {
                   url: resUrl,
-                  method: response.request().method(),
-                  headers: response.request().headers(),
-                  resource_type: response.request().resourceType(),
-                  post_data: response.request().postData(),
+                  method: req.method(),
+                  headers: req.headers(),
+                  resource_type: req.resourceType(),
+                  post_data: req.postData(),
                 };
                 console.log(
-                  `[SCRAPER-VOD] Verified working video stream (HTTP ${status}): ${resUrl}`,
+                  `[SCRAPER-VOD] Verified working direct media stream (HTTP ${status}): ${resUrl}`,
                 );
                 s.markDone();
+                return;
               }
 
-              // Attach playlist body to the captured video (or capture it standalone)
+              // Body-based HLS (#EXTM3U) and DASH (<MPD>) detection:
+              // For any fetch, xhr, or suspected stream URL, read the response body.
+              // If it starts with #EXTM3U, it is guaranteed to be an HLS playlist regardless of file extension.
               const isMpegUrl = contentType.includes("mpegurl");
               const isKnownM3u8 = isM3u8StreamUrl(resUrl);
+              const isKnownMpd = isMpdStreamUrl(resUrl) || contentType.includes("dash+xml");
+              const isFetchOrXhr = rType === "fetch" || rType === "xhr";
+              const isCandidate =
+                isKnownM3u8 ||
+                isKnownMpd ||
+                isMpegUrl ||
+                isFetchOrXhr ||
+                (domVideoFallback && resUrl === domVideoFallback.url);
 
-              if (status >= 200 && status < 300 && (isKnownM3u8 || isMpegUrl)) {
+              if (isCandidate) {
                 const p = (async () => {
                   try {
                     const text = await Promise.race([
@@ -773,22 +790,25 @@ export class ScraperEngine {
                       ),
                     ]);
                     const trimmed = text.trim();
-                    if (trimmed.startsWith("#EXTM3U") || isMpegUrl) {
-                      if (capturedVideo && capturedVideo.url === resUrl) {
-                        capturedVideo.body = text;
-                      } else if (!capturedVideo) {
+                    const isHls = trimmed.startsWith("#EXTM3U") || isMpegUrl;
+                    const isMpd = trimmed.includes("<MPD") || isKnownMpd;
+
+                    if (isHls || isMpd) {
+                      if (!capturedVideo) {
                         capturedVideo = {
                           url: resUrl,
-                          method: response.request().method(),
-                          headers: response.request().headers(),
-                          resource_type: response.request().resourceType(),
-                          post_data: response.request().postData(),
+                          method: req.method(),
+                          headers: req.headers(),
+                          resource_type: req.resourceType(),
+                          post_data: req.postData(),
                           body: text,
                         };
                         console.log(
-                          `[SCRAPER-VOD] Captured m3u8 body: ${resUrl}`,
+                          `[SCRAPER-VOD] Verified working ${isHls ? "HLS (#EXTM3U body)" : "DASH (<MPD> body)"} stream (HTTP ${status}): ${resUrl}`,
                         );
                         s.markDone();
+                      } else if (capturedVideo.url === resUrl && !capturedVideo.body) {
+                        capturedVideo.body = text;
                       }
                     }
                   } catch (_) {}
@@ -929,14 +949,14 @@ export class ScraperEngine {
                 `[SCRAPER-VOD] Observed video src from DOM: ${videoSrc}`,
               );
 
-              // Allow a brief debounce (600ms) for the network response listener to capture
-              // the request headers and m3u8 playlist body if available, then markDone so
-              // the scraper doesn't stall for the remaining 20s timeout.
+              // Allow up to 5s for the network response listener to capture verified working
+              // stream headers/body, and for stall recovery to cycle servers if default is dead,
+              // then markDone so the scraper doesn't stall for the full 20s timeout.
               s.trackedTimeout(() => {
                 if (!s.isDone()) {
                   s.markDone();
                 }
-              }, 600);
+              }, 5000);
             }
           },
         },
