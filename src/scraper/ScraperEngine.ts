@@ -136,8 +136,8 @@ const VOD_CLICK_SELECTORS = [
  * SERVER_CYCLE_INTERVAL_MS until some backend emits a stream. A no-op on
  * providers without such a menu.
  */
-const SERVER_CYCLE_START_MS = 8000;
-const SERVER_CYCLE_INTERVAL_MS = 6000;
+const SERVER_CYCLE_START_MS = 4000;
+const SERVER_CYCLE_INTERVAL_MS = 4000;
 /** Menu open animation wait before a server radio can be activated. */
 const SERVER_MENU_OPEN_WAIT_MS = 1200;
 
