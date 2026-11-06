@@ -9,73 +9,8 @@ import {
   type RawSubtitleCandidate,
   type SubtitleTrack,
 } from "../utils/subtitles";
-
-interface TtlEntry<T> {
-  value: T;
-  expiresAt: number;
-}
-
-class TtlCache<T> {
-  private cache = new Map<string, TtlEntry<T>>();
-  private cleanupInterval: NodeJS.Timeout;
-
-  constructor(
-    private defaultTtlMs: number,
-    private maxSize: number = CONFIG.CACHE_MAX_ITEMS,
-  ) {
-    this.cleanupInterval = setInterval(() => this.cleanup(), 10 * 60 * 1000);
-    if (this.cleanupInterval && typeof this.cleanupInterval.unref === "function") {
-      this.cleanupInterval.unref();
-    }
-  }
-
-  get(key: string): T | undefined {
-    const entry = this.cache.get(key);
-    if (!entry) return undefined;
-    if (Date.now() > entry.expiresAt) {
-      this.cache.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-
-  set(key: string, value: T, ttlMs: number = this.defaultTtlMs): void {
-    if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
-      }
-    }
-    this.cache.set(key, {
-      value,
-      expiresAt: Date.now() + ttlMs,
-    });
-  }
-
-  delete(key: string): void {
-    this.cache.delete(key);
-  }
-
-  deletePrefix(prefix: string): boolean {
-    let deleted = false;
-    for (const k of this.cache.keys()) {
-      if (k.startsWith(prefix)) {
-        this.cache.delete(k);
-        deleted = true;
-      }
-    }
-    return deleted;
-  }
-
-  private cleanup(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.cache.entries()) {
-      if (now > entry.expiresAt) {
-        this.cache.delete(key);
-      }
-    }
-  }
-}
+import { TtlCache } from "../utils/ttlCache";
+import { runCoalesced, type InFlightEntry } from "../utils/inFlight";
 
 export interface VideoStreamInfo {
   url: string;
@@ -100,16 +35,10 @@ interface CachedVideoPayload {
   isNotFound?: boolean;
 }
 
-interface InFlightVideoScrape {
-  promise: Promise<CachedVideoPayload>;
-  controller: AbortController;
-  subscribers: number;
-}
-
 export class VideoScraperService {
   private videoCache = new TtlCache<CachedVideoPayload>(CONFIG.VOD_CACHE_TTL_MS);
   private subCache = new TtlCache<string>(CONFIG.SUBTITLE_CACHE_TTL_MS);
-  private inFlightScrapes = new Map<string, InFlightVideoScrape>();
+  private inFlightScrapes = new Map<string, InFlightEntry<CachedVideoPayload>>();
 
   invalidateCache(url: string): boolean {
     return this.videoCache.deletePrefix(`vod:${url}`);
@@ -185,59 +114,19 @@ export class VideoScraperService {
       }
     }
 
-    let inFlight = this.inFlightScrapes.get(cacheKey);
-    if (inFlight) {
-      logger.info(
-        `Coalescing concurrent VOD request for: ${url}`,
-        "VideoScraperService",
-      );
-      inFlight.subscribers++;
-    } else {
-      const controller = new AbortController();
-      const promise = this.doExtractVideo(
-        url,
-        cacheKey,
-        isEmbed,
-        controller.signal,
-      ).finally(() => {
-        const current = this.inFlightScrapes.get(cacheKey);
-        if (current && current.promise === promise) {
-          this.inFlightScrapes.delete(cacheKey);
-        }
-      });
-      inFlight = { promise, controller, subscribers: 1 };
-      this.inFlightScrapes.set(cacheKey, inFlight);
-    }
-
-    let onAbort: (() => void) | undefined;
-    let abortPromise: Promise<never> | undefined;
-
-    if (signal) {
-      abortPromise = new Promise<never>((_, reject) => {
-        onAbort = () => {
-          if (inFlight) {
-            inFlight.subscribers--;
-            if (inFlight.subscribers <= 0) {
-              inFlight.controller.abort();
-              this.inFlightScrapes.delete(cacheKey);
-            }
-          }
-          reject(new DOMException("The operation was aborted", "AbortError"));
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-    }
-
-    try {
-      const payload = await (abortPromise
-        ? Promise.race([inFlight.promise, abortPromise])
-        : inFlight.promise);
-      return this.formatResult(payload, url, requestOrigin, false, wantProxy);
-    } finally {
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
-    }
+    const payload = await runCoalesced(
+      this.inFlightScrapes,
+      cacheKey,
+      (scrapeSignal) =>
+        this.doExtractVideo(url, cacheKey, isEmbed, scrapeSignal),
+      signal,
+      () =>
+        logger.info(
+          `Coalescing concurrent VOD request for: ${url}`,
+          "VideoScraperService",
+        ),
+    );
+    return this.formatResult(payload, url, requestOrigin, false, wantProxy);
   }
 
   private async doExtractVideo(

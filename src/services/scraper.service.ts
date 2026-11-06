@@ -8,87 +8,8 @@ import {
   scraperEngine,
 } from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
-
-interface TtlEntry<T> {
-  value: T;
-  expiresAt: number;
-}
-
-class TtlCache<T> {
-  private cache = new Map<string, TtlEntry<T>>();
-  private cleanupInterval: NodeJS.Timeout;
-
-  constructor(
-    private defaultTtlMs: number,
-    private maxSize: number = CONFIG.CACHE_MAX_ITEMS,
-  ) {
-    // Periodic cleanup every 10 minutes to avoid memory leaks
-    this.cleanupInterval = setInterval(() => this.cleanup(), 10 * 60 * 1000);
-    // Allow Node/Bun process to exit even if interval is active
-    if (this.cleanupInterval && typeof this.cleanupInterval.unref === "function") {
-      this.cleanupInterval.unref();
-    }
-  }
-
-  get(key: string): T | undefined {
-    const entry = this.cache.get(key);
-    if (!entry) return undefined;
-    if (Date.now() > entry.expiresAt) {
-      this.cache.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-
-  set(
-    key: string,
-    value: T,
-    ttlMs: number = this.defaultTtlMs,
-  ): void {
-    if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
-      // Evict oldest entry (first key in Map insertion order) to cap memory usage
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
-      }
-    }
-    const now = Date.now();
-    this.cache.set(key, {
-      value,
-      expiresAt: now + ttlMs,
-    });
-  }
-
-  delete(key: string): void {
-    this.cache.delete(key);
-  }
-
-  deletePrefix(prefix: string, predicate?: (value: T) => boolean): boolean {
-    let deletedAny = false;
-    for (const [key, entry] of this.cache.entries()) {
-      if (key.startsWith(prefix)) {
-        if (!predicate || predicate(entry.value)) {
-          this.cache.delete(key);
-          deletedAny = true;
-        }
-      }
-    }
-    return deletedAny;
-  }
-
-  private cleanup(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.cache.entries()) {
-      if (now > entry.expiresAt) {
-        this.cache.delete(key);
-      }
-    }
-  }
-
-  destroy(): void {
-    clearInterval(this.cleanupInterval);
-  }
-}
+import { TtlCache } from "../utils/ttlCache";
+import { runCoalesced, type InFlightEntry } from "../utils/inFlight";
 
 export interface ExtractedStreamResult {
   url: string;
@@ -123,15 +44,9 @@ const FORBIDDEN_HEADERS = new Set([
   "keep-alive",
 ]);
 
-interface InFlightScrape {
-  promise: Promise<ExtractedStreamResult>;
-  controller: AbortController;
-  subscribers: number;
-}
-
 export class ScraperService {
   // Deduplicates concurrent in-flight scrapes for the exact same stream (Thundering Herd protection)
-  private inFlightScrapes = new Map<string, InFlightScrape>();
+  private inFlightScrapes = new Map<string, InFlightEntry<ExtractedStreamResult>>();
 
   /**
    * Removes the cached stream URL for a given source page.
@@ -266,62 +181,17 @@ export class ScraperService {
       }
     }
 
-    // Coalesce concurrent in-flight requests for the exact same stream (Thundering Herd protection)
-    let inFlight = this.inFlightScrapes.get(cacheKey);
-    if (inFlight) {
-      logger.info(
-        `Coalescing concurrent request for: ${url} (waiting for existing in-flight scrape)`,
-        "ScraperService",
-      );
-      inFlight.subscribers++;
-    } else {
-      const controller = new AbortController();
-      const promise = this.doExtractStream(
-        url,
-        sub,
-        cacheKey,
-        isEmbed,
-        controller.signal,
-      ).finally(() => {
-        const current = this.inFlightScrapes.get(cacheKey);
-        if (current && current.promise === promise) {
-          this.inFlightScrapes.delete(cacheKey);
-        }
-      });
-      inFlight = { promise, controller, subscribers: 1 };
-      this.inFlightScrapes.set(cacheKey, inFlight);
-    }
-
-    // If client signal aborts (e.g. user switched channel), decrement subscriber count.
-    // If all subscribers have abandoned, abort the underlying scrape to free Chromium slot immediately.
-    let onAbort: (() => void) | undefined;
-    let abortPromise: Promise<never> | undefined;
-
-    if (signal) {
-      abortPromise = new Promise<never>((_, reject) => {
-        onAbort = () => {
-          if (inFlight) {
-            inFlight.subscribers--;
-            if (inFlight.subscribers <= 0) {
-              inFlight.controller.abort();
-              this.inFlightScrapes.delete(cacheKey);
-            }
-          }
-          reject(new DOMException("The operation was aborted", "AbortError"));
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-    }
-
-    try {
-      return await (abortPromise
-        ? Promise.race([inFlight.promise, abortPromise])
-        : inFlight.promise);
-    } finally {
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
-    }
+    return runCoalesced(
+      this.inFlightScrapes,
+      cacheKey,
+      (scrapeSignal) => this.doExtractStream(url, sub, cacheKey, isEmbed, scrapeSignal),
+      signal,
+      () =>
+        logger.info(
+          `Coalescing concurrent request for: ${url} (waiting for existing in-flight scrape)`,
+          "ScraperService",
+        ),
+    );
   }
 
   private async doExtractStream(

@@ -18,7 +18,7 @@ import { CONFIG } from "../config";
  *
  * Source: adapted from the debug_dlhd.ts experiment in qIPTV.
  */
-export const STEALTH_INIT_SCRIPT = `
+const STEALTH_INIT_SCRIPT = `
   // Mock visibility state to prevent video players from pausing or delaying streams in headless mode
   Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
   Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
