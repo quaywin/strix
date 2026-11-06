@@ -3,12 +3,7 @@ import { logger } from "../logger";
 import { scraperEngine } from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
 import { buildMasterPlaylistWithSubtitles } from "../utils/m3u8";
-import {
-  normalizeSubtitleTracks,
-  srtToVtt,
-  type RawSubtitleCandidate,
-  type SubtitleTrack,
-} from "../utils/subtitles";
+import { srtToVtt, type SubtitleTrack } from "../utils/subtitles";
 import { TtlCache } from "../utils/ttlCache";
 import { runCoalesced, type InFlightEntry } from "../utils/inFlight";
 
@@ -21,6 +16,7 @@ export interface VideoStreamInfo {
 
 export interface ExtractedVideoResult {
   video: VideoStreamInfo;
+  /** Always empty since subtitle capture was removed; kept for API compatibility. */
   subtitles: SubtitleTrack[];
   masterPlaylist?: string;
   extractedAt: number;
@@ -30,7 +26,6 @@ export interface ExtractedVideoResult {
 
 interface CachedVideoPayload {
   video: VideoStreamInfo;
-  rawSubtitles: RawSubtitleCandidate[];
   extractedAt: number;
   isNotFound?: boolean;
 }
@@ -51,12 +46,6 @@ export class VideoScraperService {
     fromCache: boolean = false,
     wantProxy: boolean = false,
   ): ExtractedVideoResult {
-    const subtitles = normalizeSubtitleTracks(
-      payload.rawSubtitles,
-      requestOrigin,
-      url,
-    );
-
     const isHls =
       payload.video.format === "m3u8" ||
       payload.video.url.toLowerCase().includes(".m3u8") ||
@@ -67,7 +56,7 @@ export class VideoScraperService {
     const masterPlaylist = isHls
       ? buildMasterPlaylistWithSubtitles(
           payload.video.url,
-          subtitles,
+          [],
           {
             videoBody: payload.video.body,
             ...(wantProxy
@@ -83,7 +72,7 @@ export class VideoScraperService {
 
     return {
       video: payload.video,
-      subtitles,
+      subtitles: [],
       masterPlaylist,
       extractedAt: payload.extractedAt,
       fromCache,
@@ -135,22 +124,21 @@ export class VideoScraperService {
     isEmbed: boolean,
     signal?: AbortSignal,
   ): Promise<CachedVideoPayload> {
-    logger.info(`Scraping VOD and subtitles for: ${url}`, "VideoScraperService");
+    logger.info(`Scraping VOD for: ${url}`, "VideoScraperService");
 
-    const collection = await scraperEngine.collectVideoAndSubtitles(
+    const videoReq = await scraperEngine.collectVideo(
       url,
       CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
       isEmbed,
       signal,
     );
 
-    if (!collection.video) {
+    if (!videoReq) {
       // Negative cache for 30 seconds to protect against crawler spam
       this.videoCache.set(
         cacheKey,
         {
           video: { url: "", format: "m3u8", headers: {} },
-          rawSubtitles: [],
           extractedAt: Date.now(),
           isNotFound: true,
         },
@@ -159,7 +147,6 @@ export class VideoScraperService {
       throw new Error("No playable video source found on page");
     }
 
-    const videoReq = collection.video;
     let format: "m3u8" | "mp4" | "mkv" | "webm" | "mpd" = "m3u8";
     const vLower = videoReq.url.toLowerCase();
     if (vLower.includes(".mkv") || vLower.includes("video/x-matroska")) {
@@ -179,7 +166,6 @@ export class VideoScraperService {
         headers: videoReq.headers,
         body: videoReq.body,
       },
-      rawSubtitles: collection.subtitles,
       extractedAt: Date.now(),
     };
 

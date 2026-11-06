@@ -1,7 +1,6 @@
 import type { Frame, Page, Request, Response, Route } from "patchright";
 import { CONFIG } from "../config";
 import { Semaphore } from "../utils/semaphore";
-import type { RawSubtitleCandidate } from "../utils/subtitles";
 import { PlaywrightBrowserProvider } from "./BrowserProvider";
 
 export interface RequestData {
@@ -11,11 +10,6 @@ export interface RequestData {
   resource_type: string;
   post_data: string | null;
   body?: string;
-}
-
-export interface VideoScrapeCollection {
-  video: RequestData | null;
-  subtitles: RawSubtitleCandidate[];
 }
 
 /**
@@ -629,14 +623,14 @@ export class ScraperEngine {
    * along with all subtitle tracks (VTT, SRT) from network requests, DOM <track> tags,
    * and player runtimes (JWPlayer, Artplayer, VideoJS).
    */
-  async collectVideoAndSubtitles(
+  async collectVideo(
     url: string,
     timeoutSec: number = 20,
     forceEmbed: boolean = false,
     signal?: AbortSignal,
-  ): Promise<VideoScrapeCollection> {
+  ): Promise<RequestData | null> {
     if (signal?.aborted) {
-      return { video: null, subtitles: [] };
+      return null;
     }
 
     if (this.semaphore.activeCount >= this.semaphore.maxConcurrency) {
@@ -648,37 +642,6 @@ export class ScraperEngine {
     return this.semaphore.run(async () => {
       let capturedVideo: RequestData | null = null;
       let domVideoFallback: RequestData | null = null;
-      const subtitleMap = new Map<string, RawSubtitleCandidate>();
-      let session: ScrapeSession | null = null;
-
-      // Settle timer management: once a video is captured, wait a short debounce for subtitles
-      let settleTimer: NodeJS.Timeout | null = null;
-      let settleStartTime: number | null = null;
-      const MAX_SETTLE_MS = 3500;
-      const DEBOUNCE_SETTLE_MS = 1200;
-
-      const triggerSettle = () => {
-        if (!session || session.isDone()) return;
-        if (!settleStartTime) {
-          settleStartTime = Date.now();
-        }
-        if (settleTimer) {
-          clearTimeout(settleTimer);
-        }
-
-        const elapsed = Date.now() - settleStartTime;
-        const remainingCap = Math.max(0, MAX_SETTLE_MS - elapsed);
-        const delay = Math.min(DEBOUNCE_SETTLE_MS, remainingCap);
-
-        if (delay <= 0) {
-          session.markDone();
-          return;
-        }
-
-        settleTimer = session.trackedTimeout(() => {
-          session?.markDone();
-        }, delay);
-      };
 
       return await this.withScrapeSession(
         {
@@ -688,10 +651,9 @@ export class ScraperEngine {
           loaderTitle: "Video Player",
           forceEmbed,
           signal,
+          // Drain window that lets the m3u8 body attach to the captured video
           responseWaitMs: 1000,
           registerHandlers: (s) => {
-            session = s;
-
             s.page.route("**/*", (route) => {
               const req = route.request();
               const type = req.resourceType();
@@ -699,18 +661,12 @@ export class ScraperEngine {
 
               if (this.tryFulfillEmbedLoader(route, s, reqUrl)) return;
 
-              // Whitelist subtitles and playlists
-              const isSub =
-                /\.(vtt|srt)($|\?)/i.test(reqUrl) ||
-                type === "texttrack" ||
-                reqUrl.includes("/subtitles") ||
-                reqUrl.includes("/tracks");
               const isM3u8 = isM3u8StreamUrl(reqUrl);
               const isDirectMedia =
                 /\.(mp4|mkv|webm|mpd)($|\?)/i.test(reqUrl) || type === "media";
               const isSegment = /\.(ts|m4s)($|\?)/i.test(reqUrl);
 
-              if (isSub || isM3u8 || isDirectMedia) {
+              if (isM3u8 || isDirectMedia) {
                 return route.continue().catch(() => {});
               }
 
@@ -737,28 +693,7 @@ export class ScraperEngine {
               }
             });
 
-            // Handle network requests for subtitles
-            s.page.on("request", (req: Request) => {
-              const reqUrl = req.url();
-              const rType = req.resourceType();
-
-              if (rType === "document") return;
-
-              if (
-                /\.(vtt|srt)($|\?)/i.test(reqUrl) ||
-                rType === "texttrack"
-              ) {
-                if (!subtitleMap.has(reqUrl)) {
-                  subtitleMap.set(reqUrl, { url: reqUrl });
-                  console.log(`[SCRAPER-VOD] Captured subtitle via network: ${reqUrl}`);
-                  if (capturedVideo) {
-                    triggerSettle();
-                  }
-                }
-              }
-            });
-
-            // Capture video streams that actually succeed (HTTP 200 / 206) plus subtitles
+            // Capture video streams that actually succeed (HTTP 200 / 206)
             s.page.on("response", (response: Response) => {
               const resUrl = response.url();
               const status = response.status();
@@ -766,26 +701,6 @@ export class ScraperEngine {
                 response.headers()["content-type"] || ""
               ).toLowerCase();
 
-              // Detect subtitle responses
-              if (
-                status >= 200 &&
-                status < 300 &&
-                (contentType.includes("text/vtt") ||
-                  contentType.includes("application/x-subrip") ||
-                  /\.(vtt|srt)($|\?)/i.test(resUrl))
-              ) {
-                if (!subtitleMap.has(resUrl)) {
-                  subtitleMap.set(resUrl, { url: resUrl });
-                  console.log(
-                    `[SCRAPER-VOD] Captured subtitle via response header: ${resUrl}`,
-                  );
-                  if (capturedVideo) {
-                    triggerSettle();
-                  }
-                }
-              }
-
-              // Detect verified working video stream (HTTP 200 / 206)
               const isSegment = /\.(ts|m4s)($|\?)/i.test(resUrl);
               const isVideoResponse =
                 (status === 200 || status === 206) &&
@@ -810,7 +725,7 @@ export class ScraperEngine {
                 console.log(
                   `[SCRAPER-VOD] Verified working video stream (HTTP ${status}): ${resUrl}`,
                 );
-                triggerSettle();
+                s.markDone();
               }
 
               // Attach playlist body to the captured video (or capture it standalone)
@@ -845,7 +760,7 @@ export class ScraperEngine {
                         console.log(
                           `[SCRAPER-VOD] Captured m3u8 body: ${resUrl}`,
                         );
-                        triggerSettle();
+                        s.markDone();
                       }
                     }
                   } catch (_) {}
@@ -854,9 +769,9 @@ export class ScraperEngine {
               }
             });
           },
-          processFrame: async (frame, s) => {
-            // Click play controls and inspect DOM / player APIs for tracks & video src
-            const result = await frame.evaluate((selectors: string[]) => {
+          processFrame: async (frame) => {
+            // Click play controls; observe the DOM video src as a fallback capture
+            const videoSrc = await frame.evaluate((selectors: string[]) => {
               const btns = document.querySelectorAll(selectors.join(", "));
               btns.forEach((btn) => {
                 if (btn && typeof (btn as HTMLElement).click === "function") {
@@ -881,101 +796,23 @@ export class ScraperEngine {
                 }
               } catch (_) {}
 
-              // Inspect DOM for video element src
-              let videoSrc = "";
               const videoEl = document.querySelector("video");
-              if (videoEl) {
-                const src = videoEl.currentSrc || videoEl.src || "";
-                if (src && src.startsWith("http") && !src.startsWith("blob:")) {
-                  videoSrc = src;
-                }
-              }
-
-              // Inspect DOM for subtitle track elements
-              const subList: Array<{
-                url: string;
-                label?: string;
-                language?: string;
-                isDefault?: boolean;
-              }> = [];
-
-              document.querySelectorAll("track").forEach((t) => {
-                const src = t.src;
-                if (src && src.startsWith("http")) {
-                  subList.push({
-                    url: src,
-                    label: t.label || t.getAttribute("label") || undefined,
-                    language: t.srclang || t.getAttribute("srclang") || undefined,
-                    isDefault: t.default || t.hasAttribute("default"),
-                  });
-                }
-              });
-
-              // Inspect JWPlayer tracks
-              try {
-                const win = window as any;
-                if (typeof win.jwplayer === "function") {
-                  const jw = win.jwplayer("player") || win.jwplayer("jwplayer") || win.jwplayer();
-                  const tracks = jw?.getPlaylist?.()?.[0]?.tracks || jw?.getConfig?.()?.tracks;
-                  if (Array.isArray(tracks)) {
-                    tracks.forEach((t: any) => {
-                      if ((t.kind === "captions" || t.kind === "subtitles") && t.file) {
-                        subList.push({
-                          url: t.file,
-                          label: t.label,
-                          language: t.language,
-                          isDefault: Boolean(t.default),
-                        });
-                      }
-                    });
-                  }
-                }
-              } catch (_) {}
-
-              // Inspect Artplayer subtitle
-              try {
-                const win = window as any;
-                const art = win.art || win.artplayer;
-                if (art?.option?.subtitle?.url) {
-                  subList.push({
-                    url: art.option.subtitle.url,
-                    label: art.option.subtitle.name,
-                    isDefault: true,
-                  });
-                }
-              } catch (_) {}
-
-              return { videoSrc, subList };
+              const src = videoEl?.currentSrc || videoEl?.src || "";
+              return src.startsWith("http") && !src.startsWith("blob:") ? src : "";
             }, VOD_CLICK_SELECTORS);
 
-            if (result) {
-              if (result.subList && result.subList.length > 0) {
-                for (const sub of result.subList) {
-                  if (sub.url && !subtitleMap.has(sub.url)) {
-                    subtitleMap.set(sub.url, sub);
-                    console.log(
-                      `[SCRAPER-VOD] Captured subtitle from DOM/Player: ${sub.url} (${sub.label || sub.language || "und"})`,
-                    );
-                    if (capturedVideo) {
-                      triggerSettle();
-                    }
-                  }
-                }
-              }
-              if (!capturedVideo && !domVideoFallback && result.videoSrc) {
-                domVideoFallback = {
-                  url: result.videoSrc,
-                  method: "GET",
-                  headers: {},
-                  resource_type: "media",
-                  post_data: null,
-                };
-                console.log(
-                  `[SCRAPER-VOD] Observed video src from DOM: ${result.videoSrc}`,
-                );
-              }
+            if (!capturedVideo && !domVideoFallback && videoSrc) {
+              domVideoFallback = {
+                url: videoSrc,
+                method: "GET",
+                headers: {},
+                resource_type: "media",
+                post_data: null,
+              };
+              console.log(
+                `[SCRAPER-VOD] Observed video src from DOM: ${videoSrc}`,
+              );
             }
-            void s;
           },
         },
         () => {
@@ -984,13 +821,10 @@ export class ScraperEngine {
           }
 
           console.log(
-            `[SCRAPER-VOD] Finished scraping VOD ${url}: video=${Boolean(capturedVideo)}, subtitles=${subtitleMap.size}`,
+            `[SCRAPER-VOD] Finished scraping VOD ${url}: video=${Boolean(capturedVideo)}`,
           );
 
-          return {
-            video: capturedVideo,
-            subtitles: Array.from(subtitleMap.values()),
-          };
+          return capturedVideo;
         },
       );
     }, signal);
