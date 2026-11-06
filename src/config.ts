@@ -40,6 +40,12 @@ export const CONFIG = {
     process.env.PROXY_UPSTREAM_TIMEOUT_MS || "30000",
     10,
   ),
-  // Path to ffmpeg binary (defaults to system PATH lookup or common macOS/Linux locations)
-  FFMPEG_PATH: process.env.FFMPEG_PATH || "ffmpeg",
+  // Signed stream URLs on these CDNs die within ~1-2 minutes while VOD cache
+  // lives for hours. Cached m3u8 payloads older than this get a liveness ping
+  // before being served; dead tokens trigger a fresh scrape instead of
+  // handing players 404-ing URLs.
+  STREAM_REVALIDATE_MS: parseInt(
+    process.env.STREAM_REVALIDATE_MS || "45000",
+    10,
+  ),
 };

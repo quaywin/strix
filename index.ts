@@ -443,13 +443,10 @@ export const handleScrapeVideo = async (
     json?: string;
     embed?: string;
     is_embed?: string;
-    remux?: string;
-    t?: string;
-    seek?: string;
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, fallback, proxy, format, json, embed, is_embed, remux, t, seek } = query;
+  const { url, fallback, proxy, format, json, embed, is_embed } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -458,7 +455,6 @@ export const handleScrapeVideo = async (
   }
   const wantJson = format === "json" || json === "1" || json === "true";
   const wantProxy = proxy === "1" || proxy === "true";
-  const wantRemux = remux === "1" || remux === "true";
   const wantEmbed =
     embed === "1" || embed === "true" || is_embed === "1" || is_embed === "true";
   const requestOrigin = getRequestOrigin(request);
@@ -474,8 +470,6 @@ export const handleScrapeVideo = async (
         requestOrigin,
         wantEmbed,
         request.signal,
-        false,
-        wantProxy,
       );
     } catch (primaryErr: any) {
       if (
@@ -495,8 +489,6 @@ export const handleScrapeVideo = async (
         requestOrigin,
         wantEmbed,
         request.signal,
-        false,
-        wantProxy,
       );
     }
 
@@ -521,10 +513,8 @@ export const handleScrapeVideo = async (
         ? `&fallback=${encodeURIComponent(fallback)}`
         : "";
       const masterUrl = isM3u8
-        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}${wantProxy ? "&proxy=true" : ""}`
+        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}`
         : undefined;
-
-      const remuxUrl = `${requestOrigin}/scrape-video/remux.mkv?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}`;
 
       return new Response(
         JSON.stringify({
@@ -533,7 +523,6 @@ export const handleScrapeVideo = async (
           subtitles: extracted.subtitles,
           streamUrl: directStreamUrl,
           masterPlaylistUrl: masterUrl,
-          remuxStreamUrl: remuxUrl,
           extractedAt: extracted.extractedAt,
         }),
         {
@@ -545,19 +534,6 @@ export const handleScrapeVideo = async (
 
     // Direct video formats (MKV, MP4, WebM):
     if (!isM3u8) {
-      // If remux is requested (via remux=true or /remux.mkv), launch on-the-fly FFmpeg muxing
-      if (wantRemux && extracted.subtitles && extracted.subtitles.length > 0) {
-        const seekSeconds = parseFloat(seek || t || "0") || 0;
-        return videoScraperService.streamRemuxedMkv(
-          extracted.video.url,
-          extracted.subtitles,
-          {
-            seekSeconds,
-            signal: request.signal,
-          },
-        );
-      }
-
       // Default mode for direct video: redirect to direct playable stream
       return Response.redirect(directStreamUrl, 302);
     }
@@ -614,15 +590,49 @@ export const app = new Elysia()
   .get("/scrape-video", async ({ query, request }) => {
     return handleScrapeVideo(query, request);
   })
-  .get("/scrape-video/:filename", async ({ params, query, request }) => {
-    const isRemux = params.filename?.toLowerCase().includes("remux");
-    return handleScrapeVideo(
-      {
-        ...query,
-        remux: query.remux || (isRemux ? "1" : undefined),
-      },
-      request,
-    );
+  .get("/scrape-video/:filename", async ({ query, request }) => {
+    // Friendly aliases like /master.m3u8 — the filename itself is cosmetic;
+    // responses follow the same content negotiation as plain /scrape-video.
+    return handleScrapeVideo(query, request);
+  })
+  .get("/playlist", async ({ query, request }) => {
+    const playlistUrl = query.url;
+    if (!playlistUrl) {
+      return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const referer = query.referer;
+
+    try {
+      const rewritten = await videoScraperService.getProxiedPlaylist(
+        playlistUrl,
+        referer,
+        getRequestOrigin(request),
+        request.signal,
+      );
+      return new Response(rewritten, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        },
+      });
+    } catch (e: any) {
+      if (request.signal?.aborted || e.name === "AbortError") {
+        return new Response(null, { status: 499 });
+      }
+      return new Response(
+        JSON.stringify({ error: e.message || "Failed to load playlist" }),
+        {
+          status: 502,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
   })
   .get("/proxy-sub", async ({ query, request }) => {
     const subUrl = query.url;
@@ -635,14 +645,46 @@ export const app = new Elysia()
     const referer = query.referer;
     const userAgent =
       query.ua || request.headers.get("user-agent") || DEFAULT_USER_AGENT;
+    const wantPlaylist = query.playlist === "1";
 
     try {
+      // HLS renditions must point at a media *playlist*, not a raw WebVTT
+      // document. The single-segment wrapper's content doesn't depend on the
+      // VTT payload, so it returns instantly — the caption itself is only
+      // fetched when the player requests the segment below.
+      if (wantPlaylist) {
+        const origin = getRequestOrigin(request);
+        const inner = new URLSearchParams({ url: subUrl });
+        if (referer) inner.set("referer", referer);
+        const segmentUrl = `${origin}/proxy-sub?${inner.toString()}`;
+        const playlist = [
+          "#EXTM3U",
+          "#EXT-X-VERSION:6",
+          "#EXT-X-PLAYLIST-TYPE:VOD",
+          "#EXT-X-TARGETDURATION:10800",
+          "#EXT-X-MEDIA-SEQUENCE:0",
+          "#EXTINF:10800.000,",
+          segmentUrl,
+          "#EXT-X-ENDLIST",
+        ].join("\n");
+        return new Response(playlist, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Cache-Control": "public, max-age=21600",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          },
+        });
+      }
+
       const vtt = await videoScraperService.getSubtitle(
         subUrl,
         referer,
         userAgent,
         request.signal,
       );
+
       return new Response(vtt, {
         status: 200,
         headers: {

@@ -58,6 +58,49 @@ const LANGUAGE_LOOKUP: Record<string, { code: string; label: string }> = {
   tur: { code: "tr", label: "Turkish" },
 };
 
+/** Lazily built char -> Windows-1256 byte map for mojibake reversal. */
+let cp1256Encoder: Map<string, number> | null = null;
+
+function getCp1256Encoder(): Map<string, number> {
+  if (!cp1256Encoder) {
+    cp1256Encoder = new Map<string, number>();
+    const decoder = new TextDecoder("windows-1256");
+    for (let byte = 0; byte < 256; byte++) {
+      const ch = decoder.decode(new Uint8Array([byte]));
+      if (!cp1256Encoder.has(ch)) cp1256Encoder.set(ch, byte);
+    }
+  }
+  return cp1256Encoder;
+}
+
+/**
+ * Repairs double-encoded captions. The vidnest-family caption cache stores
+ * Vietnamese (and other Latin-extended) text whose UTF-8 bytes were decoded
+ * as Windows-1256 — e.g. "Được" becomes "ؤگئ°ل»£c". Detected by the presence
+ * of Arabic-block letters in text that, once reversed, reads as clean
+ * Latin-extended content. Legit Arabic captions fail the reversal checks and
+ * pass through untouched.
+ */
+export function maybeFixMojibake(text: string): string {
+  if (!/[؀-ۿ]/.test(text)) return text;
+
+  const map = getCp1256Encoder();
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const byte = map.get(text[i]!);
+    if (byte === undefined) return text;
+    bytes[i] = byte;
+  }
+
+  try {
+    const repaired = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const stillHasArabic = /[؀-ۿ]/.test(repaired);
+    const hasLatinExtended = /[À-ǿḀ-ỿ]/.test(repaired);
+    if (!stillHasArabic && hasLatinExtended) return repaired;
+  } catch {}
+  return text;
+}
+
 /**
  * Converts SubRip (SRT) format to WebVTT format.
  * - Strips UTF-8 BOM if present
@@ -180,6 +223,106 @@ export function inferSubtitleMetadata(
     format,
     default: Boolean(candidate.isDefault),
   };
+}
+
+/**
+ * Converts a WebVTT timestamp ("HH:MM:SS.mmm" or "MM:SS.mmm") to seconds.
+ * Returns null when the string is malformed.
+ */
+export function vttTimestampToSeconds(ts: string): number | null {
+  const m = ts.trim().match(/^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\.(\d{3})$/);
+  if (!m) return null;
+  return (
+    (m[1] ? parseInt(m[1], 10) * 3600 : 0) +
+    parseInt(m[2] ?? "0", 10) * 60 +
+    parseInt(m[3] ?? "0", 10) +
+    parseInt(m[4] ?? "0", 10) / 1000
+  );
+}
+
+/** Formats seconds as a WebVTT timestamp "HH:MM:SS.mmm". */
+export function secondsToVttTimestamp(totalSec: number): string {
+  const clamped = Math.max(0, totalSec);
+  const hh = String(Math.floor(clamped / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((clamped % 3600) / 60)).padStart(2, "0");
+  const ss = String(Math.floor(clamped % 60)).padStart(2, "0");
+  const ms = String(Math.round((clamped - Math.floor(clamped)) * 1000)).padStart(3, "0");
+  return `${hh}:${mm}:${ss}.${ms}`;
+}
+
+const VTT_CUE_TIMING = /(\d{1,2}:)?(\d{1,2}):(\d{2})\.(\d{3})\s*-->\s*(\d{1,2}:)?(\d{1,2}):(\d{2})\.(\d{3})/;
+
+/** Parses the LOCAL/MPEGTS offset mapping from an HLS WebVTT segment. */
+function parseTimestampMap(lines: string[]): number {
+  for (const line of lines) {
+    const m = line.match(/X-TIMESTAMP-MAP[:=]\s*LOCAL:([\d:.]+),\s*MPEGTS:(\d+)/i);
+    if (!m) continue;
+    const localSec = vttTimestampToSeconds(m[1] ?? "0");
+    const mpegtsSec = parseInt(m[2] ?? "0", 10) / 90000; // 90kHz MPEG clock
+    if (localSec !== null) return mpegtsSec - localSec;
+  }
+  return 0;
+}
+
+/**
+ * Merges HLS WebVTT segments (each with its own WEBVTT header and optional
+ * X-TIMESTAMP-MAP offset) into one clean WebVTT document:
+ * - Applies each segment's MPEGTS offset to its cue timestamps
+ * - Drops repeated WEBVTT / NOTE / header lines from later segments
+ * - Repairs double-encoded text per segment
+ * - Deduplicates identical cues that overlap at segment boundaries
+ */
+export function mergeHlsVttSegments(segments: string[]): string {
+  const outBlocks: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of segments) {
+    if (!raw) continue;
+    const text = maybeFixMojibake(
+      raw.replace(/^﻿/, "").replace(/\r\n|\r/g, "\n"),
+    );
+    const segOffset = parseTimestampMap(text.split("\n"));
+
+    for (const block of text.split(/\n\s*\n/)) {
+      const lines = block.split("\n").filter((l) => l.trim() !== "");
+      if (lines.length === 0) continue;
+
+      // Skip segment headers and comment/style blocks
+      const first = lines[0] ?? "";
+      if (/^WEBVTT/i.test(first)) lines.shift();
+      if (lines.length === 0) continue;
+      const isTag = (l: string) => l.startsWith("NOTE") || /^(STYLE|REGION)/i.test(l);
+      if (isTag(lines[0] ?? "")) continue;
+      const filtered = lines.filter((l) => !/^X-TIMESTAMP-MAP:/i.test(l));
+      if (filtered.length === 0) continue;
+
+      const timingIdx = filtered.findIndex((l) => VTT_CUE_TIMING.test(l));
+      if (timingIdx === -1) continue;
+
+      const timingLine = filtered[timingIdx]!;
+      const m = timingLine.match(VTT_CUE_TIMING)!;
+      const startSec =
+        vttTimestampToSeconds(`${m[1] ?? "00:"}${m[2] ?? ""}:${m[3] ?? ""}.${m[4] ?? "000"}`) ?? 0;
+      const endSec =
+        vttTimestampToSeconds(`${m[5] ?? "00:"}${m[6] ?? ""}:${m[7] ?? ""}.${m[8] ?? "000"}`) ?? 0;
+
+      const newStart = startSec + segOffset;
+      const newEnd = endSec + segOffset;
+      if (newEnd <= newStart) continue;
+
+      const body = filtered.slice(timingIdx + 1).join("\n");
+      const key = `${newStart.toFixed(3)}|${newEnd.toFixed(3)}|${body}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const rest = timingLine.replace(VTT_CUE_TIMING, "");
+      outBlocks.push(
+        `${secondsToVttTimestamp(newStart)} --> ${secondsToVttTimestamp(newEnd)}${rest}\n${body}`,
+      );
+    }
+  }
+
+  return `WEBVTT\n\n${outBlocks.join("\n\n")}\n`;
 }
 
 /**

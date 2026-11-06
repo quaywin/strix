@@ -1,4 +1,4 @@
-import type { SubtitleTrack } from "./subtitles";
+import type { RawSubtitleCandidate, SubtitleTrack } from "./subtitles";
 
 /**
  * Resolves a URI relative to baseUrl, preserving query parameters
@@ -94,6 +94,51 @@ export function rewriteM3u8Playlist(
 }
 
 /**
+ * Reads a single NAME/URI/... attribute out of an #EXT-X-MEDIA tag line.
+ * Handles both quoted and unquoted values.
+ */
+function extMediaAttr(tagLine: string, name: string): string {
+  const match = tagLine.match(new RegExp(`${name}=("([^"]*)"|([^,]*))`, "i"));
+  return (match?.[2] ?? match?.[3] ?? "").trim();
+}
+
+/**
+ * Extracts all #EXT-X-MEDIA:TYPE=SUBTITLES renditions from an HLS master
+ * playlist body, resolving their URIs against the master URL (preserving
+ * base query params such as session tokens). Zero network cost — the body
+ * was already captured during the scrape.
+ */
+export function parseHlsSubtitleRenditions(
+  masterBody: string,
+  masterUrl: string,
+): RawSubtitleCandidate[] {
+  if (!masterBody || !masterBody.includes("#EXT-X-MEDIA")) return [];
+
+  const candidates: RawSubtitleCandidate[] = [];
+  for (const line of masterBody.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("#EXT-X-MEDIA:")) continue;
+    if (!/TYPE=SUBTITLES/i.test(trimmed)) continue;
+
+    const uri = extMediaAttr(trimmed, "URI");
+    if (!uri) continue;
+
+    let absolute = uri;
+    try {
+      absolute = resolveUrlWithBaseParams(uri, masterUrl);
+    } catch {}
+
+    candidates.push({
+      url: absolute,
+      label: extMediaAttr(trimmed, "NAME") || undefined,
+      language: extMediaAttr(trimmed, "LANGUAGE") || undefined,
+      isDefault: /^YES$/i.test(extMediaAttr(trimmed, "DEFAULT")),
+    });
+  }
+  return candidates;
+}
+
+/**
  * Builds or augments an RFC 8216 HLS Master Playlist combining a video stream with subtitle tracks.
  */
 export function buildMasterPlaylistWithSubtitles(
@@ -109,7 +154,7 @@ export function buildMasterPlaylistWithSubtitles(
     ? subtitles
         .map(
           (t) =>
-            `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${t.label.replace(/"/g, "")}",DEFAULT=${t.default ? "YES" : "NO"},AUTOSELECT=YES,FORCED=NO,LANGUAGE="${t.language}",URI="${t.proxyUrl}"`,
+            `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${t.label.replace(/"/g, "")}",DEFAULT=${t.default ? "YES" : "NO"},AUTOSELECT=YES,FORCED=NO,LANGUAGE="${t.language}",URI="${t.proxyUrl}&playlist=1"`,
         )
         .join("\n")
     : "";
@@ -173,6 +218,21 @@ export function buildMasterPlaylistWithSubtitles(
           resultLines.push(line);
         }
         continue;
+      }
+
+      // Upstream subtitle rendition tags: make their URI absolute so the
+      // browser resolves them against the CDN, not against our origin.
+      // Deliberately NOT wrapped in /proxy-sub — that endpoint returns a
+      // converted WebVTT file, which would corrupt a rendition *playlist*.
+      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=SUBTITLES/i.test(trimmed)) {
+        const uri = extMediaAttr(trimmed, "URI");
+        if (uri) {
+          try {
+            const absoluteUri = resolveUrlWithBaseParams(uri, videoUrl);
+            resultLines.push(trimmed.replace(/URI="([^"]+)"/i, `URI="${absoluteUri}"`));
+            continue;
+          } catch {}
+        }
       }
 
       resultLines.push(line);
