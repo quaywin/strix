@@ -326,6 +326,22 @@ export function mergeHlsVttSegments(segments: string[]): string {
 }
 
 /**
+ * Computes which configured languages are still missing from a candidate
+ * set ("*" allowed-list disables the fill — every language vdrk knows is
+ * already welcome, there is no finite per-language list to fill from).
+ */
+export function missingLanguages(
+  allowed: string[] | "*",
+  existing: ReadonlyArray<{ language?: string }>,
+): string[] {
+  if (allowed === "*") return [];
+  const found = new Set(
+    existing.map((c) => (c.language || "").toLowerCase()),
+  );
+  return allowed.filter((l) => !found.has(l));
+}
+
+/**
  * Keeps only tracks in the configured language codes ("*" = keep all).
  * An empty list is treated as "*" so a typo in the config cannot silently
  * disable subtitles altogether.

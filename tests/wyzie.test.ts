@@ -1,5 +1,20 @@
 import { describe, expect, it, mock } from "bun:test";
+import { missingLanguages } from "../src/utils/subtitles";
 import { fetchWyzieSubtitles, wyzieToCandidates } from "../src/utils/wyzie";
+
+describe("missingLanguages", () => {
+  it("returns only the configured languages not yet present", () => {
+    const existing = [{ language: "en" }, { language: "zh" }];
+    expect(missingLanguages(["vi", "en"], existing)).toEqual(["vi"]);
+    expect(missingLanguages(["vi", "en"], [])).toEqual(["vi", "en"]);
+    expect(missingLanguages(["vi", "en"], [{ language: "vi" }, { language: "en" }])).toEqual([]);
+  });
+
+  it("is case-insensitive on found codes and disables fill for '*'", () => {
+    expect(missingLanguages(["vi", "en"], [{ language: "EN" }])).toEqual(["vi"]);
+    expect(missingLanguages("*", [{ language: "en" }])).toEqual([]);
+  });
+});
 
 const sampleJson = [
   {

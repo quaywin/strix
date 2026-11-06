@@ -17,6 +17,7 @@ import {
   maybeFixMojibake,
   mergeHlsVttSegments,
   filterTracksByLanguages,
+  missingLanguages,
   srtToVtt,
   normalizeSubtitleTracks,
   type RawSubtitleCandidate,
@@ -341,41 +342,55 @@ export class VideoScraperService {
           signal,
           CONFIG.SUBTITLE_LANGUAGES,
         );
+        payload.subCandidates = [
+          ...(payload.subCandidates || []),
+          ...cacheCandidates,
+        ];
         if (cacheCandidates.length > 0) {
-          payload.subCandidates = [
-            ...(payload.subCandidates || []),
-            ...cacheCandidates,
-          ];
           logger.info(
             `Subtitle cache probe: ${cacheCandidates.length} track(s) for: ${url}`,
             "VideoScraperService",
           );
           this.prefetchDefaultSubtitles(payload.subCandidates);
         }
-      } catch (_) {}
+      } catch (_) {
+        payload.subCandidates = payload.subCandidates || [];
+      }
 
-      // Wyzie fallback (L2): brand-new releases often have no captions on
-      // vdrk yet. Wyzie returns direct SRT links — registered as candidates
-      // without any download; /proxy-sub fetches+converts lazily when a
-      // player selects the track.
-      if (CONFIG.WYZIE_API_KEY && (payload.subCandidates?.length ?? 0) === 0) {
-        try {
-          const identity = parseEmbedVideoIdentity(url);
-          if (identity) {
+      // Wyzie fallback (L2): fills whatever languages the vdrk probe missed
+      // — either everything (brand-new releases) or a single gap (vdrk has
+      // en but not vi). Wyzie returns direct SRT links — registered as
+      // candidates without any download; /proxy-sub fetches+converts
+      // lazily when a player selects the track.
+      const identity = parseEmbedVideoIdentity(url);
+      if (
+        CONFIG.WYZIE_API_KEY &&
+        identity &&
+        payload.subCandidates !== undefined
+      ) {
+        const missing = missingLanguages(
+          CONFIG.SUBTITLE_LANGUAGES,
+          payload.subCandidates,
+        );
+        if (missing.length > 0) {
+          try {
             const wyzieCandidates = await this.probeWyzieSubtitles(
               identity,
-              CONFIG.SUBTITLE_LANGUAGES,
+              missing,
               signal,
             );
             if (wyzieCandidates.length > 0) {
-              payload.subCandidates = wyzieCandidates;
+              payload.subCandidates = [
+                ...(payload.subCandidates || []),
+                ...wyzieCandidates,
+              ];
               logger.info(
-                `Wyzie fallback: ${wyzieCandidates.length} track(s) for: ${url}`,
+                `Wyzie fallback: +${wyzieCandidates.length} track(s) (missing: ${missing.join(",")}) for: ${url}`,
                 "VideoScraperService",
               );
             }
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
       }
     }
 
@@ -508,20 +523,20 @@ export class VideoScraperService {
    */
   private async probeWyzieSubtitles(
     identity: { tmdbId: string; season?: number; episode?: number },
-    allowedCodes: string[] | "*",
+    missing: string[],
     signal?: AbortSignal,
   ): Promise<RawSubtitleCandidate[]> {
     const apiKey = CONFIG.WYZIE_API_KEY;
     if (!apiKey) return [];
 
-    const missKey = `wyzie:${identity.tmdbId}:${identity.season ?? 0}:${identity.episode ?? 0}`;
+    const missKey = `wyzie:${identity.tmdbId}:${identity.season ?? 0}:${identity.episode ?? 0}:${missing.slice().sort().join(",")}`;
     if (this.wyzieMissCache.get(missKey)) return [];
 
     const subtitles = await fetchWyzieSubtitles(apiKey, {
       tmdbId: identity.tmdbId,
       season: identity.season,
       episode: identity.episode,
-      languages: allowedCodes === "*" ? [] : allowedCodes,
+      languages: missing,
       signal,
     });
     const candidates = wyzieToCandidates(subtitles).slice(0, 3);
