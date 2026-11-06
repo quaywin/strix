@@ -91,6 +91,7 @@ export function wyzieToCandidates(
     .map((s) => ({
       url: s.url,
       language: s.language,
+      format: (s.format as "vtt" | "srt") || "srt",
       isDefault: false,
     }));
 }

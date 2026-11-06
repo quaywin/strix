@@ -132,6 +132,8 @@ export function parseHlsSubtitleRenditions(
       url: absolute,
       label: extMediaAttr(trimmed, "NAME") || undefined,
       language: extMediaAttr(trimmed, "LANGUAGE") || undefined,
+      format: "m3u8",
+      isRendition: true,
       isDefault: /^YES$/i.test(extMediaAttr(trimmed, "DEFAULT")),
     });
   }
@@ -149,19 +151,37 @@ export function buildMasterPlaylistWithSubtitles(
     proxySegmentUrl?: (url: string) => string;
   } = {},
 ): string {
-  const hasSubtitles = subtitles && subtitles.length > 0;
+  const isExistingMaster = Boolean(
+    options.videoBody && options.videoBody.includes("#EXT-X-STREAM-INF:"),
+  );
+
+  // Collect existing subtitle languages from upstream master
+  const upstreamSubLangs = new Set<string>();
+  if (isExistingMaster && options.videoBody) {
+    for (const line of options.videoBody.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=SUBTITLES/i.test(trimmed)) {
+        const lang = extMediaAttr(trimmed, "LANGUAGE").toLowerCase();
+        if (lang) upstreamSubLangs.add(lang);
+      }
+    }
+  }
+
+  // Filter out injected subtitles whose languages are already provided by upstream master
+  const effectiveSubs =
+    isExistingMaster && upstreamSubLangs.size > 0
+      ? subtitles.filter((t) => !upstreamSubLangs.has(t.language.toLowerCase()))
+      : subtitles;
+
+  const hasSubtitles = effectiveSubs && effectiveSubs.length > 0;
   const subMediaLines = hasSubtitles
-    ? subtitles
+    ? effectiveSubs
         .map(
           (t) =>
             `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${t.label.replace(/"/g, "")}",DEFAULT=${t.default ? "YES" : "NO"},AUTOSELECT=YES,FORCED=NO,LANGUAGE="${t.language}",URI="${t.proxyUrl}&playlist=1"`,
         )
         .join("\n")
     : "";
-
-  const isExistingMaster = Boolean(
-    options.videoBody && options.videoBody.includes("#EXT-X-STREAM-INF:"),
-  );
 
   if (isExistingMaster && options.videoBody) {
     const lines = options.videoBody.split(/\r?\n/);
@@ -237,11 +257,34 @@ export function buildMasterPlaylistWithSubtitles(
         continue;
       }
 
-      // Upstream audio/subtitle rendition playlists route through strix as
-      // well (they are playlists, so the /playlist handler rewrites their
-      // segments; raw /proxy-sub would corrupt them). Unreferenced groups
-      // stay in the manifest untouched, players ignore them.
-      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=(SUBTITLES|AUDIO)/i.test(trimmed)) {
+      // Upstream subtitle rendition playlists route through strix as well.
+      // When external subtitles are injected into GROUP-ID="subs", align upstream subtitle
+      // GROUP-ID to "subs" as well so both upstream and injected subtitles remain in the
+      // same active rendition group referenced by EXT-X-STREAM-INF.
+      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=SUBTITLES/i.test(trimmed)) {
+        let tag = trimmed;
+        if (hasSubtitles) {
+          tag = tag.replace(/GROUP-ID=["'][^"']*["']/i, 'GROUP-ID="subs"');
+          if (effectiveSubs.some((t) => t.default)) {
+            tag = tag.replace(/DEFAULT=YES/i, "DEFAULT=NO");
+          }
+        }
+        const uri = extMediaAttr(tag, "URI");
+        if (uri && options.proxySegmentUrl) {
+          try {
+            const wrappedUri = options.proxySegmentUrl(
+              resolveUrlWithBaseParams(uri, videoUrl),
+            );
+            resultLines.push(tag.replace(/URI="([^"]+)"/i, `URI="${wrappedUri}"`));
+            continue;
+          } catch {}
+        }
+        resultLines.push(tag);
+        continue;
+      }
+
+      // Upstream audio rendition playlists route through strix
+      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=AUDIO/i.test(trimmed)) {
         const uri = extMediaAttr(trimmed, "URI");
         if (uri && options.proxySegmentUrl) {
           try {

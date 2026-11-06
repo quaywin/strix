@@ -7,6 +7,8 @@ export interface RawSubtitleCandidate {
   label?: string;
   language?: string;
   kind?: string;
+  format?: "vtt" | "srt" | "m3u8";
+  isRendition?: boolean;
   isDefault?: boolean;
 }
 
@@ -15,7 +17,8 @@ export interface SubtitleTrack {
   proxyUrl: string;
   label: string;
   language: string; // ISO 639-1 / BCP 47 (e.g. "en", "vi", "es")
-  format: "vtt" | "srt";
+  format: "vtt" | "srt" | "m3u8";
+  isRendition?: boolean;
   default: boolean;
 }
 
@@ -151,8 +154,15 @@ export function inferSubtitleMetadata(
   pageUrl?: string,
 ): SubtitleTrack {
   const url = candidate.url;
-  const isSrt = /\.srt($|\?)/i.test(url);
-  const format: "vtt" | "srt" = isSrt ? "srt" : "vtt";
+  const isM3u8 =
+    candidate.isRendition ||
+    candidate.format === "m3u8" ||
+    /\.m3u8($|\?)/i.test(url);
+  const isSrt =
+    !isM3u8 &&
+    (candidate.format === "srt" ||
+      /\.srt($|[?&])|format=srt($|&)/i.test(url));
+  const format: "vtt" | "srt" | "m3u8" = isM3u8 ? "m3u8" : isSrt ? "srt" : "vtt";
 
   let detectedCode = "";
   let detectedLabel = "";
@@ -221,6 +231,7 @@ export function inferSubtitleMetadata(
     label: finalLabel,
     language: finalCode,
     format,
+    isRendition: Boolean(isM3u8),
     default: Boolean(candidate.isDefault),
   };
 }

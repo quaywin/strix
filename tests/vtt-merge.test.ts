@@ -71,6 +71,75 @@ describe("buildMasterPlaylistWithSubtitles passthrough", () => {
     expect(out).not.toContain('URI="audio-en.m3u8"');
     expect(out).not.toContain('URI="iframes-v1.txt"');
   });
+
+  it("merges upstream subtitle renditions and injected subtitles into the same group without orphaning", () => {
+    const body = [
+      "#EXTM3U",
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subtitles_en",NAME="English",DEFAULT=YES,LANGUAGE="en",URI="subs-en.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=5000000,SUBTITLES="subtitles_en"',
+      "v1.m3u8",
+    ].join("\n");
+
+    const viTrack: SubtitleTrack = {
+      url: "https://cache.vdrk.site/v2/movie/123/Vietnamese.vtt",
+      proxyUrl: "https://strix.test/proxy-sub?url=vi",
+      label: "Vietnamese",
+      language: "vi",
+      format: "vtt",
+      default: true,
+    };
+
+    const out = buildMasterPlaylistWithSubtitles(
+      "https://cdn.example.com/hls/master.m3u8",
+      [viTrack],
+      {
+        videoBody: body,
+        proxySegmentUrl: (u) => `https://strix.test/playlist?url=${encodeURIComponent(u)}`,
+      },
+    );
+
+    // Both upstream English and injected Vietnamese are in GROUP-ID="subs"
+    expect(out).toContain(
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=NO,LANGUAGE="en"',
+    );
+    expect(out).toContain(
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Vietnamese",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="vi",URI="https://strix.test/proxy-sub?url=vi&playlist=1"',
+    );
+    // Variant references "subs"
+    expect(out).toContain('SUBTITLES="subs"');
+  });
+
+  it("avoids injecting duplicate subtitles if upstream master already declared that language", () => {
+    const body = [
+      "#EXTM3U",
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,LANGUAGE="en",URI="subs-en.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=5000000,SUBTITLES="subs"',
+      "v1.m3u8",
+    ].join("\n");
+
+    const enTrack: SubtitleTrack = {
+      url: "https://cache.vdrk.site/v2/movie/123/English.vtt",
+      proxyUrl: "https://strix.test/proxy-sub?url=en",
+      label: "English",
+      language: "en",
+      format: "vtt",
+      default: false,
+    };
+
+    const out = buildMasterPlaylistWithSubtitles(
+      "https://cdn.example.com/hls/master.m3u8",
+      [enTrack],
+      {
+        videoBody: body,
+        proxySegmentUrl: (u) => `https://strix.test/playlist?url=${encodeURIComponent(u)}`,
+      },
+    );
+
+    // Injected English is skipped because upstream already provides "en"
+    expect(out).not.toContain("https://strix.test/proxy-sub?url=en&playlist=1");
+    // Upstream English is retained
+    expect(out).toContain('NAME="English"');
+  });
 });
 
 describe("maybeFixMojibake", () => {

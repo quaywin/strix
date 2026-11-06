@@ -86,6 +86,44 @@ describe("Subtitle Metadata Inference & Normalization", () => {
     const defaults = normalized.filter((t) => t.default);
     expect(defaults.length).toBe(1);
   });
+
+  it("normalizes Wyzie translation endpoints and includes them in master playlist", () => {
+    const candidates: RawSubtitleCandidate[] = [
+      { url: "https://cache.vdrk.site/v2/movie/1657630/English.vtt", language: "en", format: "vtt" },
+      { url: "https://sub.wyzie.io/translate?id=1657630&tk=token&target=Vietnamese", language: "vi", format: "srt" },
+    ];
+    const normalized = normalizeSubtitleTracks(
+      candidates,
+      "http://localhost:5005",
+    );
+    expect(normalized.length).toBe(2);
+    const vi = normalized.find((t) => t.language === "vi");
+    expect(vi).toBeDefined();
+    expect(vi!.label).toBe("Vietnamese");
+    expect(vi!.format).toBe("srt");
+    expect(vi!.default).toBe(true);
+
+    const payload = {
+      video: {
+        url: "https://stream.example.com/master.m3u8",
+        format: "m3u8" as const,
+        headers: {},
+        body: "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nvariant.m3u8",
+      },
+      extractedAt: Date.now(),
+      subCandidates: candidates,
+    };
+    // @ts-ignore
+    const result = videoScraperService["formatResult"](
+      payload,
+      "https://vidnest.fun/movie/1657630",
+      "http://localhost:5005",
+    );
+    expect(result.subtitles.length).toBe(2);
+    expect(result.masterPlaylist).toContain('NAME="Vietnamese",DEFAULT=YES');
+    expect(result.masterPlaylist).toContain('NAME="English",DEFAULT=NO');
+    expect(result.masterPlaylist).toContain("sub.wyzie.io%2Ftranslate");
+  });
 });
 
 describe("buildMasterPlaylistWithSubtitles", () => {
@@ -195,6 +233,22 @@ Test Subtitle`;
   it("returns 400 when url parameter is missing", async () => {
     const res = await app.handle(new Request("http://localhost/proxy-sub"));
     expect(res.status).toBe(400);
+  });
+
+  it("returns single-segment VOD media playlist with 24h target duration when playlist=1", async () => {
+    const res = await app.handle(
+      new Request(
+        "http://localhost/proxy-sub?url=https%3A%2F%2Fexample.com%2Fsub.vtt&playlist=1",
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain(
+      "application/vnd.apple.mpegurl",
+    );
+    const text = await res.text();
+    expect(text).toContain("#EXT-X-TARGETDURATION:86400");
+    expect(text).toContain("#EXTINF:86400.000,");
+    expect(text).toContain("#EXT-X-ENDLIST");
   });
 });
 

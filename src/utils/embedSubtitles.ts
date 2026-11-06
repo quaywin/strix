@@ -108,6 +108,7 @@ export function buildVdrkSubtitleCandidates(
     url: `${base}/${lang.file}.vtt`,
     label: lang.file,
     language: lang.code,
+    format: "vtt",
     isDefault: false,
   }));
 }

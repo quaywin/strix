@@ -663,9 +663,9 @@ export const app = new Elysia()
           "#EXTM3U",
           "#EXT-X-VERSION:6",
           "#EXT-X-PLAYLIST-TYPE:VOD",
-          "#EXT-X-TARGETDURATION:10800",
+          "#EXT-X-TARGETDURATION:86400",
           "#EXT-X-MEDIA-SEQUENCE:0",
-          "#EXTINF:10800.000,",
+          "#EXTINF:86400.000,",
           segmentUrl,
           "#EXT-X-ENDLIST",
         ].join("\n");

@@ -85,6 +85,21 @@ describe("wyzieToCandidates", () => {
     ]);
     expect(candidates.length).toBe(1);
     expect(candidates[0]!.language).toBe("vi");
+    expect(candidates[0]!.format).toBe("srt");
     expect(candidates[0]!.url).toContain("format=srt");
+  });
+
+  it("retains format for Wyzie translation endpoints without file extension", () => {
+    const candidates = wyzieToCandidates([
+      {
+        url: "https://sub.wyzie.io/translate?id=1657630&tk=token&target=Vietnamese",
+        language: "vi",
+        format: "srt",
+        release: "",
+      },
+    ]);
+    expect(candidates.length).toBe(1);
+    expect(candidates[0]!.language).toBe("vi");
+    expect(candidates[0]!.format).toBe("srt");
   });
 });

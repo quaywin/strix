@@ -191,7 +191,7 @@ export class VideoScraperService {
       Boolean(payload.video.body?.trim().startsWith("#EXTM3U"));
 
     // Subtitle tracks from the upstream master's own renditions plus the
-    // vidnest-family caption cache. Only raw subtitle files (VTT/SRT) are
+    // vidnest-family caption cache and Wyzie. Only raw subtitle files (VTT/SRT) are
     // injected into the synthesized playlist — their /proxy-sub URIs return
     // WebVTT. Rendition playlists stay out (hls.js consumes the upstream
     // declaration directly via the absolute-ized EXT-X-MEDIA passthrough),
@@ -204,9 +204,20 @@ export class VideoScraperService {
       : [];
     // Only raw subtitle files go into the synthesized playlist (their
     // /proxy-sub URIs return WebVTT). Wyzie links declare their format via
-    // the query string instead of a file extension — accept both.
-    const playlistSubs = subtitles.filter((t) =>
-      /\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url),
+    // the query string instead of a file extension, or use translation
+    // endpoints (sub.wyzie.io/translate) — accept all raw subtitle tracks.
+    // Upstream rendition playlists (.m3u8) stay out (hls.js consumes the
+    // upstream declaration directly via the absolute-ized EXT-X-MEDIA passthrough),
+    // but all tracks are exposed through the JSON API.
+    const playlistSubs = subtitles.filter(
+      (t) =>
+        !t.isRendition &&
+        t.format !== "m3u8" &&
+        !/\.m3u8($|[?&])/i.test(t.url) &&
+        (/\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url) ||
+          /sub\.wyzie\.io/i.test(t.url) ||
+          t.format === "vtt" ||
+          t.format === "srt"),
     );
 
     // Variant playlists on these CDNs hang or 404 when a browser fetches
@@ -368,7 +379,6 @@ export class VideoScraperService {
             `Subtitle cache probe: ${cacheCandidates.length} track(s) for: ${url}`,
             "VideoScraperService",
           );
-          this.prefetchDefaultSubtitles(payload.subCandidates);
         }
       } catch (_) {
         payload.subCandidates = payload.subCandidates || [];
@@ -408,6 +418,10 @@ export class VideoScraperService {
             }
           } catch (_) {}
         }
+      }
+
+      if (payload.subCandidates && payload.subCandidates.length > 0) {
+        this.prefetchDefaultSubtitles(payload.subCandidates);
       }
     }
 
