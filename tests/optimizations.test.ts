@@ -857,6 +857,16 @@ describe("isM3u8StreamUrl and HTML proxy safeguard", () => {
     ).toBe(true);
     expect(isM3u8StreamUrl("https://example.com/live/playlist.m3u8")).toBe(true);
     expect(isM3u8StreamUrl("https://example.com/hls/channel/32.m3u8")).toBe(true);
+
+    // Disguised .txt HLS playlists (e.g. vidnest / riskanalytics master.txt)
+    expect(
+      isM3u8StreamUrl(
+        "https://znomc6azq2dc.riskanalytics.cfd/vpusxz6e9t3q/hls3/01/14849/6gbztzn2u4v0_n/master.txt",
+      ),
+    ).toBe(true);
+    expect(isM3u8StreamUrl("https://cdn.example.com/stream/playlist.txt")).toBe(true);
+    expect(isM3u8StreamUrl("https://cdn.example.com/hls/video.txt?token=123")).toBe(true);
+    expect(isM3u8StreamUrl("https://cdn.example.com/readme.txt")).toBe(false);
   });
 
   it("safeguard returns HTTP 502 when upstream returns HTML document instead of M3U8 playlist", async () => {

@@ -60,7 +60,9 @@ export function isM3u8StreamUrl(url: string): boolean {
     if (
       pathnameLower.includes(".m3u8") ||
       pathnameLower.includes("/m3u8") ||
-      pathnameLower.includes(".m3u")
+      pathnameLower.includes(".m3u") ||
+      /\/hls\d*\/.*\.txt$/i.test(pathnameLower) ||
+      /\/(master|playlist|index|list|video)\.txt$/i.test(pathnameLower)
     ) {
       return true;
     }
@@ -86,7 +88,12 @@ export function isM3u8StreamUrl(url: string): boolean {
     ) {
       return false;
     }
-    return lower.includes(".m3u8") || lower.includes("/m3u8");
+    return (
+      lower.includes(".m3u8") ||
+      lower.includes("/m3u8") ||
+      /\/hls\d*\/.*\.txt($|\?)/i.test(lower) ||
+      /\/(master|playlist|index|list|video)\.txt($|\?)/i.test(lower)
+    );
   }
 }
 
@@ -724,6 +731,8 @@ export class ScraperEngine {
                   contentType.includes("mpegurl") ||
                   contentType.includes("dash+xml") ||
                   /\.(m3u8|mp4|mkv|webm|mpd)($|\?)/i.test(resUrl) ||
+                  isM3u8StreamUrl(resUrl) ||
+                  (domVideoFallback && resUrl === domVideoFallback.url) ||
                   response.request().resourceType() === "media") &&
                 !isSegment &&
                 !resUrl.includes("ping") &&
@@ -917,6 +926,15 @@ export class ScraperEngine {
               console.log(
                 `[SCRAPER-VOD] Observed video src from DOM: ${videoSrc}`,
               );
+
+              // Allow a brief debounce (600ms) for the network response listener to capture
+              // the request headers and m3u8 playlist body if available, then markDone so
+              // the scraper doesn't stall for the remaining 20s timeout.
+              s.trackedTimeout(() => {
+                if (!s.isDone()) {
+                  s.markDone();
+                }
+              }, 600);
             }
           },
         },
