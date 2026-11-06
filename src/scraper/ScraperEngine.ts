@@ -123,6 +123,18 @@ const VOD_CLICK_SELECTORS = [
 ];
 
 /**
+ * Stall recovery for embeds with a server picker (vidnest's cloud menu:
+ * Lamda / Zeta / Filxer / Ophim). When no video shows up after
+ * SERVER_CYCLE_START_MS, click through the server options one by one every
+ * SERVER_CYCLE_INTERVAL_MS until some backend emits a stream. A no-op on
+ * providers without such a menu.
+ */
+const SERVER_CYCLE_START_MS = 8000;
+const SERVER_CYCLE_INTERVAL_MS = 6000;
+/** Menu open animation wait before a server radio can be activated. */
+const SERVER_MENU_OPEN_WAIT_MS = 1200;
+
+/**
  * MPEG-DASH manifest detection (e.g. vidlink.pro serves clear-DASH .mpd).
  * Matches URLs whose path ends in .mpd (query string allowed after it).
  */
@@ -642,6 +654,10 @@ export class ScraperEngine {
     return this.semaphore.run(async () => {
       let capturedVideo: RequestData | null = null;
       let domVideoFallback: RequestData | null = null;
+      // Server-cycling state (shared across frames; only one frame acts per interval)
+      let cycleStartedAt = 0;
+      let lastCycleAt = 0;
+      let cycleIndex = 0;
 
       return await this.withScrapeSession(
         {
@@ -770,6 +786,95 @@ export class ScraperEngine {
             });
           },
           processFrame: async (frame) => {
+            // Stall recovery: cycle the embed's server picker when nothing loads.
+            // Timed from the first frame tick so the default server gets its
+            // SERVER_CYCLE_START_MS grace period before we start switching.
+            const now = Date.now();
+            if (!cycleStartedAt) cycleStartedAt = now;
+            if (
+              !capturedVideo &&
+              !domVideoFallback &&
+              now - cycleStartedAt >= SERVER_CYCLE_START_MS &&
+              now - lastCycleAt >= SERVER_CYCLE_INTERVAL_MS
+            ) {
+              lastCycleAt = now;
+              // 1) Open the server menu (skipped when it is already open)
+              await frame
+                .evaluate(() => {
+                  const menuButton = document.querySelector(
+                    '[class*="ServerMenu"][class*="menuButton"]',
+                  ) as HTMLElement | null;
+                  const menuContent = document.querySelector(
+                    '[class*="ServerMenu"][class*="menuContent"]',
+                  );
+                  if (
+                    menuButton &&
+                    (!menuContent ||
+                      menuContent.getBoundingClientRect().width === 0)
+                  ) {
+                    menuButton.click();
+                  }
+                })
+                .catch(() => {});
+              // 2) Let the menu finish animating before touching the radios
+              await new Promise((r) =>
+                setTimeout(r, SERVER_MENU_OPEN_WAIT_MS),
+              );
+              // 3) Dispatch a full pointer sequence on the next server radio.
+              //    Start at index 1 — index 0 is the default server that already stalled.
+              const switched = await frame.evaluate((idx: number) => {
+                const radios = Array.from(
+                  document.querySelectorAll('[class*="ServerMenu"]'),
+                ).filter((el) => {
+                  const cls = String(el.className);
+                  // Only the radio rows, not the group/label/sub-label shells
+                  return (
+                    cls.includes("radio") &&
+                    !cls.includes("Label") &&
+                    !cls.includes("Group") &&
+                    !cls.includes("Sub")
+                  );
+                }) as HTMLElement[];
+                const skipDefault = radios.length > 1 ? 1 : 0;
+                const target =
+                  radios[skipDefault + (idx % (radios.length - skipDefault))];
+                if (!target) return false;
+
+                const eventOpts = {
+                  bubbles: true,
+                  cancelable: true,
+                  button: 0,
+                  buttons: 1,
+                };
+                target.dispatchEvent(
+                  new PointerEvent("pointerdown", {
+                    ...eventOpts,
+                    pointerId: 1,
+                    pointerType: "mouse",
+                    isPrimary: true,
+                  } as PointerEventInit),
+                );
+                target.dispatchEvent(new MouseEvent("mousedown", eventOpts));
+                target.dispatchEvent(
+                  new PointerEvent("pointerup", {
+                    ...eventOpts,
+                    pointerId: 1,
+                    pointerType: "mouse",
+                    isPrimary: true,
+                  } as PointerEventInit),
+                );
+                target.dispatchEvent(new MouseEvent("mouseup", eventOpts));
+                target.click();
+                return true;
+              }, cycleIndex);
+              if (switched) {
+                cycleIndex++;
+                console.log(
+                  `[SCRAPER-VOD] No stream yet — cycling embed server (option #${cycleIndex})`,
+                );
+              }
+            }
+
             // Click play controls; observe the DOM video src as a fallback capture
             const videoSrc = await frame.evaluate((selectors: string[]) => {
               const btns = document.querySelectorAll(selectors.join(", "));
