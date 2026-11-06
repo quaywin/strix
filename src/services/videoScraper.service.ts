@@ -55,6 +55,15 @@ interface CachedVideoPayload {
   subCandidates?: RawSubtitleCandidate[];
 }
 
+/**
+ * Megacloud-family /proxy endpoints never answer with a real HTTP error:
+ * upstream failures come back as HTTP 200 + an HTML error page whose lines
+ * are rewritten into fake /ts-proxy "segment" URLs, served even with an
+ * application/vnd.apple.mpegurl content-type. The only reliable error signal
+ * is the absence of HLS tags in the body.
+ */
+const HLS_MARKER_RE = /#EXTM3U|#EXTINF|#EXT-X-/;
+
 export class VideoScraperService {
   private videoCache = new TtlCache<CachedVideoPayload>(CONFIG.VOD_CACHE_TTL_MS);
   private subCache = new TtlCache<string>(CONFIG.SUBTITLE_CACHE_TTL_MS);
@@ -82,26 +91,62 @@ export class VideoScraperService {
     const headers: Record<string, string> = {};
     if (referer) headers["referer"] = referer;
 
-    const res = await smartFetch(playlistUrl, {
-      headers,
-      signal: signal || AbortSignal.timeout(15000),
-    });
-    if (!res.ok) {
-      throw new Error(`Upstream playlist fetch failed: HTTP ${res.status}`);
-    }
-
-    const text = await res.text();
     // Error pages can come back with 200/3xx statuses — never hand them to
     // the player disguised as a playlist. Some upstreams (megacloud /proxy)
     // omit the #EXTM3U header entirely while still being valid media
     // playlists (EXTINF lines + segment URLs), so require any HLS tag.
-    const hasPlaylistMarkers =
-      /#EXTM3U|#EXTINF|#EXT-X-/.test(text);
-    if (!hasPlaylistMarkers) {
-      throw new Error("Upstream playlist response is not an m3u8 document");
-    }
+    const fetchAndValidate = async (): Promise<string> => {
+      const res = await smartFetch(playlistUrl, {
+        headers,
+        signal: signal || AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        throw new Error(`Upstream playlist fetch failed: HTTP ${res.status}`);
+      }
+      const text = await res.text();
+      if (!HLS_MARKER_RE.test(text)) {
+        throw new Error("Upstream playlist response is not an m3u8 document");
+      }
+      return text.includes("#EXTM3U") ? text : `#EXTM3U\n${text}`;
+    };
 
-    const normalized = text.includes("#EXTM3U") ? text : `#EXTM3U\n${text}`;
+    // Megacloud-family proxies respond to short bursts with the disguised
+    // error page above for a few seconds/minutes at a time. Retry with a
+    // small backoff before giving the player a 502 — a bare failure here
+    // kills playback outright, while the same token usually serves a valid
+    // playlist moments later.
+    const MAX_ATTEMPTS = 3;
+    const BACKOFF_MS = [1000, 2500];
+    let normalized: string | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      try {
+        normalized = await fetchAndValidate();
+        break;
+      } catch (e) {
+        if (
+          signal?.aborted ||
+          (e as Error).name === "AbortError" ||
+          attempt === MAX_ATTEMPTS - 1
+        ) {
+          throw e;
+        }
+        lastError = e;
+        logger.warn(
+          `Playlist fetch attempt ${attempt + 1}/${MAX_ATTEMPTS} failed for ${playlistUrl.slice(0, 120)} (${(e as Error).message}); retrying in ${BACKOFF_MS[attempt]}ms`,
+          "VideoScraperService",
+        );
+        await Bun.sleep(BACKOFF_MS[attempt] ?? 2500);
+      }
+    }
+    if (normalized === undefined) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("Upstream playlist fetch failed");
+    }
 
     // Two playlist shapes with different child-URL routing:
     // - nested MASTER (#EXT-X-STREAM-INF): its children are playlists too
@@ -143,6 +188,13 @@ export class VideoScraperService {
    * Liveness check for a cached payload. Signed stream tokens die within
    * minutes; before serving a stale cached m3u8, ping the playlist so
    * players never receive URLs that 404.
+   *
+   * The HTTP status alone is not enough: megacloud-family proxies wrap even
+   * hard failures in HTTP 200 + an HTML error page disguised as a playlist
+   * (rewritten /ts-proxy lines, mpegurl content-type). A dead token therefore
+   * "pings green" and would stay cached until the TTL expires, leaving
+   * players with a master that loads but whose every variant 502s — so the
+   * body must actually contain HLS tags.
    */
   private async isPayloadAlive(payload: CachedVideoPayload): Promise<boolean> {
     if (payload.video.format !== "m3u8") return true;
@@ -153,7 +205,9 @@ export class VideoScraperService {
         headers: this.pickForwardableHeaders(payload.video.headers),
         signal: AbortSignal.timeout(6000),
       });
-      return res.ok;
+      if (!res.ok) return false;
+      const text = await res.text();
+      return HLS_MARKER_RE.test(text);
     } catch {
       return false;
     }
