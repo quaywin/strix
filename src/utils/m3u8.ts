@@ -22,6 +22,26 @@ export function resolveUrlWithBaseParams(uri: string, baseUrl: string): string {
 }
 
 /**
+ * Builds a /proxy-chunk URL whose PATH carries a cosmetic media extension.
+ * Upstreams disguise segments as .xml/.js/.txt (and the disguise often IS
+ * the real extension now), but strict HLS clients — ffmpeg/libmpv-based
+ * players enforce an allowed_extensions list — refuse to load a segment
+ * whose URL ends in a non-media extension even when the bytes are valid
+ * fMP4/TS. The filename itself is ignored by the /proxy-chunk/:filename
+ * handler; only the extension matters. .m4s is missing from older ffmpeg
+ * allowlists, so everything non-.ts is normalized to .mp4.
+ */
+export function proxyChunkUrl(
+  requestOrigin: string,
+  targetUrl: string,
+  query: string,
+): string {
+  const m = targetUrl.match(/\.(ts|m4s|mp4)(\?|$)/i);
+  const ext = m?.[1]?.toLowerCase() === "ts" ? "ts" : "mp4";
+  return `${requestOrigin}/proxy-chunk/segment.${ext}?${query}`;
+}
+
+/**
  * Rewrites relative URIs in an HLS M3U8 playlist to absolute URLs,
  * and optionally wraps them in a proxy URL handler.
  */

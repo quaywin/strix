@@ -10,6 +10,7 @@ import { curlFetch, DEFAULT_USER_AGENT, smartFetch } from "../utils/http";
 import {
   buildMasterPlaylistWithSubtitles,
   parseHlsSubtitleRenditions,
+  proxyChunkUrl,
   rewriteM3u8Playlist,
   resolveUrlWithBaseParams,
 } from "../utils/m3u8";
@@ -141,7 +142,11 @@ export class VideoScraperService {
       proxySegmentUrl: (targetUrl) =>
         isNestedMaster
           ? `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`
-          : `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`,
+          : proxyChunkUrl(
+              requestOrigin,
+              targetUrl,
+              `url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`,
+            ),
     });
   }
 

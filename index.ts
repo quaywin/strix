@@ -14,7 +14,7 @@ import {
   getRequestOrigin,
   smartFetch,
 } from "./src/utils/http";
-import { rewriteM3u8Playlist } from "./src/utils/m3u8";
+import { proxyChunkUrl, rewriteM3u8Playlist } from "./src/utils/m3u8";
 import { needsUnwrap, unwrapChunk } from "./src/utils/cvUnwrap";
 
 export const handleScrapeStream = async (
@@ -344,7 +344,7 @@ export const handleScrapeStream = async (
               if (unwrap === "1" || unwrap === "true") {
                 params.set("unwrap", "1");
               }
-              return `${requestOrigin}/proxy-chunk?${params.toString()}`;
+              return proxyChunkUrl(requestOrigin, absUrl, params.toString());
             }
           : undefined;
 
@@ -503,7 +503,11 @@ export const handleScrapeVideo = async (
     const isMpd = extracted.video.format === "mpd";
     const directStreamUrl =
       wantProxy && !isMpd
-        ? `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(effectiveUrl)}`
+        ? proxyChunkUrl(
+            requestOrigin,
+            extracted.video.url,
+            `url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(effectiveUrl)}`,
+          )
         : extracted.video.url;
 
     if (wantJson) {
@@ -709,6 +713,18 @@ export const app = new Elysia()
       );
     }
   })
+  // The :filename segment is cosmetic — strict HLS clients (ffmpeg/libmpv
+  // allowed_extensions) refuse segment URLs that don't end in a media
+  // extension, while upstreams disguise segments as .xml/.js/.txt. The 307
+  // keeps method, query and Range headers on the internal hop.
+  .get("/proxy-chunk/:filename", ({ request }) => {
+    const url = new URL(request.url);
+    url.pathname = "/proxy-chunk";
+    return new Response(null, {
+      status: 307,
+      headers: { Location: url.toString() },
+    });
+  })
   .get("/proxy-chunk", async ({ query, request }) => {
     const chunkUrl = query.url;
     if (!chunkUrl) {
@@ -850,7 +866,7 @@ export const app = new Elysia()
               if (query.source) {
                 params.set("source", query.source);
               }
-              return `${requestOrigin}/proxy-chunk?${params.toString()}`;
+              return proxyChunkUrl(requestOrigin, targetUrl, params.toString());
             },
           });
 
