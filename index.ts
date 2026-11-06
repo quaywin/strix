@@ -716,13 +716,16 @@ export const app = new Elysia()
   // The :filename segment is cosmetic — strict HLS clients (ffmpeg/libmpv
   // allowed_extensions) refuse segment URLs that don't end in a media
   // extension, while upstreams disguise segments as .xml/.js/.txt. The 307
-  // keeps method, query and Range headers on the internal hop.
+  // keeps method, query and Range headers on the internal hop. Location is
+  // rebuilt through getRequestOrigin so it matches the origin used in the
+  // playlists even behind a reverse proxy (PUBLIC_URL / forwarded headers) —
+  // request.url alone would leak the internal host.
   .get("/proxy-chunk/:filename", ({ request }) => {
-    const url = new URL(request.url);
-    url.pathname = "/proxy-chunk";
+    const search = new URL(request.url).search;
+    const location = `${getRequestOrigin(request)}/proxy-chunk${search}`;
     return new Response(null, {
       status: 307,
-      headers: { Location: url.toString() },
+      headers: { Location: location },
     });
   })
   .get("/proxy-chunk", async ({ query, request }) => {

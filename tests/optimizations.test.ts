@@ -1267,7 +1267,10 @@ https://route.transcode.cfd/m3u8-proxy.m3u8?data=Vv1tAuWbXB1uW2gYWIWD0kHB7Dq40z5
           expect(res.headers.get("content-type")).toContain("mpegurl");
           const text = await res.text();
           expect(text).toContain("#EXTM3U");
-          expect(text).toContain("/proxy-chunk?url=");
+          // Cosmetic media extension on segment URLs (strict-client
+          // allowed_extensions) — filename ignored by the handler. The
+          // child here is itself a playlist, so it keeps an .m3u8 name.
+          expect(text).toContain("/proxy-chunk/segment.m3u8?url=");
           expect(text).toContain(encodeURIComponent(`http://localhost:${server.port}/chunk.m3u8?data=123`));
         } finally {
           scraperService.extractStream = origExtract;

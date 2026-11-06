@@ -392,7 +392,9 @@ describe("/scrape-video Endpoint", () => {
       );
       expect(res.status).toBe(302);
       const location = res.headers.get("location") || "";
-      expect(location).toContain("/proxy-chunk?url=");
+      // Cosmetic media extension: strict HLS/ffmpeg clients refuse segment
+      // URLs without one; the filename itself is ignored by the handler.
+      expect(location).toContain("/proxy-chunk/segment.mp4?url=");
       expect(location).toContain("movie.mkv");
     } finally {
       videoScraperService.extractVideo = origExtract;

@@ -36,8 +36,14 @@ export function proxyChunkUrl(
   targetUrl: string,
   query: string,
 ): string {
-  const m = targetUrl.match(/\.(ts|m4s|mp4)(\?|$)/i);
-  const ext = m?.[1]?.toLowerCase() === "ts" ? "ts" : "mp4";
+  // % also terminates the match: wrapped URLs (megacloud ts-proxy) carry the
+  // real extension URL-encoded inside the query (…seg-1.ts%26headers=…), and
+  // TS content should keep the .ts name rather than fall back to .mp4.
+  // .m3u8 keeps nested-playlist children semantically named (ffmpeg's hls
+  // demuxer re-parses those by content, and the extension is allowlisted).
+  const m = targetUrl.match(/\.(ts|m4s|mp4|m3u8)(\?|%|$)/i);
+  const raw = m?.[1]?.toLowerCase();
+  const ext = raw === "ts" ? "ts" : raw === "m3u8" ? "m3u8" : "mp4";
   return `${requestOrigin}/proxy-chunk/segment.${ext}?${query}`;
 }
 

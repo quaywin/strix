@@ -248,7 +248,6 @@ export class VideoScraperService {
    */
   private async harvestVariantPlaylists(
     payload: CachedVideoPayload,
-    signal?: AbortSignal,
   ): Promise<number> {
     const headers = this.pickForwardableHeaders(payload.video.headers);
     const visited = new Set<string>();
@@ -262,7 +261,7 @@ export class VideoScraperService {
       bodyText: string | null,
       depth: number,
     ): Promise<void> => {
-      if (visited.has(url) || visited.size >= 10 || signal?.aborted) return;
+      if (visited.has(url) || visited.size >= 10) return;
       // Bound total wall time: worst-case per-URL retry chains (2 × 15s
       // timeouts + backoff) across 10 URLs would otherwise outlive the
       // server's idle timeout and strand the requesting player.
@@ -276,7 +275,7 @@ export class VideoScraperService {
       if (text === null) {
         // 2 attempts at scrape time; play-time fetches keep the 3-attempt budget.
         try {
-          text = await this.fetchPlaylistText(url, headers, signal, 2);
+          text = await this.fetchPlaylistText(url, headers, undefined, 2);
         } catch (e) {
           logger.warn(
             `Variant playlist harvest failed for ${url.slice(0, 120)}: ${(e as Error).message}`,
@@ -330,7 +329,6 @@ export class VideoScraperService {
         }
         for (const childUrl of children) {
           await harvestOne(childUrl, null, depth + 1);
-          if (signal?.aborted) return;
           await Bun.sleep(300);
         }
       }
@@ -647,9 +645,13 @@ export class VideoScraperService {
     }
 
     // Variant playlists must be cached before the payload is stored — see
-    // harvestVariantPlaylists for why this happens at scrape time.
+    // harvestVariantPlaylists for why this happens at scrape time. Deliberately
+    // NOT tied to the client signal: a player that times out mid-scrape must
+    // not skip the harvest, and must never trip the honest-404 path below —
+    // that would negative-cache a perfectly healthy source for 30s and 404
+    // the very next viewer. The 45s budget bounds the extra work.
     if (format === "m3u8") {
-      const harvested = await this.harvestVariantPlaylists(payload, signal);
+      const harvested = await this.harvestVariantPlaylists(payload);
       if (harvested === 0) {
         // The synthesized master routes every variant through /playlist, so
         // a payload whose playlists are all server-side unfetchable is
