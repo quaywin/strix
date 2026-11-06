@@ -206,6 +206,23 @@ export function buildMasterPlaylistWithSubtitles(
         continue;
       }
 
+      // I-frame preview playlists: same treatment as variants so players
+      // that support scrub previews fetch them through strix too.
+      if (trimmed.startsWith("#EXT-X-I-FRAME-STREAM-INF:")) {
+        const uri = trimmed.match(/URI="([^"]+)"/i)?.[1];
+        if (uri && options.proxySegmentUrl) {
+          try {
+            const absoluteUrl = resolveUrlWithBaseParams(uri, videoUrl);
+            resultLines.push(
+              trimmed.replace(/URI="([^"]+)"/i, `URI="${options.proxySegmentUrl(absoluteUrl)}"`),
+            );
+            continue;
+          } catch {}
+        }
+        resultLines.push(line);
+        continue;
+      }
+
       // Handle variant URI lines
       if (!trimmed.startsWith("#")) {
         try {
@@ -220,16 +237,18 @@ export function buildMasterPlaylistWithSubtitles(
         continue;
       }
 
-      // Upstream subtitle rendition tags: make their URI absolute so the
-      // browser resolves them against the CDN, not against our origin.
-      // Deliberately NOT wrapped in /proxy-sub — that endpoint returns a
-      // converted WebVTT file, which would corrupt a rendition *playlist*.
-      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=SUBTITLES/i.test(trimmed)) {
+      // Upstream audio/subtitle rendition playlists route through strix as
+      // well (they are playlists, so the /playlist handler rewrites their
+      // segments; raw /proxy-sub would corrupt them). Unreferenced groups
+      // stay in the manifest untouched, players ignore them.
+      if (trimmed.startsWith("#EXT-X-MEDIA:") && /TYPE=(SUBTITLES|AUDIO)/i.test(trimmed)) {
         const uri = extMediaAttr(trimmed, "URI");
-        if (uri) {
+        if (uri && options.proxySegmentUrl) {
           try {
-            const absoluteUri = resolveUrlWithBaseParams(uri, videoUrl);
-            resultLines.push(trimmed.replace(/URI="([^"]+)"/i, `URI="${absoluteUri}"`));
+            const wrappedUri = options.proxySegmentUrl(
+              resolveUrlWithBaseParams(uri, videoUrl),
+            );
+            resultLines.push(trimmed.replace(/URI="([^"]+)"/i, `URI="${wrappedUri}"`));
             continue;
           } catch {}
         }

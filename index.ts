@@ -538,13 +538,15 @@ export const handleScrapeVideo = async (
       return Response.redirect(directStreamUrl, 302);
     }
 
-    // HLS Stream (M3U8): Return synthesized HLS Master Playlist combining video variants + subtitles
+    // HLS Stream (M3U8): Return synthesized HLS Master Playlist combining video variants + subtitles.
+    // no-store: the master embeds short-lived upstream tokens (routed via
+    // /playlist), so a browser-cached copy would go stale within minutes.
     const playlistContent = extracted.masterPlaylist || "";
     return new Response(playlistContent, {
       status: 200,
       headers: {
         "Content-Type": "application/vnd.apple.mpegurl",
-        "Cache-Control": "public, max-age=21600",
+        "Cache-Control": "no-store",
         "Access-Control-Allow-Origin": "*",
       },
     });

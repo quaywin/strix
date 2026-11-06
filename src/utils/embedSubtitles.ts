@@ -13,28 +13,28 @@ import type { RawSubtitleCandidate } from "./subtitles";
  */
 const SUB_CACHE_BASE = "https://cache.vdrk.site/v2";
 
-/** Language file names observed on the subtitle cache (capitalized labels). */
-export const SUB_CACHE_LANGUAGES = [
-  "Vietnamese",
-  "English",
-  "Spanish",
-  "Arabic",
-  "French",
-  "German",
-  "Japanese",
-  "Korean",
-  "Chinese",
-  "Portuguese",
-  "Italian",
-  "Indonesian",
-  "Thai",
-  "Hindi",
-  "Turkish",
-  "Russian",
-  "Filipino",
-  "Dutch",
-  "Polish",
-  "Malay",
+/** Language files observed on the subtitle cache, with ISO codes. */
+export const SUB_CACHE_LANGUAGES: ReadonlyArray<{ file: string; code: string }> = [
+  { file: "Vietnamese", code: "vi" },
+  { file: "English", code: "en" },
+  { file: "Spanish", code: "es" },
+  { file: "Arabic", code: "ar" },
+  { file: "French", code: "fr" },
+  { file: "German", code: "de" },
+  { file: "Japanese", code: "ja" },
+  { file: "Korean", code: "ko" },
+  { file: "Chinese", code: "zh" },
+  { file: "Portuguese", code: "pt" },
+  { file: "Italian", code: "it" },
+  { file: "Indonesian", code: "id" },
+  { file: "Thai", code: "th" },
+  { file: "Hindi", code: "hi" },
+  { file: "Turkish", code: "tr" },
+  { file: "Russian", code: "ru" },
+  { file: "Filipino", code: "fil" },
+  { file: "Dutch", code: "nl" },
+  { file: "Polish", code: "pl" },
+  { file: "Malay", code: "ms" },
 ];
 
 export interface EmbedVideoIdentity {
@@ -80,12 +80,14 @@ export function parseEmbedVideoIdentity(
 }
 
 /**
- * Builds probe candidates for the static subtitle cache. Order matters:
+ * Builds probe candidates for the static subtitle cache, limited to the
+ * configured language codes ("*" = all known files). Order matters:
  * Vietnamese first so the shared default-track preference (vi > en > first)
  * picks it when present.
  */
 export function buildVdrkSubtitleCandidates(
   embedUrl: string,
+  allowedCodes?: string[] | "*",
 ): RawSubtitleCandidate[] {
   const identity = parseEmbedVideoIdentity(embedUrl);
   if (!identity) return [];
@@ -97,9 +99,15 @@ export function buildVdrkSubtitleCandidates(
         ? `${SUB_CACHE_BASE}/tv/${identity.tmdbId}/${identity.season}/${identity.episode}`
         : `${SUB_CACHE_BASE}/tv/${identity.tmdbId}`;
 
-  return SUB_CACHE_LANGUAGES.map((lang) => ({
-    url: `${base}/${lang}.vtt`,
-    label: lang,
+  const languages =
+    !allowedCodes || allowedCodes === "*"
+      ? SUB_CACHE_LANGUAGES
+      : SUB_CACHE_LANGUAGES.filter((l) => allowedCodes.includes(l.code));
+
+  return languages.map((lang) => ({
+    url: `${base}/${lang.file}.vtt`,
+    label: lang.file,
+    language: lang.code,
     isDefault: false,
   }));
 }

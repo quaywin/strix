@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { parseHlsSubtitleRenditions } from "../src/utils/m3u8";
+import {
+  buildMasterPlaylistWithSubtitles,
+  parseHlsSubtitleRenditions,
+} from "../src/utils/m3u8";
 import {
   buildVdrkSubtitleCandidates,
   parseEmbedVideoIdentity,
@@ -7,9 +10,68 @@ import {
 import {
   maybeFixMojibake,
   mergeHlsVttSegments,
+  filterTracksByLanguages,
   secondsToVttTimestamp,
   vttTimestampToSeconds,
+  type SubtitleTrack,
 } from "../src/utils/subtitles";
+
+describe("filterTracksByLanguages", () => {
+  const track = (lang: string): SubtitleTrack => ({
+    url: `https://x/${lang}.vtt`,
+    proxyUrl: `https://p/${lang}`,
+    label: lang.toUpperCase(),
+    language: lang,
+    format: "vtt",
+    default: false,
+  });
+
+  it("keeps only configured languages, case-insensitively", () => {
+    const filtered = filterTracksByLanguages(
+      [track("vi"), track("EN"), track("zh"), track("und")],
+      ["vi", "en"],
+    );
+    expect(filtered.map((t) => t.language)).toEqual(["vi", "EN"]);
+  });
+
+  it("treats '*' and empty lists as keep-all", () => {
+    const tracks = [track("vi"), track("zh")];
+    expect(filterTracksByLanguages(tracks, "*").length).toBe(2);
+    expect(filterTracksByLanguages(tracks, []).length).toBe(2);
+  });
+});
+
+describe("buildMasterPlaylistWithSubtitles passthrough", () => {
+  it("routes variants, audio/subtitle renditions and I-frame playlists through the proxy", () => {
+    const body = [
+      "#EXTM3U",
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",URI="audio-en.m3u8"',
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",URI="subs-en.m3u8"',
+      '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=80000,CODECS="avc1",URI="iframes-v1.txt"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=5000000,SUBTITLES="subs"',
+      "v1.m3u8",
+    ].join("\n");
+
+    const out = buildMasterPlaylistWithSubtitles(
+      "https://cdn.example.com/hls/master.m3u8",
+      [],
+      {
+        videoBody: body,
+        proxySegmentUrl: (u) => `https://strix.test/playlist?url=${encodeURIComponent(u)}`,
+      },
+    );
+
+    const wrap = (rel: string) =>
+      `https://strix.test/playlist?url=${encodeURIComponent(`https://cdn.example.com/hls/${rel}`)}`;
+    expect(out).toContain(`URI="${wrap("audio-en.m3u8")}"`);
+    expect(out).toContain(`URI="${wrap("subs-en.m3u8")}"`);
+    expect(out).toContain(`URI="${wrap("iframes-v1.txt")}"`);
+    expect(out).toContain(wrap("v1.m3u8"));
+    // No upstream URI is left relative (would resolve against strix's origin)
+    expect(out).not.toContain('URI="audio-en.m3u8"');
+    expect(out).not.toContain('URI="iframes-v1.txt"');
+  });
+});
 
 describe("maybeFixMojibake", () => {
   it("reverses Windows-1256 double-encoded Vietnamese captions", () => {
@@ -48,12 +110,28 @@ describe("parseEmbedVideoIdentity / buildVdrkSubtitleCandidates", () => {
     expect(movieSubs[0]!.url).toBe(
       "https://cache.vdrk.site/v2/movie/299534/Vietnamese.vtt",
     );
+    expect(movieSubs[0]!.language).toBe("vi");
 
     const tvSubs = buildVdrkSubtitleCandidates(
       "https://vidnest.fun/tv/119051/2/3",
     );
     expect(tvSubs[0]!.url).toBe(
       "https://cache.vdrk.site/v2/tv/119051/2/3/Vietnamese.vtt",
+    );
+  });
+
+  it("restricts probe candidates to configured language codes", () => {
+    const subs = buildVdrkSubtitleCandidates(
+      "https://vidnest.fun/movie/299534",
+      ["vi", "en"],
+    );
+    expect(subs.length).toBe(2);
+    expect(subs.map((s) => s.language)).toEqual(["vi", "en"]);
+    expect(subs[0]!.url).toBe(
+      "https://cache.vdrk.site/v2/movie/299534/Vietnamese.vtt",
+    );
+    expect(subs[1]!.url).toBe(
+      "https://cache.vdrk.site/v2/movie/299534/English.vtt",
     );
   });
 });

@@ -326,6 +326,20 @@ export function mergeHlsVttSegments(segments: string[]): string {
 }
 
 /**
+ * Keeps only tracks in the configured language codes ("*" = keep all).
+ * An empty list is treated as "*" so a typo in the config cannot silently
+ * disable subtitles altogether.
+ */
+export function filterTracksByLanguages(
+  tracks: SubtitleTrack[],
+  allowed: string[] | "*",
+): SubtitleTrack[] {
+  if (allowed === "*" || allowed.length === 0) return tracks;
+  const set = new Set(allowed);
+  return tracks.filter((t) => set.has(t.language.toLowerCase()));
+}
+
+/**
  * Normalizes an array of raw subtitle candidates:
  * - Deduplicates identical URLs
  * - Infers metadata

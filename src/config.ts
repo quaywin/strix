@@ -1,5 +1,19 @@
 import "dotenv/config";
 
+/**
+ * Parses SUBTITLE_LANGUAGES ("vi,en" | "*") into a filter spec.
+ * Empty/unset defaults to Vietnamese + English.
+ */
+function parseSubtitleLanguages(): string[] | "*" {
+  const raw = (process.env.SUBTITLE_LANGUAGES ?? "vi,en").trim();
+  if (raw === "*") return "*";
+  const codes = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return codes.length > 0 ? codes : "*";
+}
+
 export const CONFIG = {
   PORT: parseInt(process.env.PORT || "5005", 10),
   CHROME_PATH: process.env.CHROME_PATH || "",
@@ -48,4 +62,12 @@ export const CONFIG = {
     process.env.STREAM_REVALIDATE_MS || "45000",
     10,
   ),
+  // Subtitle languages to probe and expose to players ("vi,en" | "*").
+  // Restricting the list also shrinks the caption-cache probe on each
+  // fresh scrape (one request per language).
+  SUBTITLE_LANGUAGES: parseSubtitleLanguages(),
+  // Wyzie fallback (L2): consulted when the vdrk caption cache has no
+  // subtitles for a title. Returns direct SRT links — no key on the file
+  // URLs themselves, only on the search call. Empty key disables L2.
+  WYZIE_API_KEY: process.env.WYZIE_API_KEY || "",
 };

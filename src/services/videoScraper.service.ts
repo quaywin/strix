@@ -1,7 +1,11 @@
 import { CONFIG } from "../config";
 import { logger } from "../logger";
 import { scraperEngine } from "../scraper/ScraperEngine";
-import { buildVdrkSubtitleCandidates } from "../utils/embedSubtitles";
+import {
+  buildVdrkSubtitleCandidates,
+  parseEmbedVideoIdentity,
+} from "../utils/embedSubtitles";
+import { fetchWyzieSubtitles, wyzieToCandidates } from "../utils/wyzie";
 import { smartFetch } from "../utils/http";
 import {
   buildMasterPlaylistWithSubtitles,
@@ -12,6 +16,7 @@ import {
 import {
   maybeFixMojibake,
   mergeHlsVttSegments,
+  filterTracksByLanguages,
   srtToVtt,
   normalizeSubtitleTracks,
   type RawSubtitleCandidate,
@@ -52,6 +57,8 @@ interface CachedVideoPayload {
 export class VideoScraperService {
   private videoCache = new TtlCache<CachedVideoPayload>(CONFIG.VOD_CACHE_TTL_MS);
   private subCache = new TtlCache<string>(CONFIG.SUBTITLE_CACHE_TTL_MS);
+  /** Titles Wyzie had no subs for — protects the API quota on re-scrapes. */
+  private wyzieMissCache = new TtlCache<boolean>(24 * 60 * 60 * 1000);
   private inFlightScrapes = new Map<string, InFlightEntry<CachedVideoPayload>>();
 
   invalidateCache(url: string): boolean {
@@ -172,9 +179,17 @@ export class VideoScraperService {
     // declaration directly via the absolute-ized EXT-X-MEDIA passthrough),
     // but all tracks are exposed through the JSON API.
     const subtitles = isHls
-      ? this.normalizeCandidates(payload.subCandidates || [], requestOrigin, url)
+      ? filterTracksByLanguages(
+          this.normalizeCandidates(payload.subCandidates || [], requestOrigin, url),
+          CONFIG.SUBTITLE_LANGUAGES,
+        )
       : [];
-    const playlistSubs = subtitles.filter((t) => /\.(vtt|srt)($|\?)/i.test(t.url));
+    // Only raw subtitle files go into the synthesized playlist (their
+    // /proxy-sub URIs return WebVTT). Wyzie links declare their format via
+    // the query string instead of a file extension — accept both.
+    const playlistSubs = subtitles.filter((t) =>
+      /\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url),
+    );
 
     // Variant playlists on these CDNs hang or 404 when a browser fetches
     // them directly (anti-hotlink Referer checks, no CORS headers), so the
@@ -321,7 +336,11 @@ export class VideoScraperService {
     // video payload.
     if (format === "m3u8") {
       try {
-        const cacheCandidates = await this.probeVdrkSubtitleCache(url, signal);
+        const cacheCandidates = await this.probeVdrkSubtitleCache(
+          url,
+          signal,
+          CONFIG.SUBTITLE_LANGUAGES,
+        );
         if (cacheCandidates.length > 0) {
           payload.subCandidates = [
             ...(payload.subCandidates || []),
@@ -334,6 +353,30 @@ export class VideoScraperService {
           this.prefetchDefaultSubtitles(payload.subCandidates);
         }
       } catch (_) {}
+
+      // Wyzie fallback (L2): brand-new releases often have no captions on
+      // vdrk yet. Wyzie returns direct SRT links — registered as candidates
+      // without any download; /proxy-sub fetches+converts lazily when a
+      // player selects the track.
+      if (CONFIG.WYZIE_API_KEY && (payload.subCandidates?.length ?? 0) === 0) {
+        try {
+          const identity = parseEmbedVideoIdentity(url);
+          if (identity) {
+            const wyzieCandidates = await this.probeWyzieSubtitles(
+              identity,
+              CONFIG.SUBTITLE_LANGUAGES,
+              signal,
+            );
+            if (wyzieCandidates.length > 0) {
+              payload.subCandidates = wyzieCandidates;
+              logger.info(
+                `Wyzie fallback: ${wyzieCandidates.length} track(s) for: ${url}`,
+                "VideoScraperService",
+              );
+            }
+          }
+        } catch (_) {}
+      }
     }
 
     this.videoCache.set(cacheKey, payload, CONFIG.VOD_CACHE_TTL_MS);
@@ -458,6 +501,43 @@ export class VideoScraperService {
   }
 
   /**
+   * Wyzie fallback: one search call by TMDB id returning direct SRT links.
+   * Candidates are registered as-is (no download here) — /proxy-sub fetches
+   * and converts lazily when a player actually selects the track, and the
+   * result rides the 6h subtitle cache afterwards.
+   */
+  private async probeWyzieSubtitles(
+    identity: { tmdbId: string; season?: number; episode?: number },
+    allowedCodes: string[] | "*",
+    signal?: AbortSignal,
+  ): Promise<RawSubtitleCandidate[]> {
+    const apiKey = CONFIG.WYZIE_API_KEY;
+    if (!apiKey) return [];
+
+    const missKey = `wyzie:${identity.tmdbId}:${identity.season ?? 0}:${identity.episode ?? 0}`;
+    if (this.wyzieMissCache.get(missKey)) return [];
+
+    const subtitles = await fetchWyzieSubtitles(apiKey, {
+      tmdbId: identity.tmdbId,
+      season: identity.season,
+      episode: identity.episode,
+      languages: allowedCodes === "*" ? [] : allowedCodes,
+      signal,
+    });
+    const candidates = wyzieToCandidates(subtitles).slice(0, 3);
+    if (candidates.length === 0) {
+      this.wyzieMissCache.set(missKey, true);
+      return [];
+    }
+
+    logger.info(
+      `Wyzie fallback: ${candidates.length} direct link(s) (${subtitles.map((s) => s.language).join(",")})`,
+      "VideoScraperService",
+    );
+    return candidates;
+  }
+
+  /**
    * Probes the static vidnest-family subtitle cache (cache.vdrk.site) for
    * tracks matching the embed's TMDB identity. Cheap headers-only requests;
    * non-existent languages 404 and are silently dropped.
@@ -465,21 +545,28 @@ export class VideoScraperService {
   private async probeVdrkSubtitleCache(
     embedUrl: string,
     signal?: AbortSignal,
+    allowedCodes?: string[] | "*",
   ): Promise<RawSubtitleCandidate[]> {
-    const candidates = buildVdrkSubtitleCandidates(embedUrl);
+    const candidates = buildVdrkSubtitleCandidates(embedUrl, allowedCodes);
     if (candidates.length === 0) return [];
 
+    // Probe = GET + convert + cache in one pass. Cancelling the response
+    // body of parallel requests to the same host proved flaky under Bun's
+    // connection pool (one cancel reset the other request), and downloading
+    // anyway doubles as prefetch: the player's first subtitle request then
+    // hits the cache instead of the network.
     const results = await Promise.all(
       candidates.map(async (candidate) => {
         try {
-          const timeoutSignal = AbortSignal.timeout(6000);
+          const timeoutSignal = AbortSignal.timeout(8000);
           const combined = signal
             ? AbortSignal.any([signal, timeoutSignal])
             : timeoutSignal;
-          // Headers-only probe: cancel the body as soon as the status arrives
           const res = await fetch(candidate.url, { signal: combined });
           if (!res.ok) return null;
-          await res.body?.cancel().catch(() => {});
+          const vtt = srtToVtt(maybeFixMojibake(await res.text()));
+          if (!vtt.includes("-->")) return null;
+          this.subCache.set(candidate.url, vtt, CONFIG.SUBTITLE_CACHE_TTL_MS);
           return candidate;
         } catch {
           return null;
