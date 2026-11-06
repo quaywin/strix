@@ -344,4 +344,78 @@ describe("/scrape-video Endpoint", () => {
       videoScraperService.extractVideo = origExtract;
     }
   });
+
+  it("falls back to the fallback URL when the primary scrape fails", async () => {
+    const origExtract = videoScraperService.extractVideo.bind(videoScraperService);
+    const calledUrls: string[] = [];
+    videoScraperService.extractVideo = (async (url: string) => {
+      calledUrls.push(url);
+      if (url === "https://vidnest.fun/movie/157336") {
+        throw new Error("No playable video source found on page");
+      }
+      return {
+        video: {
+          url: "https://s3.example.com/backup/movie.mkv",
+          format: "mkv",
+          headers: {},
+        },
+        subtitles: [],
+        extractedAt: Date.now(),
+      };
+    }) as typeof videoScraperService.extractVideo;
+
+    try {
+      const res = await app.handle(
+        new Request(
+          "http://localhost/scrape-video?url=https%3A%2F%2Fvidnest.fun%2Fmovie%2F157336&fallback=https%3A%2F%2Fplayer.videasy.ws%2Fembed%2Fmovie%2F157336&json=1",
+        ),
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.video.url).toBe("https://s3.example.com/backup/movie.mkv");
+      expect(data.streamUrl).toBe("https://s3.example.com/backup/movie.mkv");
+      expect(calledUrls).toEqual([
+        "https://vidnest.fun/movie/157336",
+        "https://player.videasy.ws/embed/movie/157336",
+      ]);
+    } finally {
+      videoScraperService.extractVideo = origExtract;
+    }
+  });
+
+  it("points wrapper URLs at the fallback page and keeps the fallback param for m3u8", async () => {
+    const origExtract = videoScraperService.extractVideo.bind(videoScraperService);
+    videoScraperService.extractVideo = (async (url: string) => {
+      if (url === "https://vidnest.fun/movie/157336") {
+        throw new Error("No playable video source found on page");
+      }
+      return {
+        video: {
+          url: "https://s3.example.com/backup/master.m3u8",
+          format: "m3u8",
+          headers: {},
+        },
+        subtitles: [],
+        masterPlaylist:
+          '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhttps://s3.example.com/backup/stream.m3u8',
+        extractedAt: Date.now(),
+      };
+    }) as typeof videoScraperService.extractVideo;
+
+    try {
+      const res = await app.handle(
+        new Request(
+          "http://localhost/scrape-video?url=https%3A%2F%2Fvidnest.fun%2Fmovie%2F157336&fallback=https%3A%2F%2Fplayer.videasy.ws%2Fembed%2Fmovie%2F157336&json=1",
+        ),
+      );
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.masterPlaylistUrl).toContain(
+        "url=" + encodeURIComponent("https://player.videasy.ws/embed/movie/157336"),
+      );
+      expect(data.masterPlaylistUrl).toContain("fallback=");
+    } finally {
+      videoScraperService.extractVideo = origExtract;
+    }
+  });
 });

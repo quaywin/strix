@@ -437,6 +437,7 @@ export const handleScrapeStream = async (
 export const handleScrapeVideo = async (
   query: {
     url?: string;
+    fallback?: string;
     proxy?: string;
     format?: string;
     json?: string;
@@ -448,7 +449,7 @@ export const handleScrapeVideo = async (
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, proxy, format, json, embed, is_embed, remux, t, seek } = query;
+  const { url, fallback, proxy, format, json, embed, is_embed, remux, t, seek } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -463,14 +464,41 @@ export const handleScrapeVideo = async (
   const requestOrigin = getRequestOrigin(request);
 
   try {
-    const extracted = await videoScraperService.extractVideo(
-      url,
-      requestOrigin,
-      wantEmbed,
-      request.signal,
-      false,
-      wantProxy,
-    );
+    // Primary scrape; on failure fall back to the backup page URL (e.g.
+    // videasy.ws) before giving up. Client aborts are never retried.
+    let effectiveUrl = url;
+    let extracted;
+    try {
+      extracted = await videoScraperService.extractVideo(
+        url,
+        requestOrigin,
+        wantEmbed,
+        request.signal,
+        false,
+        wantProxy,
+      );
+    } catch (primaryErr: any) {
+      if (
+        !fallback ||
+        request.signal?.aborted ||
+        primaryErr?.name === "AbortError"
+      ) {
+        throw primaryErr;
+      }
+      logger.warn(
+        `Primary VOD scrape failed for ${url} (${primaryErr?.message}); trying fallback ${fallback}`,
+        "ScrapeVideo",
+      );
+      effectiveUrl = fallback;
+      extracted = await videoScraperService.extractVideo(
+        fallback,
+        requestOrigin,
+        wantEmbed,
+        request.signal,
+        false,
+        wantProxy,
+      );
+    }
 
     const isM3u8 =
       extracted.video.format === "m3u8" ||
@@ -483,15 +511,20 @@ export const handleScrapeVideo = async (
     const isMpd = extracted.video.format === "mpd";
     const directStreamUrl =
       wantProxy && !isMpd
-        ? `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(url)}`
+        ? `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(extracted.video.url)}&referer=${encodeURIComponent(effectiveUrl)}`
         : extracted.video.url;
 
     if (wantJson) {
+      // Wrapper URLs point at whichever page actually yielded the stream, and
+      // carry the fallback along so wrapper routes keep failing over too.
+      const fallbackParam = fallback
+        ? `&fallback=${encodeURIComponent(fallback)}`
+        : "";
       const masterUrl = isM3u8
-        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(url)}${wantEmbed ? "&embed=true" : ""}${wantProxy ? "&proxy=true" : ""}`
+        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}${wantProxy ? "&proxy=true" : ""}`
         : undefined;
 
-      const remuxUrl = `${requestOrigin}/scrape-video/remux.mkv?url=${encodeURIComponent(url)}${wantEmbed ? "&embed=true" : ""}`;
+      const remuxUrl = `${requestOrigin}/scrape-video/remux.mkv?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}`;
 
       return new Response(
         JSON.stringify({
@@ -886,5 +919,3 @@ scraperService
   .warmup()
   .then(() => logger.info("Browser context ready (warmup complete)", "App"))
   .catch((e) => logger.error("Browser warmup failed", "App", e));
-
-
