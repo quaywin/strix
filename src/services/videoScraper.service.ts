@@ -6,7 +6,7 @@ import {
   parseEmbedVideoIdentity,
 } from "../utils/embedSubtitles";
 import { fetchWyzieSubtitles, wyzieToCandidates } from "../utils/wyzie";
-import { smartFetch } from "../utils/http";
+import { curlFetch, DEFAULT_USER_AGENT, smartFetch } from "../utils/http";
 import {
   buildMasterPlaylistWithSubtitles,
   parseHlsSubtitleRenditions,
@@ -53,6 +53,12 @@ interface CachedVideoPayload {
   isNotFound?: boolean;
   /** Raw candidates from the master body + caption cache; normalized per-request. */
   subCandidates?: RawSubtitleCandidate[];
+  /**
+   * Variant playlist URLs whose bodies were harvested (and cached in
+   * variantBodies) at scrape time — kept so invalidateCache can purge them
+   * together with the payload.
+   */
+  variantUrls?: string[];
 }
 
 /**
@@ -67,11 +73,36 @@ const HLS_MARKER_RE = /#EXTM3U|#EXTINF|#EXT-X-/;
 export class VideoScraperService {
   private videoCache = new TtlCache<CachedVideoPayload>(CONFIG.VOD_CACHE_TTL_MS);
   private subCache = new TtlCache<string>(CONFIG.SUBTITLE_CACHE_TTL_MS);
+  /**
+   * Variant playlists downloaded at scrape time, keyed by their absolute
+   * upstream URL. Serving them from memory removes the play-time refetch —
+   * historically the step that died first when a proxy entered its
+   * disguised-error window. Bodies above MAX_VARIANT_CACHE_BYTES are served
+   * but not stored, bounding worst-case RAM at roughly entries × limit.
+   */
+  private variantBodies = new TtlCache<string>(CONFIG.VOD_CACHE_TTL_MS, 40);
   /** Titles Wyzie had no subs for — protects the API quota on re-scrapes. */
   private wyzieMissCache = new TtlCache<boolean>(24 * 60 * 60 * 1000);
   private inFlightScrapes = new Map<string, InFlightEntry<CachedVideoPayload>>();
 
+  /** Masters carry ~3 quality variants; anything beyond is redundant. */
+  private static readonly MAX_VARIANTS_PER_VOD = 3;
+  /** Playlists observed in the wild max out ~2.3MB; don't retain bigger. */
+  private static readonly MAX_VARIANT_CACHE_BYTES = 6 * 1024 * 1024;
+  /** Refuse to buffer responses larger than any real playlist. */
+  private static readonly MAX_PLAYLIST_FETCH_BYTES = 32 * 1024 * 1024;
+  /** Wall-clock cap so scrape+harvest stays under the 120s server idle timeout. */
+  private static readonly HARVEST_BUDGET_MS = 45_000;
+
   invalidateCache(url: string): boolean {
+    // Purge harvested variant bodies belonging to the dying payloads so a
+    // forced refresh never keeps serving the old token's playlists.
+    for (const suffix of ["", ":embed:true"]) {
+      const payload = this.videoCache.get(`vod:${url}${suffix}`);
+      for (const variantUrl of payload?.variantUrls || []) {
+        this.variantBodies.delete(variantUrl);
+      }
+    }
     return this.videoCache.deletePrefix(`vod:${url}`);
   }
 
@@ -91,62 +122,12 @@ export class VideoScraperService {
     const headers: Record<string, string> = {};
     if (referer) headers["referer"] = referer;
 
-    // Error pages can come back with 200/3xx statuses — never hand them to
-    // the player disguised as a playlist. Some upstreams (megacloud /proxy)
-    // omit the #EXTM3U header entirely while still being valid media
-    // playlists (EXTINF lines + segment URLs), so require any HLS tag.
-    const fetchAndValidate = async (): Promise<string> => {
-      const res = await smartFetch(playlistUrl, {
-        headers,
-        signal: signal || AbortSignal.timeout(15000),
-      });
-      if (!res.ok) {
-        throw new Error(`Upstream playlist fetch failed: HTTP ${res.status}`);
-      }
-      const text = await res.text();
-      if (!HLS_MARKER_RE.test(text)) {
-        throw new Error("Upstream playlist response is not an m3u8 document");
-      }
-      return text.includes("#EXTM3U") ? text : `#EXTM3U\n${text}`;
-    };
-
-    // Megacloud-family proxies respond to short bursts with the disguised
-    // error page above for a few seconds/minutes at a time. Retry with a
-    // small backoff before giving the player a 502 — a bare failure here
-    // kills playback outright, while the same token usually serves a valid
-    // playlist moments later.
-    const MAX_ATTEMPTS = 3;
-    const BACKOFF_MS = [1000, 2500];
-    let normalized: string | undefined;
-    let lastError: unknown;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      if (signal?.aborted) {
-        throw new DOMException("The operation was aborted", "AbortError");
-      }
-      try {
-        normalized = await fetchAndValidate();
-        break;
-      } catch (e) {
-        if (
-          signal?.aborted ||
-          (e as Error).name === "AbortError" ||
-          attempt === MAX_ATTEMPTS - 1
-        ) {
-          throw e;
-        }
-        lastError = e;
-        logger.warn(
-          `Playlist fetch attempt ${attempt + 1}/${MAX_ATTEMPTS} failed for ${playlistUrl.slice(0, 120)} (${(e as Error).message}); retrying in ${BACKOFF_MS[attempt]}ms`,
-          "VideoScraperService",
-        );
-        await Bun.sleep(BACKOFF_MS[attempt] ?? 2500);
-      }
-    }
-    if (normalized === undefined) {
-      throw lastError instanceof Error
-        ? lastError
-        : new Error("Upstream playlist fetch failed");
-    }
+    // Playlists harvested at scrape time are served straight from memory —
+    // no upstream request at all on the play path.
+    const harvested = this.variantBodies.get(playlistUrl);
+    const normalized = harvested
+      ? harvested
+      : await this.fetchPlaylistText(playlistUrl, headers, signal);
 
     // Two playlist shapes with different child-URL routing:
     // - nested MASTER (#EXT-X-STREAM-INF): its children are playlists too
@@ -162,6 +143,209 @@ export class VideoScraperService {
           ? `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`
           : `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`,
     });
+  }
+
+  /**
+   * Fetches an upstream playlist and returns it normalized (with an
+   * #EXTM3U header), retrying through the megacloud-family disguised-error
+   * window: those proxies answer bursts with HTTP 200 + an HTML error page
+   * rewritten to look like a playlist, usually for only seconds at a time.
+   * A bare failure here kills playback outright, so back off and retry
+   * before surfacing anything to the player.
+   */
+  private async fetchPlaylistText(
+    playlistUrl: string,
+    headers: Record<string, string>,
+    signal?: AbortSignal,
+    maxAttempts: number = 3,
+  ): Promise<string> {
+    const BACKOFF_MS = [1000, 2500];
+    let lastError: unknown;
+    // Prepare headers for both stacks: smartFetch applies these defaults
+    // itself, curlFetch does not.
+    const reqHeaders: Record<string, string> = { ...headers };
+    if (!reqHeaders["user-agent"]) reqHeaders["user-agent"] = DEFAULT_USER_AGENT;
+    if (playlistUrl.toLowerCase().includes(".m3u8")) {
+      reqHeaders["accept-encoding"] = "identity";
+    }
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      try {
+        // Alternate network stacks between attempts: the proxy sometimes
+        // answers non-browser TLS fingerprints with the disguised error
+        // page (HTTP 200, no HLS tags) — a status smartFetch's curl
+        // fallback never sees, so switch to curl's native stack explicitly.
+        const timeoutSignal = signal || AbortSignal.timeout(15000);
+        const res =
+          attempt > 0
+            ? await curlFetch(playlistUrl, reqHeaders, timeoutSignal)
+            : await smartFetch(playlistUrl, {
+                headers: reqHeaders,
+                signal: timeoutSignal,
+              });
+        if (!res.ok) {
+          throw new Error(`Upstream playlist fetch failed: HTTP ${res.status}`);
+        }
+        // /playlist is a public route — refusing oversized bodies here is
+        // what stops a misdirected ?url= from buffering a whole video into
+        // RAM. (Only a guard, not a guarantee: chunked responses carry no
+        // Content-Length to check.)
+        const contentLength = Number(res.headers.get("content-length") || 0);
+        if (contentLength > VideoScraperService.MAX_PLAYLIST_FETCH_BYTES) {
+          throw new Error(
+            `Upstream playlist too large: ${Math.round(contentLength / 1024 / 1024)}MB`,
+          );
+        }
+        const text = await res.text();
+        // Error pages can come back with 200/3xx statuses — never hand them
+        // to the player disguised as a playlist. Some upstreams (megacloud
+        // /proxy) omit the #EXTM3U header entirely while still being valid
+        // media playlists (EXTINF lines + segment URLs), so require any HLS
+        // tag.
+        if (!HLS_MARKER_RE.test(text)) {
+          throw new Error("Upstream playlist response is not an m3u8 document");
+        }
+        return text.includes("#EXTM3U") ? text : `#EXTM3U\n${text}`;
+      } catch (e) {
+        if (
+          signal?.aborted ||
+          (e as Error).name === "AbortError" ||
+          attempt === maxAttempts - 1
+        ) {
+          throw e;
+        }
+        lastError = e;
+        logger.warn(
+          `Playlist fetch attempt ${attempt + 1}/${maxAttempts} failed for ${playlistUrl.slice(0, 120)} (${(e as Error).message}); retrying in ${BACKOFF_MS[attempt] ?? 2500}ms`,
+          "VideoScraperService",
+        );
+        await Bun.sleep(BACKOFF_MS[attempt] ?? 2500);
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Upstream playlist fetch failed");
+  }
+
+  /**
+   * Downloads and caches the whole playlist chain immediately after a fresh
+   * scrape — the token is at its freshest and the player hasn't added its
+   * own request burst yet (the two together regularly trip the proxy's
+   * disguised-error window). Follows masters down to media playlists
+   * (this CDN nests them 2-3 levels) plus EXT-X-MEDIA renditions, so the
+   * play path's playlist fetches all come from memory. Doubles as
+   * end-to-end verification: a master can verify in-browser while every
+   * variant is server-side unfetchable — exactly the source shape that
+   * plays nothing. Best-effort: failures are logged and play time falls
+   * back to live fetching with retries.
+   */
+  private async harvestVariantPlaylists(
+    payload: CachedVideoPayload,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    const headers = this.pickForwardableHeaders(payload.video.headers);
+    const visited = new Set<string>();
+    let okCount = 0;
+    let totalBytes = 0;
+    let budgetExceeded = false;
+    const deadline = Date.now() + VideoScraperService.HARVEST_BUDGET_MS;
+
+    const harvestOne = async (
+      url: string,
+      bodyText: string | null,
+      depth: number,
+    ): Promise<void> => {
+      if (visited.has(url) || visited.size >= 10 || signal?.aborted) return;
+      // Bound total wall time: worst-case per-URL retry chains (2 × 15s
+      // timeouts + backoff) across 10 URLs would otherwise outlive the
+      // server's idle timeout and strand the requesting player.
+      if (Date.now() > deadline) {
+        budgetExceeded = true;
+        return;
+      }
+      visited.add(url);
+
+      let text = bodyText;
+      if (text === null) {
+        // 2 attempts at scrape time; play-time fetches keep the 3-attempt budget.
+        try {
+          text = await this.fetchPlaylistText(url, headers, signal, 2);
+        } catch (e) {
+          logger.warn(
+            `Variant playlist harvest failed for ${url.slice(0, 120)}: ${(e as Error).message}`,
+            "VideoScraperService",
+          );
+          return;
+        }
+      }
+
+      // Validate every body before caching — including the scrape-captured
+      // master. The engine's capture can accept a body on mpegurl
+      // content-type alone, which is exactly what the disguised error page
+      // presents; caching it would serve garbage to the player.
+      if (!HLS_MARKER_RE.test(text)) {
+        logger.warn(
+          `Harvest skipped non-HLS body for ${url.slice(0, 120)}`,
+          "VideoScraperService",
+        );
+        return;
+      }
+
+      if (text.length <= VideoScraperService.MAX_VARIANT_CACHE_BYTES) {
+        this.variantBodies.set(url, text);
+      }
+      okCount++;
+      totalBytes += text.length;
+
+      // Nested master: children (variants + EXT-X-MEDIA renditions) are
+      // playlists too and re-enter /playlist at play time — harvest one
+      // more level so the whole chain is served from memory. Sequential
+      // with a small gap: parallel bursts are what trips the proxy's
+      // abuse heuristics (a real player fetches one playlist at a time).
+      if (text.includes("#EXT-X-STREAM-INF") && depth < 2) {
+        const children: string[] = [];
+        for (const line of text.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("#EXT-X-MEDIA:")) {
+            const uri = trimmed.match(/URI="([^"]+)"/i)?.[1];
+            if (uri) {
+              try {
+                children.push(resolveUrlWithBaseParams(uri, url));
+              } catch {}
+            }
+            continue;
+          }
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          try {
+            children.push(resolveUrlWithBaseParams(trimmed, url));
+          } catch {}
+          if (children.length >= VideoScraperService.MAX_VARIANTS_PER_VOD) break;
+        }
+        for (const childUrl of children) {
+          await harvestOne(childUrl, null, depth + 1);
+          if (signal?.aborted) return;
+          await Bun.sleep(300);
+        }
+      }
+    };
+
+    const body = payload.video.body || "";
+    if (body.includes("#EXTM3U") || body.includes("#EXT-X-")) {
+      await harvestOne(payload.video.url, body, 0);
+    } else {
+      // Body-less DOM-src fallback: probe the stream URL server-side once
+      // (anti-hotlink hosts may refuse; logged, never fatal).
+      await harvestOne(payload.video.url, null, 0);
+    }
+
+    payload.variantUrls = [...visited];
+    logger.info(
+      `Harvested ${okCount}/${visited.size} playlist(s) (${Math.round(totalBytes / 1024)}KB${budgetExceeded ? ", budget exceeded — rest fetch live" : ""}) for: ${payload.video.url.slice(0, 100)}`,
+      "VideoScraperService",
+    );
+    return okCount;
   }
 
   /** Headers safe to forward upstream for our own playlist/segment fetches. */  private static readonly FORWARDABLE_HEADERS = [
@@ -325,6 +509,10 @@ export class VideoScraperService {
         }
         // Signed tokens died while cached — drop the entry and re-scrape
         // fresh below rather than handing a dead playlist to the player.
+        // The harvested variants share the token's fate; purge them too.
+        for (const variantUrl of cached.variantUrls || []) {
+          this.variantBodies.delete(variantUrl);
+        }
         this.videoCache.delete(cacheKey);
         logger.info(
           `Cached stream for ${url} has dead tokens; re-scraping fresh`,
@@ -450,6 +638,29 @@ export class VideoScraperService {
 
       if (payload.subCandidates && payload.subCandidates.length > 0) {
         this.prefetchDefaultSubtitles(payload.subCandidates);
+      }
+    }
+
+    // Variant playlists must be cached before the payload is stored — see
+    // harvestVariantPlaylists for why this happens at scrape time.
+    if (format === "m3u8") {
+      const harvested = await this.harvestVariantPlaylists(payload, signal);
+      if (harvested === 0) {
+        // The synthesized master routes every variant through /playlist, so
+        // a payload whose playlists are all server-side unfetchable is
+        // guaranteed-dead playback ("loads, never plays"). Fail honestly so
+        // the caller's fallback page gets its turn; negative-cache briefly
+        // to avoid hammering re-scrape loops.
+        this.videoCache.set(
+          cacheKey,
+          {
+            video: { url: "", format: "m3u8", headers: {} },
+            extractedAt: Date.now(),
+            isNotFound: true,
+          },
+          30000,
+        );
+        throw new Error("No playable video source found on page");
       }
     }
 

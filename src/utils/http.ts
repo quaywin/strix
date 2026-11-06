@@ -110,7 +110,21 @@ export async function smartFetch(
     );
   }
 
-  // Fallback: spawn curl which uses native OS TLS stack (passes JA3/Iron Dome checks)
+  return curlFetch(url, headers, options.signal);
+}
+
+/**
+ * Fetch via spawned curl — the OS-native TLS stack passes JA3 / Iron Dome
+ * fingerprint checks that Bun's fetch fails on some anti-bot CDNs. Also the
+ * escape hatch when a proxy answers a soft block with HTTP 200 + garbage
+ * instead of a real error status (smartFetch's status-based fallback never
+ * triggers there).
+ */
+export async function curlFetch(
+  url: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<Response> {
   try {
     const args = ["curl", "-s", "-i", "-k", "-L", "--max-time", "30"];
     for (const [k, v] of Object.entries(headers)) {
@@ -120,8 +134,8 @@ export async function smartFetch(
 
     const proc = Bun.spawn(args);
 
-    if (options.signal) {
-      options.signal.addEventListener(
+    if (signal) {
+      signal.addEventListener(
         "abort",
         () => {
           try {
@@ -207,9 +221,9 @@ export async function smartFetch(
       headers: resHeaders,
     });
   } catch (err) {
-    if (options.signal?.aborted) {
+    if (signal?.aborted) {
       throw (
-        options.signal.reason ||
+        signal.reason ||
         new DOMException("The operation was aborted", "AbortError")
       );
     }
