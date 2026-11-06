@@ -92,13 +92,30 @@ export class VideoScraperService {
 
     const text = await res.text();
     // Error pages can come back with 200/3xx statuses — never hand them to
-    // the player disguised as a playlist.
-    if (!text.includes("#EXTM3U")) {
+    // the player disguised as a playlist. Some upstreams (megacloud /proxy)
+    // omit the #EXTM3U header entirely while still being valid media
+    // playlists (EXTINF lines + segment URLs), so require any HLS tag.
+    const hasPlaylistMarkers =
+      /#EXTM3U|#EXTINF|#EXT-X-/.test(text);
+    if (!hasPlaylistMarkers) {
       throw new Error("Upstream playlist response is not an m3u8 document");
     }
-    return rewriteM3u8Playlist(text, playlistUrl, {
+
+    const normalized = text.includes("#EXTM3U") ? text : `#EXTM3U\n${text}`;
+
+    // Two playlist shapes with different child-URL routing:
+    // - nested MASTER (#EXT-X-STREAM-INF): its children are playlists too
+    //   (variants, audio renditions) — they must re-enter /playlist so their
+    //   own segments get rewritten;
+    // - MEDIA playlist: every URI line is a segment — straight to
+    //   /proxy-chunk.
+    const isNestedMaster = normalized.includes("#EXT-X-STREAM-INF");
+    const refererParam = encodeURIComponent(referer || playlistUrl);
+    return rewriteM3u8Playlist(normalized, playlistUrl, {
       proxySegmentUrl: (targetUrl) =>
-        `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(referer || playlistUrl)}`,
+        isNestedMaster
+          ? `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`
+          : `${requestOrigin}/proxy-chunk?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`,
     });
   }
 
