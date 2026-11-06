@@ -686,7 +686,9 @@ export class ScraperEngine {
 
               const isM3u8 = isM3u8StreamUrl(reqUrl);
               const isDirectMedia =
-                /\.(mp4|mkv|webm|mpd)($|\?)/i.test(reqUrl) || type === "media";
+                /\.(mp4|mkv|webm|mpd)($|\?)/i.test(reqUrl) ||
+                isMpdStreamUrl(reqUrl) ||
+                type === "media";
               const isSegment = /\.(ts|m4s)($|\?)/i.test(reqUrl);
 
               if (isM3u8 || isDirectMedia) {
@@ -732,6 +734,7 @@ export class ScraperEngine {
                   contentType.includes("dash+xml") ||
                   /\.(m3u8|mp4|mkv|webm|mpd)($|\?)/i.test(resUrl) ||
                   isM3u8StreamUrl(resUrl) ||
+                  isMpdStreamUrl(resUrl) ||
                   (domVideoFallback && resUrl === domVideoFallback.url) ||
                   response.request().resourceType() === "media") &&
                 !isSegment &&
@@ -802,7 +805,6 @@ export class ScraperEngine {
             if (!cycleStartedAt) cycleStartedAt = now;
             if (
               !capturedVideo &&
-              !domVideoFallback &&
               now - cycleStartedAt >= SERVER_CYCLE_START_MS &&
               now - lastCycleAt >= SERVER_CYCLE_INTERVAL_MS
             ) {

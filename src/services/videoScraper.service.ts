@@ -310,6 +310,9 @@ export class VideoScraperService {
     );
 
     if (!videoReq) {
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
       // Negative cache for 30 seconds to protect against crawler spam
       this.videoCache.set(
         cacheKey,
