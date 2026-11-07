@@ -328,12 +328,26 @@ export function buildMasterPlaylistWithSubtitles(
         continue;
       }
 
+      // Header block: #EXTM3U, #EXT-X-VERSION, #EXT-X-INDEPENDENT-SEGMENTS.
+      // RFC 8216 requires EXT-X-INDEPENDENT-SEGMENTS to precede every Master
+      // Playlist Tag (EXT-X-MEDIA included), so subtitle lines must wait
+      // until the whole header has passed.
+      if (trimmed === "#EXTM3U" && !/^#EXT-X-VERSION/m.test(options.videoBody)) {
+        resultLines.push(line);
+        // fMP4/CODECS renditions need ≥6; 7 is safe for everything we emit.
+        resultLines.push("#EXT-X-VERSION:7");
+        continue;
+      }
+      const isHeaderTag =
+        trimmed.startsWith("#EXTM3U") ||
+        trimmed.startsWith("#EXT-X-VERSION") ||
+        trimmed.startsWith("#EXT-X-INDEPENDENT-SEGMENTS");
+
       // Insert subtitle media lines after header/version tags
       if (
         !insertedSubs &&
         hasSubtitles &&
-        !trimmed.startsWith("#EXTM3U") &&
-        !trimmed.startsWith("#EXT-X-VERSION")
+        !isHeaderTag
       ) {
         resultLines.push(subMediaLines);
         insertedSubs = true;

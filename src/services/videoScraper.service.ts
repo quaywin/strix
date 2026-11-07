@@ -498,6 +498,51 @@ export class VideoScraperService {
       }
     }
 
+    // Real movie duration: sum of EXTINF in the first video media playlist
+    // (its body is already in the harvest cache). Passed to the subtitle
+    // wrapper playlist so players derive a correct timeline instead of the
+    // legacy 86400s (24h) stub.
+    if (isHls && playlistSubs.length > 0) {
+      let durationSec = 0;
+      try {
+        const mediaUri = effectiveBody
+          .split(/\r?\n/)
+          .find((l) => l.trim() && !l.trim().startsWith("#"));
+        if (mediaUri) {
+          const mediaBody = this.variantBodies.get(
+            resolveUrlWithBaseParams(mediaUri.trim(), payload.video.url),
+          );
+          if (mediaBody) {
+            durationSec = [
+              ...mediaBody.matchAll(/#EXTINF:([0-9.]+)/g),
+            ].reduce((acc, m) => acc + parseFloat(m[1] ?? "0"), 0);
+          }
+        }
+      } catch {}
+      if (durationSec > 0) {
+        const rounded = Math.round(durationSec);
+        for (const t of playlistSubs) {
+          t.proxyUrl += `&duration=${rounded}`;
+        }
+      }
+      // Cosmetic .m3u8 on the rendition URL: ffmpeg/mpv hls demuxers reject
+      // subtitle renditions whose URI lacks a media extension ("Can't support
+      // the subtitle"), which makes the whole track invisible in IINA/iSTB.
+      // The filename is ignored by the /proxy-sub/:filename handler. ffmpeg
+      // reads the extension from the LAST dot of the URL, so dots in the
+      // query (wyzie token, hostnames) are percent-encoded to %2E — decoded
+      // back transparently server-side — to keep .m3u8 the last one.
+      for (const t of playlistSubs) {
+        const q = t.proxyUrl.indexOf("?");
+        const query = t.proxyUrl
+          .slice(q + 1)
+          .replace(/\./g, "%2E");
+        t.proxyUrl = `${t.proxyUrl
+          .slice(0, q)
+          .replace("/proxy-sub", "/proxy-sub/subs.m3u8")}?${query}`;
+      }
+    }
+
     const masterPlaylist = isHls
       ? buildMasterPlaylistWithSubtitles(
           payload.video.url,

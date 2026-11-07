@@ -576,6 +576,99 @@ export const handleScrapeVideo = async (
 // Once a host succeeds without Referer after an initial 403, we skip sending Referer for all future chunks on that host.
 export const stripRefererHosts = new Set<string>();
 
+const proxySubHandler = async (
+  query: {
+    url?: string;
+    referer?: string;
+    ua?: string;
+    duration?: string;
+    playlist?: string;
+  },
+  request: Request,
+): Promise<Response> => {
+  const subUrl = query.url;
+  if (!subUrl) {
+    return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const referer = query.referer;
+  const userAgent =
+    query.ua || request.headers.get("user-agent") || DEFAULT_USER_AGENT;
+  const wantPlaylist = query.playlist === "1";
+
+  try {
+    // HLS renditions must point at a media *playlist*, not a raw WebVTT
+    // document. The single-segment wrapper's content doesn't depend on the
+    // VTT payload, so it returns instantly — the caption itself is only
+    // fetched when the player requests the segment below.
+    if (wantPlaylist) {
+      const origin = getRequestOrigin(request);
+      const inner = new URLSearchParams({ url: subUrl });
+      if (referer) inner.set("referer", referer);
+      // .vtt cosmetic path: ffmpeg/libmpv hls demuxers only accept segments
+      // whose URL carries an allowlisted media extension. ffmpeg derives the
+      // extension from the LAST dot of the whole URL string, so every dot in
+      // the query (sub.wyzie.io, tok=3.…, vidnest.fun) must be percent-encoded
+      // (%2E is semantically identical) or it would override the cosmetic one.
+      const segmentUrl = `${origin}/proxy-sub/caption.vtt?${inner
+        .toString()
+        .replace(/\./g, "%2E")}`;
+      const duration = Number(query.duration);
+      const extInf =
+        Number.isFinite(duration) && duration > 0 ? duration : 86400;
+      const playlist = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        `#EXT-X-TARGETDURATION:${Math.ceil(extInf)}`,
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        `#EXTINF:${extInf.toFixed(3)},`,
+        segmentUrl,
+        "#EXT-X-ENDLIST",
+      ].join("\n");
+      return new Response(playlist, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "public, max-age=21600",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        },
+      });
+    }
+
+    const vtt = await videoScraperService.getSubtitle(
+      subUrl,
+      referer,
+      userAgent,
+      request.signal,
+    );
+
+    return new Response(vtt, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/vtt; charset=utf-8",
+        "Cache-Control": "public, max-age=21600",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      },
+    });
+  } catch (e: any) {
+    if (request.signal?.aborted || e.name === "AbortError") {
+      return new Response(null, { status: 499 });
+    }
+    return new Response(
+      JSON.stringify({ error: e.message || "Failed to load subtitle" }),
+      {
+        status: 502,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+  }
+};
+
 export const app = new Elysia()
   .use(cors({ origin: "*" }))
   .onError(({ code, error, request }) => {
@@ -640,78 +733,21 @@ export const app = new Elysia()
       );
     }
   })
+  // Subtitle routes: static cosmetic paths + param + plain, all sharing
+  // proxySubHandler directly (no redirect — ffmpeg's hls demuxer re-checks
+  // the allowed extension on the FINAL post-redirect URL, and the bare
+  // /proxy-sub target has no dot at all, which drops the whole track).
+  .get("/proxy-sub/subs.m3u8", async ({ query, request }) => {
+    return proxySubHandler(query, request);
+  })
+  .get("/proxy-sub/caption.vtt", async ({ query, request }) => {
+    return proxySubHandler(query, request);
+  })
+  .get("/proxy-sub/:filename", async ({ query, request }) => {
+    return proxySubHandler(query, request);
+  })
   .get("/proxy-sub", async ({ query, request }) => {
-    const subUrl = query.url;
-    if (!subUrl) {
-      return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-    const referer = query.referer;
-    const userAgent =
-      query.ua || request.headers.get("user-agent") || DEFAULT_USER_AGENT;
-    const wantPlaylist = query.playlist === "1";
-
-    try {
-      // HLS renditions must point at a media *playlist*, not a raw WebVTT
-      // document. The single-segment wrapper's content doesn't depend on the
-      // VTT payload, so it returns instantly — the caption itself is only
-      // fetched when the player requests the segment below.
-      if (wantPlaylist) {
-        const origin = getRequestOrigin(request);
-        const inner = new URLSearchParams({ url: subUrl });
-        if (referer) inner.set("referer", referer);
-        const segmentUrl = `${origin}/proxy-sub?${inner.toString()}`;
-        const playlist = [
-          "#EXTM3U",
-          "#EXT-X-VERSION:6",
-          "#EXT-X-PLAYLIST-TYPE:VOD",
-          "#EXT-X-TARGETDURATION:86400",
-          "#EXT-X-MEDIA-SEQUENCE:0",
-          "#EXTINF:86400.000,",
-          segmentUrl,
-          "#EXT-X-ENDLIST",
-        ].join("\n");
-        return new Response(playlist, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/vnd.apple.mpegurl",
-            "Cache-Control": "public, max-age=21600",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-          },
-        });
-      }
-
-      const vtt = await videoScraperService.getSubtitle(
-        subUrl,
-        referer,
-        userAgent,
-        request.signal,
-      );
-
-      return new Response(vtt, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/vtt; charset=utf-8",
-          "Cache-Control": "public, max-age=21600",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        },
-      });
-    } catch (e: any) {
-      if (request.signal?.aborted || e.name === "AbortError") {
-        return new Response(null, { status: 499 });
-      }
-      return new Response(
-        JSON.stringify({ error: e.message || "Failed to load subtitle" }),
-        {
-          status: 502,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-    }
+    return proxySubHandler(query, request);
   })
   // The :filename segment is cosmetic — strict HLS clients (ffmpeg/libmpv
   // allowed_extensions) refuse segment URLs that don't end in a media
