@@ -9,6 +9,7 @@ import { fetchWyzieSubtitles, wyzieToCandidates } from "../utils/wyzie";
 import { curlFetch, DEFAULT_USER_AGENT, smartFetch } from "../utils/http";
 import {
   buildMasterPlaylistWithSubtitles,
+  flattenMasterChain,
   parseHlsSubtitleRenditions,
   proxyChunkUrl,
   rewriteM3u8Playlist,
@@ -467,12 +468,42 @@ export class VideoScraperService {
     // fetches upstream and rewrites every segment through /proxy-chunk.
     const cdnReferer =
       this.pickForwardableHeaders(payload.video.headers).referer || url;
+
+    // Flatten nested master chains (master → variant master → media playlist)
+    // into a single-level master. VLC's adaptive demuxer cannot re-parse a
+    // representation that is itself a master playlist — it finds no segments
+    // and stalls forever — so players must never be handed an inner master.
+    // The harvest cache already holds the inner bodies, so this is free.
+    let effectiveBody = payload.video.body || "";
+    if (isHls && !effectiveBody.includes("#EXT-X-STREAM-INF")) {
+      // Body-less capture (direct-media classification): the harvest cached
+      // the stream URL's real body — use it when it's a master.
+      const topCached = this.variantBodies.get(payload.video.url);
+      if (topCached && topCached.includes("#EXT-X-STREAM-INF")) {
+        effectiveBody = topCached;
+      }
+    }
+    if (isHls && effectiveBody.includes("#EXT-X-STREAM-INF")) {
+      const flat = flattenMasterChain(
+        effectiveBody,
+        payload.video.url,
+        (u) => this.variantBodies.get(u),
+      );
+      if (flat) {
+        effectiveBody = flat;
+        logger.info(
+          `Flattened nested master chain (${effectiveBody.split("#EXT-X-STREAM-INF").length - 1} variant(s)) for: ${payload.video.url.slice(0, 100)}`,
+          "VideoScraperService",
+        );
+      }
+    }
+
     const masterPlaylist = isHls
       ? buildMasterPlaylistWithSubtitles(
           payload.video.url,
           playlistSubs,
           {
-            videoBody: payload.video.body,
+            videoBody: effectiveBody,
             proxySegmentUrl: (targetUrl: string) =>
               `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(cdnReferer)}`,
           },

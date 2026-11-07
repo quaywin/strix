@@ -31,6 +31,110 @@ export function resolveUrlWithBaseParams(uri: string, baseUrl: string): string {
  * handler; only the extension matters. .m4s is missing from older ffmpeg
  * allowlists, so everything non-.ts is normalized to .mp4.
  */
+/**
+ * Flattens a nested master chain (master → variant master → media playlist,
+ * as served by the oneroom/megacloud families) into a single-level master
+ * whose variant URIs point directly at the final media playlists. VLC's
+ * adaptive demuxer — unlike ffmpeg/lavf and hls.js — does not re-parse a
+ * representation that turns out to be another master playlist: it finds no
+ * segments and stalls forever ("Waiting sync reference"). Promotes any
+ * EXT-X-MEDIA AUDIO renditions declared at the inner level to the top.
+ *
+ * `getVariantBody` supplies the (harvest-cached) body of a variant URL.
+ * Returns a plain master text, or null when the input isn't a nested master
+ * (caller keeps its existing behavior).
+ */
+export function flattenMasterChain(
+  body: string,
+  baseUrl: string,
+  getVariantBody: (url: string) => string | undefined,
+): string | null {
+  if (!body.includes("#EXT-X-STREAM-INF")) return null;
+
+  const out: string[] = ["#EXTM3U", "#EXT-X-INDEPENDENT-SEGMENTS"];
+  const audioLines = new Set<string>();
+  const entries: string[] = [];
+  let pendingInf: string | null = null;
+  let flattenedAny = false;
+
+  for (const line of body.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.startsWith("#EXT-X-MEDIA:") && /TYPE=AUDIO/i.test(t)) {
+      audioLines.add(t);
+      continue;
+    }
+    if (t.startsWith("#EXT-X-STREAM-INF:")) {
+      pendingInf = t;
+      continue;
+    }
+    if (t.startsWith("#") || !t) continue;
+
+    let resolved: string;
+    try {
+      resolved = resolveUrlWithBaseParams(t, baseUrl);
+    } catch {
+      return null;
+    }
+
+    const child = getVariantBody(resolved);
+    if (child && child.includes("#EXT-X-STREAM-INF")) {
+      // Nested variant master: splice its qualities up one level.
+      let childInf: string | null = null;
+      for (const l2 of child.split(/\r?\n/)) {
+        const t2 = l2.trim();
+        if (t2.startsWith("#EXT-X-MEDIA:") && /TYPE=AUDIO/i.test(t2)) {
+          try {
+            const uri2 = t2.match(/URI="([^"]+)"/i)?.[1];
+            const abs2 = uri2
+              ? resolveUrlWithBaseParams(uri2, resolved)
+              : undefined;
+            audioLines.add(
+              abs2 ? t2.replace(/URI="[^"]+"/i, `URI="${abs2}"`) : t2,
+            );
+          } catch {
+            audioLines.add(t2);
+          }
+          continue;
+        }
+        if (t2.startsWith("#EXT-X-STREAM-INF:")) {
+          childInf = t2;
+          continue;
+        }
+        if (t2.startsWith("#") || !t2) continue;
+        let mediaUrl: string;
+        try {
+          mediaUrl = resolveUrlWithBaseParams(t2, resolved);
+        } catch {
+          continue;
+        }
+        entries.push(`${childInf ?? "#EXT-X-STREAM-INF:BANDWIDTH=2000000"}\n${mediaUrl}`);
+        flattenedAny = true;
+        childInf = null;
+      }
+    } else {
+      // Variant is already a media playlist — keep the outer pairing.
+      if (!pendingInf) return null;
+      entries.push(`${pendingInf}\n${resolved}`);
+    }
+    pendingInf = null;
+  }
+
+  if (!flattenedAny || entries.length === 0) return null;
+  for (const a of audioLines) out.push(a);
+  for (const e of entries) out.push(e);
+  return out.join("\n");
+}
+
+/**
+ * Builds a /proxy-chunk URL whose PATH carries a cosmetic media extension.
+ * Upstreams disguise segments as .xml/.js/.txt (and the disguise often IS
+ * the real extension now), but strict HLS clients — ffmpeg/libmpv-based
+ * players enforce an allowed_extensions list — refuse to load a segment
+ * whose URL ends in a non-media extension even when the bytes are valid
+ * fMP4/TS. The filename itself is ignored by the /proxy-chunk/:filename
+ * handler; only the extension matters. .m4s is missing from older ffmpeg
+ * allowlists, so everything non-.ts is normalized to .mp4.
+ */
 export function proxyChunkUrl(
   requestOrigin: string,
   targetUrl: string,
