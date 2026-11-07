@@ -646,7 +646,17 @@ const proxySubHandler = async (
       request.signal,
     );
 
-    return new Response(vtt, {
+    // Apple's HLS authoring spec requires every WebVTT segment to declare an
+    // X-TIMESTAMP-MAP so AVPlayer can position cues (tvOS/airOS players are
+    // strict about this — the same file plays fine in ffmpeg/VLC without it).
+    // LOCAL:0 ↔ MPEGTS:0 keeps cue times as-is for a single from-zero segment;
+    // ffmpeg/VLC ignore the map at offset 0, so nothing else changes.
+    const vttOut =
+      vtt.startsWith("WEBVTT") && !vtt.includes("X-TIMESTAMP-MAP")
+        ? vtt.replace(/^WEBVTT/, "WEBVTT\nX-TIMESTAMP-MAP:LOCAL:0,MPEGTS:0")
+        : vtt;
+
+    return new Response(vttOut, {
       status: 200,
       headers: {
         "Content-Type": "text/vtt; charset=utf-8",
