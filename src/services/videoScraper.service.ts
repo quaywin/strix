@@ -22,9 +22,15 @@ import {
   missingLanguages,
   srtToVtt,
   normalizeSubtitleTracks,
+  isWyzieSubtitleUrl,
   type RawSubtitleCandidate,
   type SubtitleTrack,
 } from "../utils/subtitles";
+import {
+  alignSubtitleCues,
+  applyVttTimeTransform,
+  type SubtitleSyncTransform,
+} from "../utils/subtitleSync";
 import { TtlCache } from "../utils/ttlCache";
 import { Semaphore } from "../utils/semaphore";
 import { runCoalesced, type InFlightEntry } from "../utils/inFlight";
@@ -72,9 +78,27 @@ interface CachedVideoPayload {
  */
 const HLS_MARKER_RE = /#EXTM3U|#EXTINF|#EXT-X-/;
 
+/** Normalized "label language" tag of a candidate, for language matching. */
+function candidateLangTag(c: RawSubtitleCandidate): string {
+  return `${c.label || ""} ${c.language || ""}`.toLowerCase();
+}
+
 export class VideoScraperService {
   private videoCache = new TtlCache<CachedVideoPayload>(CONFIG.VOD_CACHE_TTL_MS);
   private subCache = new TtlCache<string>(CONFIG.SUBTITLE_CACHE_TTL_MS);
+  /**
+   * Wyzie URL → calibrated linear time transform (see utils/subtitleSync).
+   * Keyed by the same raw-URL key as subCache; TTL matches it so neither
+   * outlives the other. subCache stores RAW text unconditionally and the
+   * transform is applied at READ time (applySyncTransform) — that split is
+   * what makes the invariant unbreakable: concurrent fetches of the same
+   * Wyzie URL can land in any order, but raw writes never poison anything
+   * and a transform landing after a cached fetch takes effect immediately
+   * on the next read.
+   */
+  private subtitleSyncCache = new TtlCache<SubtitleSyncTransform>(
+    CONFIG.SUBTITLE_CACHE_TTL_MS,
+  );
   /**
    * Variant playlists downloaded at scrape time, keyed by their absolute
    * upstream URL. Serving them from memory removes the play-time refetch —
@@ -85,6 +109,18 @@ export class VideoScraperService {
   private variantBodies = new TtlCache<string>(CONFIG.VOD_CACHE_TTL_MS, 40);
   /** Titles Wyzie had no subs for — protects the API quota on re-scrapes. */
   private wyzieMissCache = new TtlCache<boolean>(24 * 60 * 60 * 1000);
+  /**
+   * vdrk probe results (possibly empty) keyed by embedUrl+languages. The
+   * cache is slow (0.6-8s/file) and fresh scrapes re-probe the same TMDB id
+   * after VOD expiry — caching the outcome, including the empty one, turns
+   * those repeats into zero-network lookups.
+   */
+  private vdrkProbeCache = new TtlCache<RawSubtitleCandidate[]>(
+    15 * 60 * 1000,
+  );
+  /** Individual vdrk URLs known missing — shared by the probe and the
+   * sync-reference lookup so a learned 404 is never paid twice. */
+  private vdrkMissCache = new TtlCache<boolean>(15 * 60 * 1000);
   private inFlightScrapes = new Map<string, InFlightEntry<CachedVideoPayload>>();
 
   /** Masters carry ~3 quality variants; anything beyond is redundant. */
@@ -457,7 +493,7 @@ export class VideoScraperService {
         t.format !== "m3u8" &&
         !/\.m3u8($|[?&])/i.test(t.url) &&
         (/\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url) ||
-          /sub\.wyzie\.io/i.test(t.url) ||
+          isWyzieSubtitleUrl(t.url) ||
           t.format === "vtt" ||
           t.format === "srt"),
     );
@@ -564,18 +600,46 @@ export class VideoScraperService {
     };
   }
 
+  /**
+   * One calibration attempt per 5 minutes per payload on the cache-hit path.
+   * A transient failure at scrape time (network blip, reference 403) would
+   * otherwise pin misaligned Wyzie tracks for the payload's whole 6h TTL,
+   * even though a re-run is nearly free — subCache and vdrkProbeCache are
+   * warm and the targets filter skips URLs that already have a transform.
+   */
+  private calibrationRetryGate = new TtlCache<boolean>(5 * 60 * 1000);
+
+  private maybeRetryCalibration(
+    cacheKey: string,
+    embedUrl: string,
+    payload: CachedVideoPayload,
+  ): void {
+    if (!CONFIG.SUBTITLE_AUTO_SYNC) return;
+    if (this.calibrationRetryGate.get(cacheKey)) return;
+    const candidates = payload.subCandidates || [];
+    const hasPending = candidates.some(
+      (c) =>
+        isWyzieSubtitleUrl(c.url) &&
+        this.subtitleSyncCache.get(c.url) === undefined,
+    );
+    if (!hasPending) return;
+    this.calibrationRetryGate.set(cacheKey, true);
+    void this.runSubtitleCalibration(candidates, embedUrl).catch(() => {});
+  }
+
   async extractVideo(
     url: string,
     requestOrigin: string,
     isEmbed: boolean = false,
     signal?: AbortSignal,
     forceFresh: boolean = false,
+    server?: string,
   ): Promise<ExtractedVideoResult> {
     if (signal?.aborted) {
       throw new DOMException("The operation was aborted", "AbortError");
     }
 
-    const cacheKey = `vod:${url}${isEmbed ? ":embed:true" : ""}`;
+    const cacheKey = `vod:${url}${isEmbed ? ":embed:true" : ""}${server ? `:server:${server}` : ""}`;
 
     if (!forceFresh) {
       const cached = this.videoCache.get(cacheKey);
@@ -584,6 +648,7 @@ export class VideoScraperService {
           throw new Error("No playable video source found on page");
         }
         if (await this.isPayloadAlive(cached)) {
+          this.maybeRetryCalibration(cacheKey, url, cached);
           return this.formatResult(cached, url, requestOrigin, true);
         }
         // Signed tokens died while cached — drop the entry and re-scrape
@@ -604,7 +669,7 @@ export class VideoScraperService {
       this.inFlightScrapes,
       cacheKey,
       (scrapeSignal) =>
-        this.doExtractVideo(url, cacheKey, isEmbed, scrapeSignal),
+        this.doExtractVideo(url, cacheKey, isEmbed, scrapeSignal, server),
       signal,
       () =>
         logger.info(
@@ -620,14 +685,32 @@ export class VideoScraperService {
     cacheKey: string,
     isEmbed: boolean,
     signal?: AbortSignal,
+    server?: string,
   ): Promise<CachedVideoPayload> {
-    logger.info(`Scraping VOD for: ${url}`, "VideoScraperService");
+    logger.info(`Scraping VOD for: ${url}${server ? " (server: " + server + ")" : ""}`, "VideoScraperService");
+
+    // L1 caption-cache probe starts NOW, not after the browser scrape: it
+    // only needs the embed URL, and cache.vdrk.site is slow (0.6-8s observed
+    // per file). Racing it across the multi-second browser scrape hides that
+    // latency; the subtitle block below just joins the already-running
+    // promise. Direct-video sources whose URL happens to parse as a TMDB
+    // identity waste up to 8s of *background* fetches — accepted, they're
+    // rare and the result is simply discarded.
+    const identity = parseEmbedVideoIdentity(url);
+    const vdrkProbe = identity
+      ? this.probeVdrkSubtitleCache(
+          url,
+          signal,
+          CONFIG.SUBTITLE_LANGUAGES,
+        ).catch(() => [] as RawSubtitleCandidate[])
+      : null;
 
     const videoReq = await scraperEngine.collectVideo(
       url,
       CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
       isEmbed,
       signal,
+      server,
     );
 
     if (!videoReq) {
@@ -684,11 +767,56 @@ export class VideoScraperService {
       } catch (_) {}
     }
 
-    // Subtitle resolution: Wyzie Subtitles API is called directly by TMDB identity.
-    // It returns direct SRT links via a single fast JSON call (100-200ms) without pre-downloading
-    // full subtitle files during the scrape, maximizing speed.
+    // Subtitle resolution, L1 → L2:
+    // L1 — the vidnest-family static caption cache (cache.vdrk.site), keyed
+    // by TMDB id. Same ecosystem as the stream, so its captions are in sync
+    // with the video — probed before Wyzie so synced tracks win, and the
+    // GET doubles as prefetch for the player's first caption request.
+    // L2 — Wyzie Subtitles API is called directly by TMDB identity for
+    // whatever languages L1 lacks. It returns direct SRT links via a single
+    // fast JSON call (100-200ms) without pre-downloading full subtitle files
+    // during the scrape, maximizing speed.
     if (format === "m3u8") {
-      const identity = parseEmbedVideoIdentity(url);
+      // Join the probe started at the top of this method (see the comment
+      // there). The join is capped: if the probe outlives the browser scrape
+      // (cache.vdrk.site can hang towards its 8s timeout), waiting for it
+      // would put its whole tail latency on the response. A cap alone would
+      // silently drop the vdrk tracks from the payload for its whole 6h
+      // cache lifetime — so when the cap wins, the late result is merged
+      // into the (cached) payload the moment it lands: payload is the same
+      // object reference videoCache stores below.
+      if (vdrkProbe) {
+        try {
+          let capped = false;
+          const vdrkCandidates = await Promise.race([
+            vdrkProbe,
+            Bun.sleep(3000).then(() => {
+              capped = true;
+              return [] as RawSubtitleCandidate[];
+            }),
+          ]);
+          if (vdrkCandidates.length > 0) {
+            payload.subCandidates = [
+              ...vdrkCandidates,
+              ...(payload.subCandidates || []),
+            ];
+            logger.info(
+              `vdrk caption cache: ${vdrkCandidates.length} track(s) (${vdrkCandidates.map((c) => c.language).join(",")}) for: ${url}`,
+              "VideoScraperService",
+            );
+          }
+          if (capped) {
+            void vdrkProbe.then((late) => {
+              if (late.length === 0) return;
+              payload.subCandidates = [...late, ...(payload.subCandidates || [])];
+              logger.info(
+                `vdrk caption cache (late): +${late.length} track(s) merged into cached payload for: ${url}`,
+                "VideoScraperService",
+              );
+            });
+          }
+        } catch (_) {}
+      }
       if (CONFIG.WYZIE_API_KEY && identity) {
         const missing = missingLanguages(
           CONFIG.SUBTITLE_LANGUAGES,
@@ -717,6 +845,8 @@ export class VideoScraperService {
 
       if (payload.subCandidates && payload.subCandidates.length > 0) {
         this.prefetchDefaultSubtitles(payload.subCandidates);
+        // Fire-and-forget — must never delay the scrape or fail it.
+        this.calibrateWyzieSubtitles(payload.subCandidates, url);
       }
     }
 
@@ -751,6 +881,23 @@ export class VideoScraperService {
     return payload;
   }
 
+  /**
+   * Applies the calibrated linear time transform for `url`, if one exists.
+   * subCache holds RAW (uncalibrated) text only — the transform is a read-time
+   * concern (see the subtitleSyncCache field doc for why).
+   */
+  private applySyncTransform(url: string, vtt: string): string {
+    const t = this.subtitleSyncCache.get(url);
+    return t ? applyVttTimeTransform(vtt, t.scale, t.offset) : vtt;
+  }
+
+  /** Whether a calibrated time transform exists for this subtitle URL.
+   * /proxy-sub uses it to keep pre-calibration responses out of long-lived
+   * downstream HTTP caches (they are about to become stale). */
+  hasSubtitleSync(url: string): boolean {
+    return this.subtitleSyncCache.get(url) !== undefined;
+  }
+
   async getSubtitle(
     url: string,
     referer?: string,
@@ -759,7 +906,7 @@ export class VideoScraperService {
   ): Promise<string> {
     const cached = this.subCache.get(url);
     if (cached) {
-      return cached;
+      return this.applySyncTransform(url, cached);
     }
 
     const headers: Record<string, string> = {
@@ -797,7 +944,7 @@ export class VideoScraperService {
           const rawText = await retryRes.text();
           const vttText = await toVtt(rawText);
           this.subCache.set(url, vttText, CONFIG.SUBTITLE_CACHE_TTL_MS);
-          return vttText;
+          return this.applySyncTransform(url, vttText);
         }
       }
       throw new Error(`Failed to fetch subtitle: HTTP ${res.status}`);
@@ -806,7 +953,7 @@ export class VideoScraperService {
     const rawText = await res.text();
     const vttText = await toVtt(rawText);
     this.subCache.set(url, vttText, CONFIG.SUBTITLE_CACHE_TTL_MS);
-    return vttText;
+    return this.applySyncTransform(url, vttText);
   }
 
   /**
@@ -859,13 +1006,178 @@ export class VideoScraperService {
    */
   private prefetchDefaultSubtitles(candidates: RawSubtitleCandidate[]): void {
     const preferred = candidates.filter((c) => {
-      const tag = `${c.label || ""} ${c.language || ""}`.toLowerCase();
+      const tag = candidateLangTag(c);
       return /vietnamese|\bvi\b/.test(tag) || /english|\ben\b/.test(tag);
     });
     const targets = (preferred.length > 0 ? preferred : candidates).slice(0, 2);
     for (const candidate of targets) {
       void this.getSubtitle(candidate.url).catch(() => {});
     }
+  }
+
+  /**
+   * Fires calibration for every Wyzie track against one reference track that
+   * is known in sync with the video, in priority order:
+   * 1. an embedded rendition (muxed with the video, in sync by construction),
+   * 2. a vdrk caption-cache track (same vidnest ecosystem as the stream).
+   * The Wyzie track's language is by definition absent from both (Wyzie only
+   * fills missingLanguages), so alignment runs on cue onset times only, which
+   * are language-independent. Results land in subtitleSyncCache; the served
+   * text is transformed inside getSubtitle. Fire-and-forget: never blocks or
+   * fails the scrape.
+   */
+  private calibrateWyzieSubtitles(
+    candidates: RawSubtitleCandidate[],
+    embedUrl: string,
+  ): void {
+    if (!CONFIG.SUBTITLE_AUTO_SYNC) return;
+    void this.runSubtitleCalibration(candidates, embedUrl).catch(() => {});
+  }
+
+  private async runSubtitleCalibration(
+    candidates: RawSubtitleCandidate[],
+    embedUrl: string,
+  ): Promise<void> {
+    const targets = candidates
+      .filter(
+        (c) =>
+          !c.isRendition &&
+          (c.format === "srt" || c.format === "vtt") &&
+          isWyzieSubtitleUrl(c.url) &&
+          this.subtitleSyncCache.get(c.url) === undefined,
+      )
+      .slice(0, 3); // mirrors the Wyzie candidate cap
+    if (targets.length === 0) return;
+
+    // Reference candidates in confidence order: an embedded rendition is
+    // muxed with the video, the vdrk caption cache is the same ecosystem.
+    // These CDNs frequently reject server-side fetches and masters do ship
+    // forced-only renditions — a broken or sparse first reference must fall
+    // through to the next one, not kill calibration for every Wyzie track.
+    const refs: RawSubtitleCandidate[] = [];
+    const renditionRef = this.pickRenditionReference(
+      candidates.filter((c) => c.isRendition),
+    );
+    if (renditionRef) refs.push(renditionRef);
+    const vdrkRef = await this.findVdrkSyncReference(embedUrl, targets);
+    if (vdrkRef && !refs.some((r) => r.url === vdrkRef.url)) refs.push(vdrkRef);
+    if (refs.length === 0) return;
+
+    // prefetchDefaultSubtitles started fetching the first target's URL a
+    // moment ago with no in-flight dedup on subCache; a short stagger turns
+    // that lookup into a cache hit instead of a duplicate download.
+    await Bun.sleep(1500);
+
+    for (const ref of refs) {
+      let anyCalibrated = false;
+      for (const target of targets) {
+        if (this.subtitleSyncCache.get(target.url) !== undefined) continue;
+        // Sequential on purpose: each target's reference fetch is a subCache
+        // hit off the previous iteration, and parallel getSubtitle calls have
+        // no in-flight dedup (they would re-download the reference per target).
+        const ok = await this.calibrateSubtitleTrack(target, ref).catch(
+          () => false,
+        );
+        anyCalibrated = anyCalibrated || ok;
+      }
+      if (anyCalibrated) return;
+    }
+  }
+
+  /**
+   * English renditions are the densest dialogue tracks in practice. Forced/
+   * CC/SDH-labeled tracks carry only a handful of cues, so they are excluded
+   * from BOTH the preferred pick and the fallback — otherwise a forced-only
+   * rendition set would silently starve every alignment (not_enough_cues for
+   * all targets) when a dense sibling track was sitting right there.
+   */
+  private pickRenditionReference(
+    renditions: RawSubtitleCandidate[],
+  ): RawSubtitleCandidate | undefined {
+    const pool = renditions.filter((c) => !/forc|\bcc\b|sdh/i.test(candidateLangTag(c)));
+    const candidates = pool.length > 0 ? pool : renditions;
+    return (
+      candidates.find((c) => /english|\ben\b/i.test(candidateLangTag(c))) ??
+      candidates[0]
+    );
+  }
+
+  /**
+   * Probes the vdrk caption cache for a same-ecosystem sync reference. Only
+   * dense dialogue languages are worth the requests, and a language that a
+   * Wyzie target covers can't serve as its reference (the target exists
+   * precisely because that language was missing). Sequential-probe order
+   * keeps the common path at one or two requests — English nearly always
+   * exists when anything does.
+   */
+  private async findVdrkSyncReference(
+    embedUrl: string,
+    targets: RawSubtitleCandidate[],
+  ): Promise<RawSubtitleCandidate | null> {
+    const excludeLangs = new Set(
+      targets.map((t) => (t.language || "").toLowerCase()),
+    );
+    const preferred = ["en", "es", "fr", "pt", "de", "it", "ru"].filter(
+      (code) => !excludeLangs.has(code),
+    );
+    const candidates = buildVdrkSubtitleCandidates(embedUrl, preferred);
+    for (const candidate of candidates) {
+      // The L1 probe (probeVdrkSubtitleCache) may have already cached this
+      // track during the scrape — reuse it instead of refetching.
+      const cached = this.subCache.get(candidate.url);
+      if (cached && cached.includes("-->")) return candidate;
+      // Sequential on purpose (not probeVdrkSubtitleCache's parallel-all):
+      // cache.vdrk.site is slow, English — almost always present when
+      // anything is — usually ends this loop at the first request, and
+      // vdrkMissCache makes learned 404s free. A transport error just moves
+      // on to the next language.
+      try {
+        if (await this.fetchVdrkVtt(candidate)) return candidate;
+      } catch {}
+    }
+    return null;
+  }
+
+  /**
+   * Aligns one Wyzie track against the reference and stores the linear
+   * transform. Returns true when a transform was stored, false when the
+   * fetch failed or the gates rejected — callers use that to fall through
+   * to the next reference candidate. subCache keeps its RAW text — serving
+   * picks the transform up at read time (applySyncTransform).
+   */
+  private async calibrateSubtitleTrack(
+    target: RawSubtitleCandidate,
+    ref: RawSubtitleCandidate,
+  ): Promise<boolean> {
+    const [targetVtt, refVtt] = await Promise.all([
+      this.getSubtitle(target.url).catch(() => null),
+      this.getSubtitle(ref.url).catch(() => null),
+    ]);
+    if (!targetVtt || !refVtt) return false;
+
+    const result = alignSubtitleCues(refVtt, targetVtt, {
+      windowSec: CONFIG.SUBTITLE_SYNC_WINDOW_S,
+    });
+    const shortUrl = target.url.slice(0, 90);
+    if (!result.ok) {
+      const unchanged =
+        result.reason === "low_confidence" ||
+        result.reason === "not_better_than_identity" ||
+        result.reason === "already_synced";
+      logger.info(
+        `Subtitle sync: no transform for ${shortUrl} (${result.reason})${unchanged ? " — serving unchanged" : ""}`,
+        "SubtitleSync",
+      );
+      return false;
+    }
+
+    const t = result.transform;
+    this.subtitleSyncCache.set(target.url, t, CONFIG.SUBTITLE_CACHE_TTL_MS);
+    logger.info(
+      `Subtitle sync: calibrated ${shortUrl} scale=${t.scale.toFixed(6)} offset=${t.offset.toFixed(2)}s score=${(t.score * 100).toFixed(0)}% (identity ${(t.identityScore * 100).toFixed(0)}%, ${t.matched}/${t.total} cues)`,
+      "SubtitleSync",
+    );
+    return true;
   }
 
   /**
@@ -906,15 +1218,60 @@ export class VideoScraperService {
   }
 
   /**
+   * Fetches one vdrk caption file and caches the converted text into
+   * subCache. Returns null for a DEFINITIVE miss (404 / junk body) — that
+   * outcome is recorded in vdrkMissCache so the same URL is never re-fetched
+   * within the TTL. THROWS on transport failures (timeout, network, abort):
+   * callers must not treat those as misses, and the probe skips its result
+   * cache when any occur — a transient cache.vdrk.site outage must not
+   * freeze a 15-minute subtitle blackout into vdrkProbeCache.
+   */
+  private async fetchVdrkVtt(
+    candidate: RawSubtitleCandidate,
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    if (this.vdrkMissCache.get(candidate.url)) return null;
+    const timeoutSignal = AbortSignal.timeout(8000);
+    const combined = signal
+      ? AbortSignal.any([signal, timeoutSignal])
+      : timeoutSignal;
+    const res = await fetch(candidate.url, { signal: combined });
+    if (!res.ok) {
+      this.vdrkMissCache.set(candidate.url, true);
+      return null;
+    }
+    const vtt = srtToVtt(maybeFixMojibake(await res.text()));
+    if (!vtt.includes("-->")) {
+      this.vdrkMissCache.set(candidate.url, true);
+      return null;
+    }
+    this.subCache.set(candidate.url, vtt, CONFIG.SUBTITLE_CACHE_TTL_MS);
+    return vtt;
+  }
+
+  /**
    * Probes the static vidnest-family subtitle cache (cache.vdrk.site) for
-   * tracks matching the embed's TMDB identity. Cheap headers-only requests;
-   * non-existent languages 404 and are silently dropped.
+   * tracks matching the embed's TMDB identity; non-existent languages 404
+   * and are silently dropped.
    */
   private async probeVdrkSubtitleCache(
     embedUrl: string,
     signal?: AbortSignal,
     allowedCodes?: string[] | "*",
   ): Promise<RawSubtitleCandidate[]> {
+    const identity = parseEmbedVideoIdentity(embedUrl);
+    if (!identity) return [];
+
+    // Keyed by TMDB identity, not the raw embed URL: the primary-then-
+    // fallback scrape flow tries different embed providers for the same id,
+    // and the fallback's probe should reuse the primary's outcome instead of
+    // re-issuing the same slow GETs against cache.vdrk.site.
+    const probeKey = `vdrk:${identity.kind}:${identity.tmdbId}:${identity.season ?? 0}:${identity.episode ?? 0}|${
+      Array.isArray(allowedCodes) ? allowedCodes.join(",") : allowedCodes ?? "*"
+    }`;
+    const cachedProbe = this.vdrkProbeCache.get(probeKey);
+    if (cachedProbe) return cachedProbe;
+
     const candidates = buildVdrkSubtitleCandidates(embedUrl, allowedCodes);
     if (candidates.length === 0) return [];
 
@@ -923,26 +1280,26 @@ export class VideoScraperService {
     // connection pool (one cancel reset the other request), and downloading
     // anyway doubles as prefetch: the player's first subtitle request then
     // hits the cache instead of the network.
+    let transportFailed = false;
     const results = await Promise.all(
       candidates.map(async (candidate) => {
         try {
-          const timeoutSignal = AbortSignal.timeout(8000);
-          const combined = signal
-            ? AbortSignal.any([signal, timeoutSignal])
-            : timeoutSignal;
-          const res = await fetch(candidate.url, { signal: combined });
-          if (!res.ok) return null;
-          const vtt = srtToVtt(maybeFixMojibake(await res.text()));
-          if (!vtt.includes("-->")) return null;
-          this.subCache.set(candidate.url, vtt, CONFIG.SUBTITLE_CACHE_TTL_MS);
-          return candidate;
+          return (await this.fetchVdrkVtt(candidate, signal)) ? candidate : null;
         } catch {
+          transportFailed = true;
           return null;
         }
       }),
     );
 
-    return results.filter((c): c is RawSubtitleCandidate => c !== null);
+    const found = results.filter((c): c is RawSubtitleCandidate => c !== null);
+    // Don't persist an outcome tainted by transport errors or an aborted
+    // scrape — either would freeze a (partially) empty probe into the cache,
+    // a 15-minute subtitle blackout that no request path retries sooner.
+    if (!signal?.aborted && !transportFailed) {
+      this.vdrkProbeCache.set(probeKey, found);
+    }
+    return found;
   }
 }
 

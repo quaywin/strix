@@ -142,6 +142,43 @@ const SERVER_CYCLE_INTERVAL_MS = 4000;
 const SERVER_MENU_OPEN_WAIT_MS = 1200;
 
 /**
+ * Preferred server keywords in order of quality/reliability.
+ * On embed providers with a server picker (like vidnest/animanga), servers like
+ * Zeta (Upcloud/Megacloud multi-bitrate 1080p) or Prime (1080p) deliver full 1080p,
+ * while others (Filxer, Ophim, or default) often cap at 720p.
+ */
+export const PREFERRED_SERVER_KEYWORDS = [
+  "zeta",
+  "prime",
+  "upcloud",
+  "vidcloud",
+  "megacloud",
+  "lamda",
+];
+
+/**
+ * Extracts the highest horizontal resolution (width) declared in an HLS/DASH manifest.
+ * Used to distinguish 1080p streams (width >= 1920) from 720p streams (width ~1280-1728).
+ */
+export function getStreamMaxWidth(body?: string): number {
+  if (!body) return 0;
+  let maxWidth = 0;
+  for (const m of body.matchAll(/RESOLUTION=(\d+)x(\d+)/gi)) {
+    if (m[1]) {
+      const w = parseInt(m[1], 10);
+      if (w > maxWidth) maxWidth = w;
+    }
+  }
+  for (const m of body.matchAll(/width=["'](\d+)["']/gi)) {
+    if (m[1]) {
+      const w = parseInt(m[1], 10);
+      if (w > maxWidth) maxWidth = w;
+    }
+  }
+  return maxWidth;
+}
+
+/**
  * MPEG-DASH manifest detection (e.g. vidlink.pro serves clear-DASH .mpd).
  * Matches URLs whose path ends in .mpd (query string allowed after it).
  */
@@ -591,7 +628,7 @@ export class ScraperEngine {
               }
             });
           },
-          processFrame: async (frame) => {
+          processFrame: async (frame, s) => {
             // Poll and click play buttons; nudge player APIs
             await frame.evaluate((selectors: string[]) => {
               const btns = document.querySelectorAll(selectors.join(", "));
@@ -647,6 +684,7 @@ export class ScraperEngine {
     timeoutSec: number = 20,
     forceEmbed: boolean = false,
     signal?: AbortSignal,
+    preferredServer?: string,
   ): Promise<RequestData | null> {
     if (signal?.aborted) {
       return null;
@@ -661,10 +699,36 @@ export class ScraperEngine {
     return this.semaphore.run(async () => {
       let capturedVideo: RequestData | null = null;
       let domVideoFallback: RequestData | null = null;
+      let stagedFallbackVideo: RequestData | null = null;
+      let preferredServerAttempted = false;
+      let preferredServerChecking = false;
+      let preferredServerName = "";
+      let preferredServerSwitchedAt = 0;
+      let sessionStartedAt = 0;
       // Server-cycling state (shared across frames; only one frame acts per interval)
       let cycleStartedAt = 0;
       let lastCycleAt = 0;
       let cycleIndex = 0;
+
+      const serverKeywords = preferredServer
+        ? [preferredServer.toLowerCase(), ...PREFERRED_SERVER_KEYWORDS]
+        : PREFERRED_SERVER_KEYWORDS;
+
+      const isWaitingForPreferred = (): boolean => {
+        if (preferredServerChecking) return true;
+        if (preferredServer) {
+          if (!preferredServerAttempted) return sessionStartedAt === 0 || Date.now() - sessionStartedAt < 5000;
+          if (preferredServerSwitchedAt > 0) return Date.now() - preferredServerSwitchedAt < 3000;
+          return false;
+        }
+        if (preferredServerSwitchedAt > 0) {
+          return Date.now() - preferredServerSwitchedAt < 3000;
+        }
+        if (!preferredServerAttempted) {
+          return sessionStartedAt === 0 || Date.now() - sessionStartedAt < 4500;
+        }
+        return false;
+      };
 
       return await this.withScrapeSession(
         {
@@ -677,6 +741,7 @@ export class ScraperEngine {
           // Drain window that lets the m3u8 body attach to the captured video
           responseWaitMs: 1000,
           registerHandlers: (s) => {
+            sessionStartedAt = Date.now();
             s.page.route("**/*", (route) => {
               const req = route.request();
               const type = req.resourceType();
@@ -743,23 +808,45 @@ export class ScraperEngine {
               ).toLowerCase();
 
               // Direct media files (mp4, mkv, webm, or native media resource type)
+              // NOTE: .m3u8 and .mpd manifests must never be treated as direct media even if Chrome labels their resourceType as 'media'.
               const isDirectMedia =
-                /\.(mp4|mkv|webm)($|\?)/i.test(resUrl) ||
-                rType === "media" ||
-                (contentType.startsWith("video/") && !contentType.includes("mpegurl"));
+                !isM3u8StreamUrl(resUrl) &&
+                !isMpdStreamUrl(resUrl) &&
+                !contentType.includes("mpegurl") &&
+                !contentType.includes("dash+xml") &&
+                (/\.(mp4|mkv|webm)($|\?)/i.test(resUrl) ||
+                  rType === "media" ||
+                  contentType.startsWith("video/"));
 
               if (!capturedVideo && isDirectMedia) {
-                capturedVideo = {
+                const directData: RequestData = {
                   url: resUrl,
                   method: req.method(),
                   headers: req.headers(),
                   resource_type: req.resourceType(),
                   post_data: req.postData(),
                 };
-                console.log(
-                  `[SCRAPER-VOD] Verified working direct media stream (HTTP ${status}): ${resUrl}`,
-                );
-                s.markDone();
+                if (!isWaitingForPreferred()) {
+                  capturedVideo = directData;
+                  console.log(
+                    `[SCRAPER-VOD] Verified working direct media stream (HTTP ${status}): ${resUrl}`,
+                  );
+                  s.markDone();
+                } else if (!stagedFallbackVideo) {
+                  stagedFallbackVideo = directData;
+                  console.log(
+                    `[SCRAPER-VOD] Observed direct media; staging as fallback while checking preferred servers...`,
+                  );
+                  s.trackedTimeout(() => {
+                    if (!s.isDone() && !capturedVideo && stagedFallbackVideo) {
+                      capturedVideo = stagedFallbackVideo;
+                      console.log(
+                        `[SCRAPER-VOD] Timeout waiting for preferred 1080p server; accepting direct media fallback (HTTP ${status}): ${resUrl}`,
+                      );
+                      s.markDone();
+                    }
+                  }, 3000);
+                }
                 return;
               }
 
@@ -769,7 +856,7 @@ export class ScraperEngine {
               const isMpegUrl = contentType.includes("mpegurl");
               const isKnownM3u8 = isM3u8StreamUrl(resUrl);
               const isKnownMpd = isMpdStreamUrl(resUrl) || contentType.includes("dash+xml");
-              const isFetchOrXhr = rType === "fetch" || rType === "xhr";
+              const isFetchOrXhr = rType === "fetch" || rType === "xhr" || rType === "media";
               const isCandidate =
                 isKnownM3u8 ||
                 isKnownMpd ||
@@ -790,23 +877,49 @@ export class ScraperEngine {
                       ),
                     ]);
                     const trimmed = text.trim();
-                    const isHls = trimmed.startsWith("#EXTM3U") || isMpegUrl;
-                    const isMpd = trimmed.includes("<MPD") || isKnownMpd;
+                    const isHls = trimmed.startsWith("#EXTM3U") || (isMpegUrl && trimmed.includes("#EXT"));
+                    const isMpd = trimmed.includes("<MPD") || (isKnownMpd && trimmed.includes("<MPD"));
 
                     if (isHls || isMpd) {
+                      const maxWidth = getStreamMaxWidth(trimmed);
+                      const isHighQuality = maxWidth >= 1920;
+                      const candidateData: RequestData = {
+                        url: resUrl,
+                        method: req.method(),
+                        headers: req.headers(),
+                        resource_type: req.resourceType(),
+                        post_data: req.postData(),
+                        body: text,
+                      };
+
+                      const canAcceptImmediately =
+                        (isHighQuality && !preferredServer) ||
+                        (preferredServerSwitchedAt > 0 && isHighQuality) ||
+                        !isWaitingForPreferred();
+
                       if (!capturedVideo) {
-                        capturedVideo = {
-                          url: resUrl,
-                          method: req.method(),
-                          headers: req.headers(),
-                          resource_type: req.resourceType(),
-                          post_data: req.postData(),
-                          body: text,
-                        };
-                        console.log(
-                          `[SCRAPER-VOD] Verified working ${isHls ? "HLS (#EXTM3U body)" : "DASH (<MPD> body)"} stream (HTTP ${status}): ${resUrl}`,
-                        );
-                        s.markDone();
+                        if (canAcceptImmediately) {
+                          capturedVideo = candidateData;
+                          console.log(
+                            `[SCRAPER-VOD] Verified working ${isHighQuality ? "1080p+ " : ""}${isHls ? "HLS (#EXTM3U body)" : "DASH (<MPD> body)"} stream (HTTP ${status}, maxRes: ${maxWidth > 0 ? maxWidth + "w" : "stream"}${preferredServerName ? ", server: " + preferredServerName : ""}): ${resUrl}`,
+                          );
+                          s.markDone();
+                        } else {
+                          // Lower resolution or waiting for requested server: stage as fallback
+                          stagedFallbackVideo = candidateData;
+                          console.log(
+                            `[SCRAPER-VOD] Observed stream with maxRes: ${maxWidth > 0 ? maxWidth + "w" : "single-rendition"}; staging as fallback while checking preferred servers...`,
+                          );
+                          s.trackedTimeout(() => {
+                            if (!s.isDone() && !capturedVideo && stagedFallbackVideo) {
+                              capturedVideo = stagedFallbackVideo;
+                              console.log(
+                                `[SCRAPER-VOD] Timeout waiting for 1080p; accepting fallback stream (${maxWidth > 0 ? maxWidth + "w" : "stream"})`,
+                              );
+                              s.markDone();
+                            }
+                          }, 3000);
+                        }
                       } else if (capturedVideo.url === resUrl && !capturedVideo.body) {
                         capturedVideo.body = text;
                       }
@@ -817,7 +930,150 @@ export class ScraperEngine {
               }
             });
           },
-          processFrame: async (frame) => {
+          processFrame: async (frame, s) => {
+            // Proactive high-quality server selection:
+            // Check if embed has a ServerMenu. If so, proactively switch to top preferred server (Zeta, Prime, Upcloud...)
+            if (!preferredServerAttempted && !preferredServerChecking && !capturedVideo) {
+              const hasMenu = await frame
+                .evaluate(() =>
+                  Boolean(document.querySelector('[class*="ServerMenu"]')),
+                )
+                .catch(() => false);
+
+              if (hasMenu && !preferredServerAttempted && !preferredServerChecking) {
+                preferredServerChecking = true;
+                try {
+                  // Open menu if closed
+                  await frame
+                    .evaluate(() => {
+                      const menuButton = document.querySelector(
+                        '[class*="ServerMenu"][class*="menuButton"]',
+                      ) as HTMLElement | null;
+                      const menuContent = document.querySelector(
+                        '[class*="ServerMenu"][class*="menuContent"]',
+                      );
+                      if (
+                        menuButton &&
+                        (!menuContent ||
+                          menuContent.getBoundingClientRect().width === 0)
+                      ) {
+                        menuButton.click();
+                      }
+                    })
+                    .catch(() => {});
+
+                  // Small delay to allow menu animation/mounting
+                  await s.trackedSleep(400);
+
+                  const targetIdx = await frame
+                    .evaluate((keywords: string[]) => {
+                      const radios = Array.from(
+                        document.querySelectorAll('[class*="ServerMenu"]'),
+                      ).filter((el) => {
+                        const cls = String((el as HTMLElement).className);
+                        return (
+                          cls.includes("radio") &&
+                          !cls.includes("Label") &&
+                          !cls.includes("Group") &&
+                          !cls.includes("Sub") &&
+                          !cls.includes("Disabled")
+                        );
+                      }) as HTMLElement[];
+
+                      for (const kw of keywords) {
+                        const idx = radios.findIndex((r) =>
+                          (r.innerText || "").toLowerCase().includes(kw),
+                        );
+                        if (idx !== -1) return idx;
+                      }
+                      return -1;
+                    }, serverKeywords)
+                    .catch(() => -1);
+
+                  if (targetIdx > 0) {
+                    const switched = await frame
+                      .evaluate((idx: number) => {
+                        const radios = Array.from(
+                          document.querySelectorAll('[class*="ServerMenu"]'),
+                        ).filter((el) => {
+                          const cls = String((el as HTMLElement).className);
+                          return (
+                            cls.includes("radio") &&
+                            !cls.includes("Label") &&
+                            !cls.includes("Group") &&
+                            !cls.includes("Sub") &&
+                            !cls.includes("Disabled")
+                          );
+                        }) as HTMLElement[];
+                        const target = radios[idx];
+                        if (!target) return false;
+
+                        const eventOpts = {
+                          bubbles: true,
+                          cancelable: true,
+                          button: 0,
+                          buttons: 1,
+                        };
+                        target.dispatchEvent(
+                          new PointerEvent("pointerdown", {
+                            ...eventOpts,
+                            pointerId: 1,
+                            pointerType: "mouse",
+                            isPrimary: true,
+                          } as PointerEventInit),
+                        );
+                        target.dispatchEvent(new MouseEvent("mousedown", eventOpts));
+                        target.dispatchEvent(
+                          new PointerEvent("pointerup", {
+                            ...eventOpts,
+                            pointerId: 1,
+                            pointerType: "mouse",
+                            isPrimary: true,
+                          } as PointerEventInit),
+                        );
+                        target.dispatchEvent(new MouseEvent("mouseup", eventOpts));
+                        target.click();
+                        return (target.innerText || "").split("\n")[0]?.trim() || "";
+                      }, targetIdx)
+                      .catch(() => "");
+
+                    if (switched) {
+                      preferredServerName = switched;
+                      preferredServerSwitchedAt = Date.now();
+                      console.log(
+                        `[SCRAPER-VOD] Switched to preferred high-quality server: "${switched}" (radio #${targetIdx})`,
+                      );
+                      lastCycleAt = Date.now();
+                    }
+                  } else if (targetIdx === 0) {
+                    console.log(
+                      `[SCRAPER-VOD] Default server is already a preferred server (radio #0)`,
+                    );
+                    if (!capturedVideo && stagedFallbackVideo) {
+                      capturedVideo = stagedFallbackVideo;
+                      console.log(
+                        `[SCRAPER-VOD] Default server is already preferred; accepting staged stream immediately`,
+                      );
+                      s.markDone();
+                    }
+                  }
+                } finally {
+                  preferredServerAttempted = true;
+                  preferredServerChecking = false;
+                }
+              }
+            }
+
+            // If we have a staged stream, but we are no longer waiting for any preferred server,
+            // commit the staged stream immediately so we don't stall for the fallback timeout.
+            if (!capturedVideo && stagedFallbackVideo && !isWaitingForPreferred()) {
+              capturedVideo = stagedFallbackVideo;
+              console.log(
+                `[SCRAPER-VOD] No preferred server pending; accepting staged fallback immediately`,
+              );
+              s.markDone();
+            }
+
             // Stall recovery: cycle the embed's server picker when nothing loads.
             // Timed from the first frame tick so the default server gets its
             // SERVER_CYCLE_START_MS grace period before we start switching.
@@ -848,9 +1104,7 @@ export class ScraperEngine {
                 })
                 .catch(() => {});
               // 2) Let the menu finish animating before touching the radios
-              await new Promise((r) =>
-                setTimeout(r, SERVER_MENU_OPEN_WAIT_MS),
-              );
+              await s.trackedSleep(SERVER_MENU_OPEN_WAIT_MS);
               // 3) Dispatch a full pointer sequence on the next server radio.
               //    Start at index 1 — index 0 is the default server that already stalled.
               const switched = await frame.evaluate((idx: number) => {
@@ -949,6 +1203,19 @@ export class ScraperEngine {
                 `[SCRAPER-VOD] Observed video src from DOM: ${videoSrc}`,
               );
 
+              // On single-server players without a ServerMenu, the presence of videoSrc
+              // indicates playback has initialized and no server picker exists.
+              if (!preferredServerAttempted && !preferredServer) {
+                preferredServerAttempted = true;
+                if (stagedFallbackVideo && !capturedVideo) {
+                  capturedVideo = stagedFallbackVideo;
+                  console.log(
+                    `[SCRAPER-VOD] Video playback initialized on single-server embed; accepting staged stream immediately`,
+                  );
+                  s.markDone();
+                }
+              }
+
               // Allow up to 5s for the network response listener to capture verified working
               // stream headers/body, and for stall recovery to cycle servers if default is dead,
               // then markDone so the scraper doesn't stall for the full 20s timeout.
@@ -961,6 +1228,9 @@ export class ScraperEngine {
           },
         },
         () => {
+          if (!capturedVideo && stagedFallbackVideo) {
+            capturedVideo = stagedFallbackVideo;
+          }
           if (!capturedVideo && domVideoFallback) {
             capturedVideo = domVideoFallback;
           }

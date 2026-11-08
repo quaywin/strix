@@ -70,4 +70,17 @@ export const CONFIG = {
   // subtitles for a title. Returns direct SRT links — no key on the file
   // URLs themselves, only on the search call. Empty key disables L2.
   WYZIE_API_KEY: process.env.WYZIE_API_KEY || "",
+  // Auto-calibrate Wyzie subtitle tracks against an embedded HLS subtitle
+  // rendition from the same master (cue-onset alignment → linear scale+offset,
+  // then rewritten cue timings at serve time). Wyzie SRTs are synced to an
+  // arbitrary release of the movie — some are offset, some drift (fps
+  // mismatch). "false" serves Wyzie tracks untouched.
+  SUBTITLE_AUTO_SYNC: process.env.SUBTITLE_AUTO_SYNC !== "false",
+  // Search window in seconds (each direction) for the coarse onset-density
+  // alignment — must cover stream-cut differences (pre-roll/recap trims)
+  // without making the correlation scan quadratic in movie length.
+  // The `|| 120` catches non-numeric values: parseInt yields NaN there and
+  // NaN would silently disable every alignment downstream.
+  SUBTITLE_SYNC_WINDOW_S:
+    parseInt(process.env.SUBTITLE_SYNC_WINDOW_S || "120", 10) || 120,
 };

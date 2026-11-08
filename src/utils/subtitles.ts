@@ -127,6 +127,11 @@ export function isSubtitleAd(text: string): boolean {
   return SUBTITLE_AD_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+/** True when a candidate URL points at the Wyzie subtitle host. */
+export function isWyzieSubtitleUrl(url: string): boolean {
+  return /sub\.wyzie\.io/i.test(url);
+}
+
 /**
  * Converts SubRip (SRT) format to WebVTT format and purges promotional/ad cues:
  * - Strips UTF-8 BOM if present
@@ -309,15 +314,48 @@ export function vttTimestampToSeconds(ts: string): number | null {
 
 /** Formats seconds as a WebVTT timestamp "HH:MM:SS.mmm". */
 export function secondsToVttTimestamp(totalSec: number): string {
-  const clamped = Math.max(0, totalSec);
-  const hh = String(Math.floor(clamped / 3600)).padStart(2, "0");
-  const mm = String(Math.floor((clamped % 3600) / 60)).padStart(2, "0");
-  const ss = String(Math.floor(clamped % 60)).padStart(2, "0");
-  const ms = String(Math.round((clamped - Math.floor(clamped)) * 1000)).padStart(3, "0");
+  // Round once at millisecond resolution, then decompose — rounding per
+  // component lets a .9995s fraction spill into a "1000" millisecond field,
+  // producing an invalid ".1000" timestamp that strict parsers drop.
+  const totalMs = Math.max(0, Math.round(totalSec * 1000));
+  const hh = String(Math.floor(totalMs / 3600000)).padStart(2, "0");
+  const mm = String(Math.floor((totalMs % 3600000) / 60000)).padStart(2, "0");
+  const ss = String(Math.floor((totalMs % 60000) / 1000)).padStart(2, "0");
+  const ms = String(totalMs % 1000).padStart(3, "0");
   return `${hh}:${mm}:${ss}.${ms}`;
 }
 
-const VTT_CUE_TIMING = /(\d{1,2}:)?(\d{1,2}):(\d{2})\.(\d{3})\s*-->\s*(\d{1,2}:)?(\d{1,2}):(\d{2})\.(\d{3})/;
+// A WebVTT cue-timing line always STARTS with the start timestamp (leading
+// whitespace tolerated). Anchoring matters twice over: cue text that happens
+// to contain a timestamp-with-arrow must not be mistaken for a cue line, and
+// rewriting must not leave garbage when a malformed file glues the cue id to
+// its timings ("1 00:00:02.000 --> …") — an unanchored match there would let
+// the id's digits bleed into the rewritten milliseconds.
+const VTT_TIMING_LINE = /^\s*(\d{1,2}:)?(\d{1,2}):(\d{2})\.(\d{3})\s*-->\s*(\d{1,2}:)?(\d{1,2}):(\d{2})\.(\d{3})/;
+
+export interface CueTimingLine {
+  start: number;
+  end: number;
+  /** Everything after the matched timings — cue settings, normally "" or " align:start". */
+  rest: string;
+}
+
+/**
+ * Parses a WebVTT cue-timing line into seconds. Returns null for any line
+ * that does not start with a timestamp pair (cue ids, text, NOTE blocks).
+ */
+export function parseCueTimingLine(line: string): CueTimingLine | null {
+  const m = line.match(VTT_TIMING_LINE);
+  if (!m) return null;
+  const start = vttTimestampToSeconds(
+    `${m[1] ?? "00:"}${m[2] ?? ""}:${m[3] ?? ""}.${m[4] ?? "000"}`,
+  );
+  const end = vttTimestampToSeconds(
+    `${m[5] ?? "00:"}${m[6] ?? ""}:${m[7] ?? ""}.${m[8] ?? "000"}`,
+  );
+  if (start === null || end === null) return null;
+  return { start, end, rest: line.slice(m[0].length) };
+}
 
 /** Parses the LOCAL/MPEGTS offset mapping from an HLS WebVTT segment. */
 function parseTimestampMap(lines: string[]): number {
@@ -363,18 +401,13 @@ export function mergeHlsVttSegments(segments: string[]): string {
       const filtered = lines.filter((l) => !/^X-TIMESTAMP-MAP:/i.test(l));
       if (filtered.length === 0) continue;
 
-      const timingIdx = filtered.findIndex((l) => VTT_CUE_TIMING.test(l));
+      const timingIdx = filtered.findIndex((l) => parseCueTimingLine(l) !== null);
       if (timingIdx === -1) continue;
 
       const timingLine = filtered[timingIdx]!;
-      const m = timingLine.match(VTT_CUE_TIMING)!;
-      const startSec =
-        vttTimestampToSeconds(`${m[1] ?? "00:"}${m[2] ?? ""}:${m[3] ?? ""}.${m[4] ?? "000"}`) ?? 0;
-      const endSec =
-        vttTimestampToSeconds(`${m[5] ?? "00:"}${m[6] ?? ""}:${m[7] ?? ""}.${m[8] ?? "000"}`) ?? 0;
-
-      const newStart = startSec + segOffset;
-      const newEnd = endSec + segOffset;
+      const timing = parseCueTimingLine(timingLine)!;
+      const newStart = timing.start + segOffset;
+      const newEnd = timing.end + segOffset;
       if (newEnd <= newStart) continue;
 
       const body = filtered.slice(timingIdx + 1).join("\n");
@@ -383,9 +416,8 @@ export function mergeHlsVttSegments(segments: string[]): string {
       if (seen.has(key)) continue;
       seen.add(key);
 
-      const rest = timingLine.replace(VTT_CUE_TIMING, "");
       outBlocks.push(
-        `${secondsToVttTimestamp(newStart)} --> ${secondsToVttTimestamp(newEnd)}${rest}\n${body}`,
+        `${secondsToVttTimestamp(newStart)} --> ${secondsToVttTimestamp(newEnd)}${timing.rest}\n${body}`,
       );
     }
   }

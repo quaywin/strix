@@ -164,6 +164,8 @@ Many modern streaming providers disguise video segments as image files (`.png` /
 | `CACHE_MAX_ITEMS` | `1000` | Maximum number of stream URLs stored in memory cache. |
 | `VOD_CACHE_TTL_MS` | `21600000` (6 hrs) | Cache TTL in milliseconds for resolved VOD movie streams and playlists. |
 | `SUBTITLE_CACHE_TTL_MS` | `21600000` (6 hrs) | Cache TTL in milliseconds for converted WebVTT subtitles. |
+| `SUBTITLE_AUTO_SYNC` | `true` | Auto-align Wyzie subtitle tracks against an in-sync reference (embedded source rendition, else the vidnest caption cache) via cue-onset alignment; fixes constant offset and fps drift. `false` serves Wyzie tracks untouched. |
+| `SUBTITLE_SYNC_WINDOW_S` | `120` | Search window in seconds (each direction) for the subtitle alignment scan. |
 | `MAX_BROWSER_USES` | `30` | Number of scrapes before recycling the Chromium context. |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `30000` | Upstream proxy timeout in milliseconds. |
 | `HEADLESS` | `true` | Set to `false` to show browser UI (useful for debugging). |

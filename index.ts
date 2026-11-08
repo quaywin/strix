@@ -8,6 +8,7 @@ import {
   scraperService,
 } from "./src/services/scraper.service";
 import { videoScraperService } from "./src/services/videoScraper.service";
+import { isWyzieSubtitleUrl } from "./src/utils/subtitles";
 import {
   DEFAULT_USER_AGENT,
   getHeader,
@@ -443,10 +444,11 @@ export const handleScrapeVideo = async (
     json?: string;
     embed?: string;
     is_embed?: string;
+    server?: string;
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, fallback, proxy, format, json, embed, is_embed } = query;
+  const { url, fallback, proxy, format, json, embed, is_embed, server } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -470,6 +472,8 @@ export const handleScrapeVideo = async (
         requestOrigin,
         wantEmbed,
         request.signal,
+        false,
+        server,
       );
     } catch (primaryErr: any) {
       if (
@@ -489,6 +493,8 @@ export const handleScrapeVideo = async (
         requestOrigin,
         wantEmbed,
         request.signal,
+        false,
+        server,
       );
     }
 
@@ -516,8 +522,9 @@ export const handleScrapeVideo = async (
       const fallbackParam = fallback
         ? `&fallback=${encodeURIComponent(fallback)}`
         : "";
+      const serverParam = server ? `&server=${encodeURIComponent(server)}` : "";
       const masterUrl = isM3u8
-        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}`
+        ? `${requestOrigin}/scrape-video/master.m3u8?url=${encodeURIComponent(effectiveUrl)}${fallbackParam}${wantEmbed ? "&embed=true" : ""}${serverParam}`
         : undefined;
 
       return new Response(
@@ -656,11 +663,21 @@ const proxySubHandler = async (
         ? vtt.replace(/^WEBVTT/, "WEBVTT\nX-TIMESTAMP-MAP:LOCAL:0,MPEGTS:0")
         : vtt;
 
+    // A response served BEFORE calibration landed must not be pinned by
+    // downstream HTTP caches for the full 6h — that would freeze the
+    // misaligned body for exactly the viewer whose request triggered the
+    // calibration. Non-Wyzie URLs never calibrate, so they keep the long
+    // TTL; a Wyzie URL only earns it once its transform exists.
+    const cacheMaxAge =
+      videoScraperService.hasSubtitleSync(subUrl) || !isWyzieSubtitleUrl(subUrl)
+        ? 21600
+        : 120;
+
     return new Response(vttOut, {
       status: 200,
       headers: {
         "Content-Type": "text/vtt; charset=utf-8",
-        "Cache-Control": "public, max-age=21600",
+        "Cache-Control": `public, max-age=${cacheMaxAge}`,
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
       },
