@@ -121,6 +121,8 @@ export class VideoScraperService {
   /** Individual vdrk URLs known missing — shared by the probe and the
    * sync-reference lookup so a learned 404 is never paid twice. */
   private vdrkMissCache = new TtlCache<boolean>(15 * 60 * 1000);
+  /** Variant URLs known to fail upstream (e.g. 429 rate limit or non-HLS error) — prevents hammering retry loops at play time. */
+  private failedPlaylistCache = new TtlCache<boolean>(60 * 1000);
   private inFlightScrapes = new Map<string, InFlightEntry<CachedVideoPayload>>();
 
   /** Masters carry ~3 quality variants; anything beyond is redundant. */
@@ -201,6 +203,9 @@ export class VideoScraperService {
     signal?: AbortSignal,
     maxAttempts: number = 3,
   ): Promise<string> {
+    if (this.failedPlaylistCache.get(playlistUrl)) {
+      throw new Error("Upstream playlist response is not an m3u8 document (cached failure)");
+    }
     const BACKOFF_MS = [1000, 2500];
     let lastError: unknown;
     // Prepare headers for both stacks: smartFetch applies these defaults
@@ -256,6 +261,7 @@ export class VideoScraperService {
           (e as Error).name === "AbortError" ||
           attempt === maxAttempts - 1
         ) {
+          this.failedPlaylistCache.set(playlistUrl, true, 60000);
           throw e;
         }
         lastError = e;
@@ -266,6 +272,7 @@ export class VideoScraperService {
         await Bun.sleep(BACKOFF_MS[attempt] ?? 2500);
       }
     }
+    this.failedPlaylistCache.set(playlistUrl, true, 60000);
     throw lastError instanceof Error
       ? lastError
       : new Error("Upstream playlist fetch failed");
@@ -289,8 +296,11 @@ export class VideoScraperService {
     const headers = this.pickForwardableHeaders(payload.video.headers);
     const visited = new Set<string>();
     let okCount = 0;
+    let mediaOkCount = 0;
     let totalBytes = 0;
     let budgetExceeded = false;
+    const body = payload.video.body || "";
+    const isMaster = body.includes("#EXT-X-STREAM-INF");
     const deadline = Date.now() + VideoScraperService.HARVEST_BUDGET_MS;
 
     const harvestOne = async (
@@ -318,6 +328,7 @@ export class VideoScraperService {
             `Variant playlist harvest failed for ${url.slice(0, 120)}: ${(e as Error).message}`,
             "VideoScraperService",
           );
+          this.failedPlaylistCache.set(url, true, 60000);
           return;
         }
       }
@@ -331,6 +342,7 @@ export class VideoScraperService {
           `Harvest skipped non-HLS body for ${url.slice(0, 120)}`,
           "VideoScraperService",
         );
+        this.failedPlaylistCache.set(url, true, 60000);
         return;
       }
 
@@ -339,6 +351,9 @@ export class VideoScraperService {
       }
       okCount++;
       totalBytes += text.length;
+      if (!text.includes("#EXT-X-STREAM-INF")) {
+        mediaOkCount++;
+      }
 
       // Nested master: children (variants + EXT-X-MEDIA renditions) are
       // playlists too and re-enter /playlist at play time — harvest one
@@ -371,13 +386,20 @@ export class VideoScraperService {
       }
     };
 
-    const body = payload.video.body || "";
     if (body.includes("#EXTM3U") || body.includes("#EXT-X-")) {
       await harvestOne(payload.video.url, body, 0);
     } else {
       // Body-less DOM-src fallback: probe the stream URL server-side once
       // (anti-hotlink hosts may refuse; logged, never fatal).
       await harvestOne(payload.video.url, null, 0);
+    }
+
+    if (isMaster && mediaOkCount === 0) {
+      logger.warn(
+        `Master playlist has variants declared but 0 media variants succeeded harvest for: ${payload.video.url.slice(0, 100)}`,
+        "VideoScraperService",
+      );
+      return 0;
     }
 
     payload.variantUrls = [...visited];
@@ -742,7 +764,7 @@ export class VideoScraperService {
       format = "webm";
     }
 
-    const payload: CachedVideoPayload = {
+    let payload: CachedVideoPayload = {
       video: {
         url: videoReq.url,
         format,
@@ -857,7 +879,50 @@ export class VideoScraperService {
     // that would negative-cache a perfectly healthy source for 30s and 404
     // the very next viewer. The 45s budget bounds the extra work.
     if (format === "m3u8") {
-      const harvested = await this.harvestVariantPlaylists(payload);
+      let harvested = await this.harvestVariantPlaylists(payload);
+      if (harvested === 0 && !server) {
+        // In auto-mode, if the first preferred server (e.g. Zeta) has dead/rate-limited variants (429),
+        // try alternative preferred servers (Prime, then Lamda) before declaring failure.
+        const fallbackServers = ["prime", "lamda"];
+        for (const altServer of fallbackServers) {
+          logger.warn(
+            `Primary server stream variants failed harvest (unplayable); attempting fallback server "${altServer}" for: ${url}`,
+            "VideoScraperService",
+          );
+          try {
+            const altVideoReq = await scraperEngine.collectVideo(
+              url,
+              CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
+              isEmbed,
+              signal,
+              altServer,
+            );
+            if (altVideoReq && altVideoReq.url !== payload.video.url) {
+              const altPayload: CachedVideoPayload = {
+                video: {
+                  url: altVideoReq.url,
+                  format: "m3u8",
+                  headers: altVideoReq.headers,
+                  body: altVideoReq.body,
+                },
+                extractedAt: Date.now(),
+                subCandidates: payload.subCandidates,
+              };
+              const altHarvested = await this.harvestVariantPlaylists(altPayload);
+              if (altHarvested > 0) {
+                payload = altPayload;
+                harvested = altHarvested;
+                logger.info(
+                  `Successfully recovered with fallback server "${altServer}" (${altHarvested} playlist(s) harvested) for: ${url}`,
+                  "VideoScraperService",
+                );
+                break;
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
       if (harvested === 0) {
         // The synthesized master routes every variant through /playlist, so
         // a payload whose playlists are all server-side unfetchable is
