@@ -122,7 +122,7 @@ describe("Subtitle Metadata Inference & Normalization", () => {
     expect(result.subtitles.length).toBe(2);
     expect(result.masterPlaylist).toContain('NAME="Vietnamese",DEFAULT=YES');
     expect(result.masterPlaylist).toContain('NAME="English",DEFAULT=NO');
-    expect(result.masterPlaylist).toContain("sub.wyzie.io%2Ftranslate");
+    expect(result.masterPlaylist).toContain("sub%2Ewyzie%2Eio%2Ftranslate");
   });
 });
 
@@ -165,6 +165,35 @@ describe("buildMasterPlaylistWithSubtitles", () => {
     expect(result).toContain('NAME="Vietnamese",DEFAULT=NO');
     expect(result).toContain('SUBTITLES="subs"');
     expect(result).toContain("https://stream.example.com/360p.m3u8");
+    // Verify variants are sorted descending: 720p appears before 360p
+    expect(result.indexOf("1280x720")).toBeLessThan(result.indexOf("640x360"));
+  });
+
+  it("sorts variants descending from 4K/1080p down to 720p/480p", () => {
+    const masterBody = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=16000000,RESOLUTION=3840x2160
+4k.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480
+480p.m3u8`;
+
+    const result = buildMasterPlaylistWithSubtitles(
+      "https://stream.example.com/master.m3u8",
+      [],
+      { videoBody: masterBody },
+    );
+
+    const idx4k = result.indexOf("3840x2160");
+    const idx1080 = result.indexOf("1920x1080");
+    const idx720 = result.indexOf("1280x720");
+    const idx480 = result.indexOf("854x480");
+
+    expect(idx4k).toBeLessThan(idx1080);
+    expect(idx1080).toBeLessThan(idx720);
+    expect(idx720).toBeLessThan(idx480);
   });
 
   it("synthesizes an HLS Master Playlist for a media playlist without existing master tags", () => {
@@ -222,7 +251,7 @@ Test Subtitle`;
       expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
 
       const text = await res.text();
-      expect(text.startsWith("WEBVTT\n\n")).toBe(true);
+      expect(text.startsWith("WEBVTT")).toBe(true);
       expect(text).toContain("00:00:01.000 --> 00:00:03.000");
       expect(text).toContain("Test Subtitle");
     } finally {

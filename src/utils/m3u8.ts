@@ -328,6 +328,14 @@ export function buildMasterPlaylistWithSubtitles(
     const resultLines: string[] = [];
     let insertedSubs = false;
 
+    interface VariantEntry {
+      inf: string;
+      url: string;
+      score: number;
+    }
+    const variants: VariantEntry[] = [];
+    let pendingInf: string | null = null;
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (line === undefined) continue;
@@ -363,7 +371,7 @@ export function buildMasterPlaylistWithSubtitles(
         insertedSubs = true;
       }
 
-      // Augment variant lines with SUBTITLES="subs"
+      // Augment variant lines with SUBTITLES="subs" and queue for quality sorting
       if (trimmed.startsWith("#EXT-X-STREAM-INF:")) {
         let streamInf = trimmed;
         if (hasSubtitles) {
@@ -376,7 +384,7 @@ export function buildMasterPlaylistWithSubtitles(
             streamInf = `${streamInf},SUBTITLES="subs"`;
           }
         }
-        resultLines.push(streamInf);
+        pendingInf = streamInf;
         continue;
       }
 
@@ -404,9 +412,24 @@ export function buildMasterPlaylistWithSubtitles(
           const finalUrl = options.proxySegmentUrl
             ? options.proxySegmentUrl(absoluteUrl)
             : absoluteUrl;
-          resultLines.push(finalUrl);
+          if (pendingInf) {
+            const bwMatch = pendingInf.match(/BANDWIDTH=(\d+)/i);
+            const resMatch = pendingInf.match(/RESOLUTION=(\d+)x(\d+)/i);
+            const width = resMatch?.[1] ? parseInt(resMatch[1], 10) : 0;
+            const bandwidth = bwMatch?.[1] ? parseInt(bwMatch[1], 10) : 0;
+            const score = width > 0 ? width * 10000000 + bandwidth : bandwidth;
+            variants.push({ inf: pendingInf, url: finalUrl, score });
+            pendingInf = null;
+          } else {
+            resultLines.push(finalUrl);
+          }
         } catch {
-          resultLines.push(line);
+          if (pendingInf) {
+            variants.push({ inf: pendingInf, url: trimmed, score: 0 });
+            pendingInf = null;
+          } else {
+            resultLines.push(line);
+          }
         }
         continue;
       }
@@ -456,6 +479,13 @@ export function buildMasterPlaylistWithSubtitles(
 
     if (!insertedSubs && hasSubtitles) {
       resultLines.push(subMediaLines);
+    }
+
+    // Sort variants from highest quality to lowest so HLS players default to 1080p
+    variants.sort((a, b) => b.score - a.score);
+    for (const v of variants) {
+      resultLines.push(v.inf);
+      resultLines.push(v.url);
     }
 
     return resultLines.join("\n");

@@ -148,6 +148,8 @@ const SERVER_MENU_OPEN_WAIT_MS = 1200;
  * while others (Filxer, Ophim, or default) often cap at 720p.
  */
 export const PREFERRED_SERVER_KEYWORDS = [
+  "beta",
+  "alfa",
   "zeta",
   "prime",
   "upcloud",
@@ -912,13 +914,16 @@ export class ScraperEngine {
                           );
                           s.trackedTimeout(() => {
                             if (!s.isDone() && !capturedVideo && stagedFallbackVideo) {
+                              if (isWaitingForPreferred()) {
+                                return;
+                              }
                               capturedVideo = stagedFallbackVideo;
                               console.log(
                                 `[SCRAPER-VOD] Timeout waiting for 1080p; accepting fallback stream (${maxWidth > 0 ? maxWidth + "w" : "stream"})`,
                               );
                               s.markDone();
                             }
-                          }, 3000);
+                          }, 5000);
                         }
                       } else if (capturedVideo.url === resUrl && !capturedVideo.body) {
                         capturedVideo.body = text;
@@ -1040,10 +1045,20 @@ export class ScraperEngine {
                     if (switched) {
                       preferredServerName = switched;
                       preferredServerSwitchedAt = Date.now();
+                      stagedFallbackVideo = null;
                       console.log(
                         `[SCRAPER-VOD] Switched to preferred high-quality server: "${switched}" (radio #${targetIdx})`,
                       );
                       lastCycleAt = Date.now();
+                      s.trackedTimeout(() => {
+                        if (!s.isDone() && !capturedVideo && stagedFallbackVideo) {
+                          capturedVideo = stagedFallbackVideo;
+                          console.log(
+                            `[SCRAPER-VOD] Timeout waiting for 1080p from switched server; accepting staged stream`,
+                          );
+                          s.markDone();
+                        }
+                      }, 6000);
                     }
                   } else if (targetIdx === 0) {
                     console.log(

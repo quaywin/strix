@@ -881,9 +881,9 @@ export class VideoScraperService {
     if (format === "m3u8") {
       let harvested = await this.harvestVariantPlaylists(payload);
       if (harvested === 0 && !server) {
-        // In auto-mode, if the first preferred server (e.g. Zeta) has dead/rate-limited variants (429),
-        // try alternative preferred servers (Prime, then Lamda) before declaring failure.
-        const fallbackServers = ["prime", "lamda"];
+        // In auto-mode, if the first preferred server (e.g. Beta/Zeta) has dead/rate-limited variants (429),
+        // try alternative preferred servers (Alfa, Beta, Prime, Lamda) before declaring failure.
+        const fallbackServers = ["alfa", "beta", "prime", "lamda"];
         for (const altServer of fallbackServers) {
           if (signal?.aborted) break;
           logger.warn(
