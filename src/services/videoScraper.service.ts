@@ -885,6 +885,7 @@ export class VideoScraperService {
         // try alternative preferred servers (Prime, then Lamda) before declaring failure.
         const fallbackServers = ["prime", "lamda"];
         for (const altServer of fallbackServers) {
+          if (signal?.aborted) break;
           logger.warn(
             `Primary server stream variants failed harvest (unplayable); attempting fallback server "${altServer}" for: ${url}`,
             "VideoScraperService",
