@@ -44,6 +44,35 @@ export function getHeader(
 }
 
 /**
+ * Detects whether a URL is a proxy wrapper (e.g. megacloud / Cloudflare workers / animanga proxy
+ * that encodes the actual stream/key target in ?url=... and optional forwarded headers in &headers=...).
+ * If found, returns the inner target URL and parsed headers.
+ */
+export function unwrapProxyUrl(rawUrl: string): {
+  targetUrl: string;
+  headers?: Record<string, string>;
+} | null {
+  try {
+    const parsed = new URL(rawUrl);
+    const innerUrl = parsed.searchParams.get("url");
+    if (innerUrl && (innerUrl.startsWith("http://") || innerUrl.startsWith("https://"))) {
+      let headers: Record<string, string> | undefined;
+      const headersParam = parsed.searchParams.get("headers");
+      if (headersParam) {
+        try {
+          const parsedHeaders = JSON.parse(headersParam);
+          if (parsedHeaders && typeof parsedHeaders === "object") {
+            headers = parsedHeaders;
+          }
+        } catch (_) {}
+      }
+      return { targetUrl: innerUrl, headers };
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
  * Enhanced fetch helper that automatically falls back to system curl if
  * standard fetch gets blocked by upstream anti-bot/TLS-fingerprint systems
  * (e.g. Iron Dome / JA3 checks returning 403 on Bun/Node TLS ClientHello).

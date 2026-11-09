@@ -140,6 +140,16 @@ export function proxyChunkUrl(
   targetUrl: string,
   query: string,
 ): string {
+  // Key URLs (e.g. encryption.key) are raw key bytes (AES-128 / 16 bytes), not media segments.
+  // Bypass cosmetic segment extension and redundant 307 redirect.
+  const isKey =
+    targetUrl.includes(".key") ||
+    targetUrl.includes("/key") ||
+    targetUrl.includes("encryption.key");
+  if (isKey) {
+    return `${requestOrigin}/proxy-chunk?${query}`;
+  }
+
   // % also terminates the match: wrapped URLs (megacloud ts-proxy) carry the
   // real extension URL-encoded inside the query (…seg-1.ts%26headers=…), and
   // TS content should keep the .ts name rather than fall back to .mp4.

@@ -14,6 +14,7 @@ import {
   getHeader,
   getRequestOrigin,
   smartFetch,
+  unwrapProxyUrl,
 } from "./src/utils/http";
 import { proxyChunkUrl, rewriteM3u8Playlist } from "./src/utils/m3u8";
 import { needsUnwrap, unwrapChunk } from "./src/utils/cvUnwrap";
@@ -826,9 +827,34 @@ export const app = new Elysia()
       : chunkTimeout;
 
     try {
-      let upstream = await smartFetch(chunkUrl, {
+      const isKey =
+        chunkUrl.includes(".key") ||
+        chunkUrl.includes("/key") ||
+        chunkUrl.includes("encryption.key");
+
+      const unwrapped = unwrapProxyUrl(chunkUrl);
+      let fetchUrl = chunkUrl;
+      let fetchHeaders = new Headers(headers);
+
+      // ts-proxy endpoints (e.g. Cloudflare workers / megacloud) are designed strictly
+      // for transport stream video segments; upstream workers return 404 for encryption keys.
+      // If a key request is wrapped in a ts-proxy, bypass the wrapper and fetch target directly.
+      if (
+        isKey &&
+        unwrapped &&
+        (chunkUrl.includes("ts-proxy") || chunkUrl.includes("workers.dev"))
+      ) {
+        fetchUrl = unwrapped.targetUrl;
+        if (unwrapped.headers) {
+          for (const [k, v] of Object.entries(unwrapped.headers)) {
+            fetchHeaders.set(k, v);
+          }
+        }
+      }
+
+      let upstream = await smartFetch(fetchUrl, {
         signal: chunkSignal,
-        headers,
+        headers: fetchHeaders,
         range,
       });
 
@@ -836,19 +862,44 @@ export const app = new Elysia()
       // If upstream rejected with HTTP 403 and a Referer was present, retry once without Referer.
       // Many CDNs permit direct requests but reject third-party referers.
       // When successful, remember this hostname so subsequent chunks skip the referer immediately.
-      if (upstream.status === 403 && headers.has("referer")) {
-        const fallbackHeaders = new Headers(headers);
+      if (upstream.status === 403 && fetchHeaders.has("referer")) {
+        const fallbackHeaders = new Headers(fetchHeaders);
         fallbackHeaders.delete("referer");
-        const retryUpstream = await smartFetch(chunkUrl, {
+        const retryUpstream = await smartFetch(fetchUrl, {
           signal: chunkSignal,
           headers: fallbackHeaders,
           range,
         });
         if (retryUpstream.ok) {
           upstream = retryUpstream;
-          if (chunkHostname) {
-            stripRefererHosts.add(chunkHostname);
+          const host = new URL(fetchUrl).hostname.toLowerCase();
+          if (host) {
+            stripRefererHosts.add(host);
           }
+        }
+      }
+
+      // Proxy Wrapper Fallback:
+      // If a wrapper proxy (e.g. workers.dev, megacloud) returned an error (404/403/500+),
+      // attempt fetching directly from the unwrapped target using its embedded headers.
+      if (!upstream.ok && fetchUrl !== unwrapped?.targetUrl && unwrapped) {
+        const directHeaders = new Headers(headers);
+        if (unwrapped.headers) {
+          for (const [k, v] of Object.entries(unwrapped.headers)) {
+            directHeaders.set(k, v);
+          }
+        }
+        const retryDirect = await smartFetch(unwrapped.targetUrl, {
+          signal: chunkSignal,
+          headers: directHeaders,
+          range,
+        });
+        if (retryDirect.ok) {
+          upstream = retryDirect;
+          logger.info(
+            `Recovered via direct unwrap fetch (HTTP 200) for: ${unwrapped.targetUrl.slice(0, 100)}`,
+            "ProxyChunk",
+          );
         }
       }
 
