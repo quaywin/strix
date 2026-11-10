@@ -532,6 +532,7 @@ export const handleScrapeVideo = async (
         JSON.stringify({
           format: isM3u8 ? "m3u8" : extracted.video.format,
           video: extracted.video,
+          duration: extracted.duration,
           subtitles: extracted.subtitles,
           streamUrl: directStreamUrl,
           masterPlaylistUrl: masterUrl,
@@ -623,7 +624,20 @@ const proxySubHandler = async (
       const segmentUrl = `${origin}/proxy-sub/caption.vtt?${inner
         .toString()
         .replace(/\./g, "%2E")}`;
-      const duration = Number(query.duration);
+      let duration = Number(query.duration);
+      if (!Number.isFinite(duration) || duration <= 0) {
+        // Fallback 1: Lookup cached duration by page URL (referer)
+        const videoDur = videoScraperService.getDuration(referer);
+        if (videoDur && videoDur > 0) {
+          duration = videoDur;
+        } else {
+          // Fallback 2: Lookup duration from cached subtitle cues
+          const subDur = videoScraperService.getSubtitleDuration(subUrl);
+          if (subDur && subDur > 0) {
+            duration = subDur;
+          }
+        }
+      }
       const extInf =
         Number.isFinite(duration) && duration > 0 ? duration : 86400;
       const playlist = [

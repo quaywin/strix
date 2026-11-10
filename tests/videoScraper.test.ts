@@ -1,10 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { app } from "../index";
-import { buildMasterPlaylistWithSubtitles } from "../src/utils/m3u8";
+import {
+  buildMasterPlaylistWithSubtitles,
+  extractDurationFromMediaPlaylist,
+  extractPlaylistDuration,
+} from "../src/utils/m3u8";
 import {
   inferSubtitleMetadata,
   normalizeSubtitleTracks,
   srtToVtt,
+  extractDurationFromVtt,
   type RawSubtitleCandidate,
 } from "../src/utils/subtitles";
 import { videoScraperService } from "../src/services/videoScraper.service";
@@ -278,6 +283,92 @@ Test Subtitle`;
     expect(text).toContain("#EXT-X-TARGETDURATION:86400");
     expect(text).toContain("#EXTINF:86400.000,");
     expect(text).toContain("#EXT-X-ENDLIST");
+  });
+
+  it("returns single-segment VOD media playlist with exact duration when duration query is provided", async () => {
+    const res = await app.handle(
+      new Request(
+        "http://localhost/proxy-sub?url=https%3A%2F%2Fexample.com%2Fsub.vtt&playlist=1&duration=7140",
+      ),
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("#EXT-X-TARGETDURATION:7140");
+    expect(text).toContain("#EXTINF:7140.000,");
+  });
+
+  it("resolves exact duration from single-rendition media playlist (fixing 24h bug)", () => {
+    const mediaBody = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXT-X-VERSION:3
+#EXTINF:9.500,
+seg1.ts
+#EXTINF:10.000,
+seg2.ts
+#EXTINF:8.500,
+seg3.ts
+#EXT-X-ENDLIST`;
+
+    const dur = extractDurationFromMediaPlaylist(mediaBody);
+    expect(dur).toBe(28);
+
+    const playlistDur = extractPlaylistDuration(mediaBody, "https://stream.example.com/media.m3u8");
+    expect(playlistDur).toBe(28);
+  });
+
+  it("resolves exact duration from master playlist and nested master chains", () => {
+    const masterBody = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+v1.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+v2.m3u8`;
+
+    const variantMediaBody = `#EXTM3U
+#EXTINF:6.000,
+chunk1.ts
+#EXTINF:6.000,
+chunk2.ts
+#EXTINF:4.500,
+chunk3.ts
+#EXT-X-ENDLIST`;
+
+    const bodies = new Map<string, string>();
+    bodies.set("https://stream.example.com/v1.m3u8", variantMediaBody);
+
+    const dur = extractPlaylistDuration(
+      masterBody,
+      "https://stream.example.com/master.m3u8",
+      (u) => bodies.get(u),
+    );
+    expect(dur).toBe(16.5);
+  });
+
+  it("extracts duration from WebVTT and SRT cue timestamps", () => {
+    const vtt = `WEBVTT
+
+1
+00:01:00.000 --> 00:01:05.000
+Start
+
+2
+01:45:20.500 --> 01:45:25.000
+End dialogue`;
+
+    // 1h 45m 25s = 6325s. + 15s buffer = 6340s.
+    const durVtt = extractDurationFromVtt(vtt);
+    expect(durVtt).toBe(6340);
+
+    const srt = `1
+00:00:10,000 --> 00:00:15,000
+Hello
+
+2
+02:10:00,000 --> 02:10:05,000
+Goodbye`;
+
+    // 2h 10m 5s = 7805s. + 15s buffer = 7820s.
+    const durSrt = extractDurationFromVtt(srt);
+    expect(durSrt).toBe(7820);
   });
 });
 

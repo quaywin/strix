@@ -14,6 +14,8 @@ import {
   proxyChunkUrl,
   rewriteM3u8Playlist,
   resolveUrlWithBaseParams,
+  extractDurationFromMediaPlaylist,
+  extractPlaylistDuration,
 } from "../utils/m3u8";
 import {
   maybeFixMojibake,
@@ -23,6 +25,7 @@ import {
   srtToVtt,
   normalizeSubtitleTracks,
   isWyzieSubtitleUrl,
+  extractDurationFromVtt,
   type RawSubtitleCandidate,
   type SubtitleTrack,
 } from "../utils/subtitles";
@@ -44,6 +47,7 @@ export interface VideoStreamInfo {
 
 export interface ExtractedVideoResult {
   video: VideoStreamInfo;
+  duration?: number;
   /**
    * Subtitle tracks from the upstream master's own renditions plus the
    * vidnest-family static caption cache (empty for direct-video sources).
@@ -57,6 +61,7 @@ export interface ExtractedVideoResult {
 
 interface CachedVideoPayload {
   video: VideoStreamInfo;
+  duration?: number;
   extractedAt: number;
   isNotFound?: boolean;
   /** Raw candidates from the master body + caption cache; normalized per-request. */
@@ -144,6 +149,32 @@ export class VideoScraperService {
       }
     }
     return this.videoCache.deletePrefix(`vod:${url}`);
+  }
+
+  /**
+   * Retrieves the cached media duration (in seconds) for a video page URL or stream URL.
+   */
+  getDuration(url?: string): number | undefined {
+    if (!url) return undefined;
+    for (const suffix of ["", ":embed:true"]) {
+      const payload = this.videoCache.get(`vod:${url}${suffix}`);
+      if (payload?.duration && payload.duration > 0) {
+        return payload.duration;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Estimates duration from cached subtitle cue timestamps if available.
+   */
+  getSubtitleDuration(subUrl: string): number | undefined {
+    const cached = this.subCache.get(subUrl);
+    if (cached) {
+      const dur = extractDurationFromVtt(cached);
+      if (dur > 0) return dur;
+    }
+    return undefined;
   }
 
   /**
@@ -301,6 +332,12 @@ export class VideoScraperService {
     let budgetExceeded = false;
     const body = payload.video.body || "";
     const isMaster = body.includes("#EXT-X-STREAM-INF");
+    if (!isMaster && body.includes("#EXTINF")) {
+      const dur = extractDurationFromMediaPlaylist(body);
+      if (dur > 0 && (!payload.duration || dur > payload.duration)) {
+        payload.duration = Math.round(dur);
+      }
+    }
     const deadline = Date.now() + VideoScraperService.HARVEST_BUDGET_MS;
 
     const harvestOne = async (
@@ -353,6 +390,10 @@ export class VideoScraperService {
       totalBytes += text.length;
       if (!text.includes("#EXT-X-STREAM-INF")) {
         mediaOkCount++;
+        const dur = extractDurationFromMediaPlaylist(text);
+        if (dur > 0 && (!payload.duration || dur > payload.duration)) {
+          payload.duration = Math.round(dur);
+        }
       }
 
       // Nested master: children (variants + EXT-X-MEDIA renditions) are
@@ -556,29 +597,35 @@ export class VideoScraperService {
       }
     }
 
-    // Real movie duration: sum of EXTINF in the first video media playlist
+    // Real movie duration: sum of EXTINF in video media playlists
     // (its body is already in the harvest cache). Passed to the subtitle
     // wrapper playlist so players derive a correct timeline instead of the
     // legacy 86400s (24h) stub.
     if (isHls && playlistSubs.length > 0) {
-      let durationSec = 0;
-      try {
-        const mediaUri = effectiveBody
-          .split(/\r?\n/)
-          .find((l) => l.trim() && !l.trim().startsWith("#"));
-        if (mediaUri) {
-          const mediaBody = this.variantBodies.get(
-            resolveUrlWithBaseParams(mediaUri.trim(), payload.video.url),
-          );
-          if (mediaBody) {
-            durationSec = [
-              ...mediaBody.matchAll(/#EXTINF:([0-9.]+)/g),
-            ].reduce((acc, m) => acc + parseFloat(m[1] ?? "0"), 0);
+      let durationSec = payload.duration || 0;
+      if (durationSec <= 0) {
+        durationSec = extractPlaylistDuration(
+          effectiveBody,
+          payload.video.url,
+          (u) => this.variantBodies.get(u),
+        );
+      }
+      if (durationSec <= 0) {
+        // Fallback: check any cached variant body in variantBodies
+        for (const variantUrl of payload.variantUrls || []) {
+          const b = this.variantBodies.get(variantUrl);
+          if (b && b.includes("#EXTINF")) {
+            const dur = extractDurationFromMediaPlaylist(b);
+            if (dur > 0) {
+              durationSec = dur;
+              break;
+            }
           }
         }
-      } catch {}
+      }
       if (durationSec > 0) {
         const rounded = Math.round(durationSec);
+        payload.duration = rounded;
         for (const t of playlistSubs) {
           t.proxyUrl += `&duration=${rounded}`;
         }
@@ -615,6 +662,7 @@ export class VideoScraperService {
 
     return {
       video: payload.video,
+      duration: payload.duration,
       subtitles,
       masterPlaylist,
       extractedAt: payload.extractedAt,

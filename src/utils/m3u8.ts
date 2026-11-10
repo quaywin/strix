@@ -1,6 +1,68 @@
 import type { RawSubtitleCandidate, SubtitleTrack } from "./subtitles";
 
 /**
+ * Calculates the total duration in seconds from an HLS media playlist body by summing #EXTINF tags.
+ */
+export function extractDurationFromMediaPlaylist(body: string): number {
+  if (!body) return 0;
+  let total = 0;
+  for (const match of body.matchAll(/#EXTINF:([0-9.]+)/g)) {
+    const val = parseFloat(match[1] ?? "0");
+    if (!isNaN(val) && val > 0) {
+      total += val;
+    }
+  }
+  return total;
+}
+
+/**
+ * Resolves the total media duration (in seconds) of an HLS stream.
+ * Handles:
+ * 1. Single-rendition media playlists (contains #EXTINF directly).
+ * 2. Master playlists: checks cached variant bodies across all declared variants.
+ * 3. Nested master chains: recursively checks inner representation bodies.
+ */
+export function extractPlaylistDuration(
+  body: string,
+  baseUrl: string,
+  getVariantBody?: (url: string) => string | undefined,
+): number {
+  if (!body) return 0;
+
+  // Case 1: Body is already a media playlist
+  if (body.includes("#EXTINF")) {
+    const dur = extractDurationFromMediaPlaylist(body);
+    if (dur > 0) return dur;
+  }
+
+  // Case 2: Body is a master playlist
+  if (!getVariantBody) return 0;
+
+  const lines = body.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    try {
+      const childUrl = resolveUrlWithBaseParams(trimmed, baseUrl);
+      const childBody = getVariantBody(childUrl);
+      if (childBody) {
+        if (childBody.includes("#EXTINF")) {
+          const dur = extractDurationFromMediaPlaylist(childBody);
+          if (dur > 0) return dur;
+        } else if (childBody.includes("#EXT-X-STREAM-INF")) {
+          // Nested master: recurse one level
+          const nestedDur = extractPlaylistDuration(childBody, childUrl, getVariantBody);
+          if (nestedDur > 0) return nestedDur;
+        }
+      }
+    } catch {}
+  }
+
+  return 0;
+}
+
+/**
  * Resolves a URI relative to baseUrl, preserving query parameters
  * (such as session or expiry tokens) from baseUrl if the resolved URI lacks query parameters.
  */

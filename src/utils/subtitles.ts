@@ -514,3 +514,25 @@ export function normalizeSubtitleTracks(
 
   return tracks;
 }
+
+/**
+ * Extracts the approximate total media duration (in seconds) from the last cue timestamp in WebVTT / SRT content.
+ */
+export function extractDurationFromVtt(content: string): number {
+  if (!content) return 0;
+  let maxEndSec = 0;
+  const matches = content.matchAll(
+    /(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})/g,
+  );
+  for (const m of matches) {
+    const h = m[5] ? parseInt(m[5], 10) : 0;
+    const min = parseInt(m[6] ?? "0", 10);
+    const s = parseInt(m[7] ?? "0", 10);
+    const ms = parseInt(m[8] ?? "0", 10);
+    const endSec = h * 3600 + min * 60 + s + ms / 1000;
+    if (endSec > maxEndSec) {
+      maxEndSec = endSec;
+    }
+  }
+  return maxEndSec > 0 ? Math.ceil(maxEndSec + 15) : 0;
+}
