@@ -16,6 +16,33 @@ export function extractDurationFromMediaPlaylist(body: string): number {
 }
 
 /**
+ * Extracts the first playable segment or initialization map URL from an HLS media playlist.
+ * Supports fMP4 (#EXT-X-MAP:URI) and standard MPEG-TS/M4S segments (#EXTINF).
+ */
+export function extractFirstSegmentUrl(
+  body: string,
+  baseUrl: string,
+): string | null {
+  if (!body) return null;
+  const mapMatch = body.match(/#EXT-X-MAP:URI=["']?([^"'\r\n]+)["']?/i);
+  if (mapMatch && mapMatch[1]) {
+    try {
+      return resolveUrlWithBaseParams(mapMatch[1], baseUrl);
+    } catch {}
+  }
+  const lines = body.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]?.trim();
+    if (line && !line.startsWith("#")) {
+      try {
+        return resolveUrlWithBaseParams(line, baseUrl);
+      } catch {}
+    }
+  }
+  return null;
+}
+
+/**
  * Resolves the total media duration (in seconds) of an HLS stream.
  * Handles:
  * 1. Single-rendition media playlists (contains #EXTINF directly).
@@ -351,6 +378,7 @@ export function buildMasterPlaylistWithSubtitles(
   options: {
     videoBody?: string;
     proxySegmentUrl?: (url: string) => string;
+    excludedVariantUrls?: Set<string>;
   } = {},
 ): string {
   const isExistingMaster = Boolean(
@@ -471,6 +499,15 @@ export function buildMasterPlaylistWithSubtitles(
       if (!trimmed.startsWith("#")) {
         try {
           const absoluteUrl = resolveUrlWithBaseParams(trimmed, videoUrl);
+          if (
+            options.excludedVariantUrls &&
+            (options.excludedVariantUrls.has(absoluteUrl) ||
+              options.excludedVariantUrls.has(trimmed))
+          ) {
+            // Drop unplayable variant
+            pendingInf = null;
+            continue;
+          }
           const finalUrl = options.proxySegmentUrl
             ? options.proxySegmentUrl(absoluteUrl)
             : absoluteUrl;

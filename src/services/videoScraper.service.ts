@@ -16,6 +16,7 @@ import {
   resolveUrlWithBaseParams,
   extractDurationFromMediaPlaylist,
   extractPlaylistDuration,
+  extractFirstSegmentUrl,
 } from "../utils/m3u8";
 import {
   maybeFixMojibake,
@@ -72,6 +73,8 @@ interface CachedVideoPayload {
    * together with the payload.
    */
   variantUrls?: string[];
+  /** Variant URLs whose segments failed upstream check (403/404/502). */
+  unplayableVariantUrls?: Set<string>;
 }
 
 /**
@@ -130,8 +133,8 @@ export class VideoScraperService {
   private failedPlaylistCache = new TtlCache<boolean>(60 * 1000);
   private inFlightScrapes = new Map<string, InFlightEntry<CachedVideoPayload>>();
 
-  /** Masters carry ~3 quality variants; anything beyond is redundant. */
-  private static readonly MAX_VARIANTS_PER_VOD = 3;
+  /** Masters carry up to 4-5 quality variants (4K, 1080p, 720p, 480p, 360p). */
+  private static readonly MAX_VARIANTS_PER_VOD = 5;
   /** Playlists observed in the wild max out ~2.3MB; don't retain bigger. */
   private static readonly MAX_VARIANT_CACHE_BYTES = 6 * 1024 * 1024;
   /** Refuse to buffer responses larger than any real playlist. */
@@ -310,6 +313,41 @@ export class VideoScraperService {
   }
 
   /**
+   * Performs a lightweight probe on the first segment/init map of a media variant.
+   * If upstream explicitly responds with 4xx or 5xx (e.g. 403 Forbidden, 404 Not Found, 502 Bad Gateway),
+   * the rendition variant is unplayable (often declared in master template but absent from storage)
+   * and should be excluded from the master playlist to prevent player playback errors or unwanted degradation.
+   */
+  private async probeSegmentPlayable(
+    segUrl: string,
+    headers: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      const timeoutSignal = AbortSignal.timeout(3000);
+      const combined = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
+      let res = await fetch(segUrl, {
+        method: "HEAD",
+        headers,
+        signal: combined,
+      });
+      if (res.status === 405) {
+        res = await fetch(segUrl, {
+          method: "GET",
+          headers: { ...headers, Range: "bytes=0-1" },
+          signal: combined,
+        });
+      }
+      return res.status >= 200 && res.status < 400;
+    } catch {
+      // Conservative on network glitches: only drop on explicit upstream failure responses
+      return true;
+    }
+  }
+
+  /**
    * Downloads and caches the whole playlist chain immediately after a fresh
    * scrape — the token is at its freshest and the player hasn't added its
    * own request burst yet (the two together regularly trip the proxy's
@@ -326,6 +364,7 @@ export class VideoScraperService {
   ): Promise<number> {
     const headers = this.pickForwardableHeaders(payload.video.headers);
     const visited = new Set<string>();
+    const unplayableVariants = new Set<string>();
     let okCount = 0;
     let mediaOkCount = 0;
     let totalBytes = 0;
@@ -383,18 +422,32 @@ export class VideoScraperService {
         return;
       }
 
-      if (text.length <= VideoScraperService.MAX_VARIANT_CACHE_BYTES) {
-        this.variantBodies.set(url, text);
-      }
-      okCount++;
-      totalBytes += text.length;
       if (!text.includes("#EXT-X-STREAM-INF")) {
+        const segUrl = extractFirstSegmentUrl(text, url);
+        if (segUrl) {
+          const playable = await this.probeSegmentPlayable(segUrl, headers);
+          if (!playable) {
+            logger.warn(
+              `Variant playlist segment check failed (unplayable upstream): ${url.slice(0, 100)}`,
+              "VideoScraperService",
+            );
+            unplayableVariants.add(url);
+            this.failedPlaylistCache.set(url, true, 60000);
+            return;
+          }
+        }
         mediaOkCount++;
         const dur = extractDurationFromMediaPlaylist(text);
         if (dur > 0 && (!payload.duration || dur > payload.duration)) {
           payload.duration = Math.round(dur);
         }
       }
+
+      if (text.length <= VideoScraperService.MAX_VARIANT_CACHE_BYTES) {
+        this.variantBodies.set(url, text);
+      }
+      okCount++;
+      totalBytes += text.length;
 
       // Nested master: children (variants + EXT-X-MEDIA renditions) are
       // playlists too and re-enter /playlist at play time — harvest one
@@ -403,6 +456,8 @@ export class VideoScraperService {
       // abuse heuristics (a real player fetches one playlist at a time).
       if (text.includes("#EXT-X-STREAM-INF") && depth < 2) {
         const children: string[] = [];
+        const parsedVariants: { url: string; score: number }[] = [];
+        let curScore = 0;
         for (const line of text.split(/\r?\n/)) {
           const trimmed = line.trim();
           if (trimmed.startsWith("#EXT-X-MEDIA:")) {
@@ -414,11 +469,30 @@ export class VideoScraperService {
             }
             continue;
           }
+          if (trimmed.startsWith("#EXT-X-STREAM-INF:")) {
+            const bwMatch = trimmed.match(/BANDWIDTH=(\d+)/i);
+            const resMatch = trimmed.match(/RESOLUTION=(\d+)x(\d+)/i);
+            const width = resMatch?.[1] ? parseInt(resMatch[1], 10) : 0;
+            const bandwidth = bwMatch?.[1] ? parseInt(bwMatch[1], 10) : 0;
+            curScore = width > 0 ? width * 10000000 + bandwidth : bandwidth;
+            continue;
+          }
           if (!trimmed || trimmed.startsWith("#")) continue;
           try {
-            children.push(resolveUrlWithBaseParams(trimmed, url));
+            parsedVariants.push({
+              url: resolveUrlWithBaseParams(trimmed, url),
+              score: curScore,
+            });
           } catch {}
-          if (children.length >= VideoScraperService.MAX_VARIANTS_PER_VOD) break;
+          curScore = 0;
+        }
+        // Prioritize highest-quality variants (4K, 1080p, 720p) first
+        parsedVariants.sort((a, b) => b.score - a.score);
+        for (const v of parsedVariants.slice(
+          0,
+          VideoScraperService.MAX_VARIANTS_PER_VOD,
+        )) {
+          children.push(v.url);
         }
         for (const childUrl of children) {
           await harvestOne(childUrl, null, depth + 1);
@@ -443,6 +517,9 @@ export class VideoScraperService {
       return 0;
     }
 
+    if (unplayableVariants.size > 0) {
+      payload.unplayableVariantUrls = unplayableVariants;
+    }
     payload.variantUrls = [...visited];
     logger.info(
       `Harvested ${okCount}/${visited.size} playlist(s) (${Math.round(totalBytes / 1024)}KB${budgetExceeded ? ", budget exceeded — rest fetch live" : ""}) for: ${payload.video.url.slice(0, 100)}`,
@@ -656,6 +733,7 @@ export class VideoScraperService {
             videoBody: effectiveBody,
             proxySegmentUrl: (targetUrl: string) =>
               `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(cdnReferer)}`,
+            excludedVariantUrls: payload.unplayableVariantUrls,
           },
         )
       : undefined;

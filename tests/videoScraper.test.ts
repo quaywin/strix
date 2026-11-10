@@ -4,6 +4,7 @@ import {
   buildMasterPlaylistWithSubtitles,
   extractDurationFromMediaPlaylist,
   extractPlaylistDuration,
+  extractFirstSegmentUrl,
 } from "../src/utils/m3u8";
 import {
   inferSubtitleMetadata,
@@ -201,6 +202,35 @@ describe("buildMasterPlaylistWithSubtitles", () => {
     expect(idx720).toBeLessThan(idx480);
   });
 
+  it("excludes unplayable variants when excludedVariantUrls is provided", () => {
+    const masterBody = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=16000000,RESOLUTION=3840x2160
+4k.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p.m3u8`;
+
+    const excluded = new Set<string>([
+      "https://stream.example.com/4k.m3u8",
+    ]);
+
+    const result = buildMasterPlaylistWithSubtitles(
+      "https://stream.example.com/master.m3u8",
+      [],
+      {
+        videoBody: masterBody,
+        excludedVariantUrls: excluded,
+      },
+    );
+
+    expect(result).not.toContain("3840x2160");
+    expect(result).not.toContain("4k.m3u8");
+    expect(result).toContain("1920x1080");
+    expect(result).toContain("1280x720");
+    expect(result.indexOf("1920x1080")).toBeLessThan(result.indexOf("1280x720"));
+  });
+
   it("synthesizes an HLS Master Playlist for a media playlist without existing master tags", () => {
     const subs = [
       {
@@ -224,6 +254,36 @@ describe("buildMasterPlaylistWithSubtitles", () => {
       '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,SUBTITLES="subs"',
     );
     expect(result).toContain("https://cdn.example.com/movies/media.m3u8");
+  });
+});
+
+describe("extractFirstSegmentUrl", () => {
+  it("extracts fMP4 initialization map URI", () => {
+    const fmp4Body = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:6
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:6.000,
+seg-1.m4s`;
+    const seg = extractFirstSegmentUrl(fmp4Body, "https://cdn.example.com/hls/index.m3u8");
+    expect(seg).toBe("https://cdn.example.com/hls/init.mp4");
+  });
+
+  it("extracts first media segment URI when no MAP tag is present", () => {
+    const tsBody = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:3
+#EXTINF:6.000,
+seg-1.ts
+#EXTINF:6.000,
+seg-2.ts`;
+    const seg = extractFirstSegmentUrl(tsBody, "https://cdn.example.com/hls/index.m3u8");
+    expect(seg).toBe("https://cdn.example.com/hls/seg-1.ts");
+  });
+
+  it("returns null for empty or invalid playlists", () => {
+    expect(extractFirstSegmentUrl("", "https://example.com")).toBeNull();
+    expect(extractFirstSegmentUrl("#EXTM3U\n#EXT-X-VERSION:3", "https://example.com")).toBeNull();
   });
 });
 
