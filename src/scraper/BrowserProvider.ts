@@ -94,6 +94,11 @@ const USER_AGENT =
   "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 export class PlaywrightBrowserProvider {
+  // Shared singleton: launchPersistentContext takes an exclusive lock on its
+  // profile dir (ProcessSingleton), so two provider instances in one process
+  // must never point at the same userDataDir. Everything browser-backed
+  // (ScraperEngine, CinejoyExtractor) acquires from this one instance.
+  static readonly shared = new PlaywrightBrowserProvider();
   // Promise-based singleton so concurrent callers (e.g. eager warmup racing
   // with the first request) await the SAME in-flight creation instead of
   // each spawning a separate browser context.

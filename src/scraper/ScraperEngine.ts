@@ -218,7 +218,7 @@ interface ScrapeSession {
  * as the first `.m3u8` request is observed (no subtitle requirement).
  */
 export class ScraperEngine {
-  private browserProvider = new PlaywrightBrowserProvider();
+  private browserProvider = PlaywrightBrowserProvider.shared;
   private semaphore = new Semaphore(CONFIG.SCRAPER.MAX_CONCURRENT);
 
   /**
@@ -707,6 +707,7 @@ export class ScraperEngine {
       let preferredServerName = "";
       let preferredServerSwitchedAt = 0;
       let sessionStartedAt = 0;
+      let upstreamSourceApiFailed = false;
       // Server-cycling state (shared across frames; only one frame acts per interval)
       let cycleStartedAt = 0;
       let lastCycleAt = 0;
@@ -785,12 +786,36 @@ export class ScraperEngine {
               }
             });
 
+            s.page.on("requestfailed", (req) => {
+              const u = req.url().toLowerCase();
+              if (
+                u.includes("new.vidnest.fun") ||
+                u.includes("/yflix/") ||
+                u.includes("/ophim/") ||
+                u.includes("/vs_src.php")
+              ) {
+                upstreamSourceApiFailed = true;
+              }
+            });
+
             // Capture video streams that actually succeed (HTTP 200 / 206)
             s.page.on("response", (response: Response) => {
               const status = response.status();
-              if (status < 200 || status >= 300) return;
-
               const resUrl = response.url();
+              const resUrlLower = resUrl.toLowerCase();
+
+              if (status >= 400) {
+                if (
+                  resUrlLower.includes("new.vidnest.fun") ||
+                  resUrlLower.includes("/yflix/") ||
+                  resUrlLower.includes("/ophim/") ||
+                  resUrlLower.includes("/vs_src.php")
+                ) {
+                  upstreamSourceApiFailed = true;
+                }
+                return;
+              }
+              if (status < 200 || status >= 300) return;
               const isSegment = /\.(ts|m4s)($|\?)/i.test(resUrl);
               if (isSegment) return;
 
@@ -936,6 +961,82 @@ export class ScraperEngine {
             });
           },
           processFrame: async (frame, s) => {
+            // 1. Fail-fast on DOM error messages indicating no media / deleted file / 404
+            if (!capturedVideo && !stagedFallbackVideo) {
+              const notFoundState = await frame
+                .evaluate(() => {
+                  const text = (document.body?.innerText || "").toUpperCase();
+                  if (
+                    text.includes("MEDIA NOT FOUND") ||
+                    text.includes("VIDEO NOT FOUND") ||
+                    text.includes("FILE WAS DELETED") ||
+                    text.includes("CONTENT NOT FOUND") ||
+                    text.includes("NO STREAM AVAILABLE") ||
+                    text.includes("VIDEO HAS BEEN REMOVED")
+                  ) {
+                    return "media_not_found";
+                  }
+                  const title = (document.title || "").toLowerCase();
+                  if (title.includes("404 not found") || title === "not found") {
+                    return "title_not_found";
+                  }
+                  return null;
+                })
+                .catch(() => null);
+
+              if (notFoundState) {
+                console.log(
+                  `[SCRAPER-VOD] Fail-fast: detected upstream not-found indicator ("${notFoundState}") for ${url}`,
+                );
+                s.markDone();
+                return;
+              }
+            }
+
+            // 2. Fail-fast on Vidnest when upstream source API failed or page is stuck in loading
+            if (
+              url.includes("vidnest.fun") &&
+              !capturedVideo &&
+              !stagedFallbackVideo
+            ) {
+              const elapsed = sessionStartedAt > 0 ? Date.now() - sessionStartedAt : 0;
+              const isStuckFetching = await frame
+                .evaluate(() => {
+                  const hasLoading = Boolean(
+                    document.querySelector('[class*="LoadingState"]'),
+                  );
+                  const text = (document.body?.innerText || "").toUpperCase();
+                  const hasFetching = text.includes("FETCHING, ONE MOMENT");
+                  const hasVideo = Boolean(document.querySelector("video"));
+                  const hasServerMenu = Boolean(
+                    document.querySelector('[class*="ServerMenu"]'),
+                  );
+                  const hasPlayer = Boolean(
+                    document.querySelector(
+                      "#player, .jwplayer, .art-video-player, iframe",
+                    ),
+                  );
+                  return (
+                    (hasLoading || hasFetching) &&
+                    !hasVideo &&
+                    !hasServerMenu &&
+                    !hasPlayer
+                  );
+                })
+                .catch(() => false);
+
+              if (
+                isStuckFetching &&
+                ((upstreamSourceApiFailed && elapsed >= 3000) || elapsed >= 6000)
+              ) {
+                console.log(
+                  `[SCRAPER-VOD] Fail-fast: Vidnest upstream source unavailable (stuck loading, apiFailed: ${upstreamSourceApiFailed}, elapsed: ${elapsed}ms) for ${url}`,
+                );
+                s.markDone();
+                return;
+              }
+            }
+
             // Proactive high-quality server selection:
             // Check if embed has a ServerMenu. If so, proactively switch to top preferred server (Zeta, Prime, Upcloud...)
             if (!preferredServerAttempted && !preferredServerChecking && !capturedVideo) {

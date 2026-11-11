@@ -1,5 +1,6 @@
 import { CONFIG } from "../config";
 import { logger } from "../logger";
+import { CinejoyExtractor } from "../scraper/extractors/CinejoyExtractor";
 import { PitSportExtractor } from "../scraper/extractors/PitSportExtractor";
 import { StrmFreeExtractor } from "../scraper/extractors/StrmFreeExtractor";
 import {
@@ -207,6 +208,36 @@ export class ScraperService {
     );
 
     // Fast-path: try specialized direct HTTP extractors if available
+    if (CinejoyExtractor.canHandle(url)) {
+      try {
+        logger.info(
+          `Attempting cinejoy headless extraction for: ${url}`,
+          "ScraperService",
+        );
+        const extracted = await CinejoyExtractor.extract(url, signal);
+        const result: ExtractedStreamResult = {
+          url: extracted.url,
+          headers: extracted.headers,
+          body: extracted.body,
+          extractedAt: Date.now(),
+        };
+        // cinejoy UUIDs are long-lived (≥50min observed vs megacloud-family
+        // minutes) — cache at the VOD TTL; videoScraperService's payload
+        // liveness ping recovers dead URLs before TTL anyway.
+        streamCache.set(cacheKey, result, CONFIG.VOD_CACHE_TTL_MS);
+        logger.info(
+          `Extracted stream URL via cinejoy extractor: ${extracted.url}`,
+          "ScraperService",
+        );
+        return { ...result, fromCache: false };
+      } catch (e) {
+        logger.warn(
+          `Cinejoy extractor failed for ${url}, falling back to browser scraper: ${(e as Error).message}`,
+          "ScraperService",
+        );
+      }
+    }
+
     if (PitSportExtractor.canHandle(url)) {
       try {
         logger.info(

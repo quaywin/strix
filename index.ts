@@ -745,6 +745,7 @@ export const app = new Elysia()
       });
     }
     const referer = query.referer;
+    const upstreamOrigin = query.origin;
 
     try {
       const rewritten = await videoScraperService.getProxiedPlaylist(
@@ -752,6 +753,7 @@ export const app = new Elysia()
         referer,
         getRequestOrigin(request),
         request.signal,
+        upstreamOrigin,
       );
       return new Response(rewritten, {
         status: 200,
@@ -823,6 +825,12 @@ export const app = new Elysia()
     const headers = new Headers();
     if (query.referer && (!chunkHostname || !stripRefererHosts.has(chunkHostname))) {
       headers.set("referer", query.referer);
+    }
+    // cinejoy's lightspeed.st CDN rejects segments without the site Origin
+    // even when the referer matches; the origin param rides alongside
+    // referer through /playlist rewrites (see getProxiedPlaylist).
+    if (query.origin) {
+      headers.set("origin", query.origin);
     }
     const userAgent =
       query.ua ||

@@ -1,6 +1,7 @@
 import { CONFIG } from "../config";
 import { logger } from "../logger";
-import { scraperEngine } from "../scraper/ScraperEngine";
+import { CinejoyExtractor } from "../scraper/extractors/CinejoyExtractor";
+import { scraperEngine, type RequestData } from "../scraper/ScraperEngine";
 import {
   buildVdrkSubtitleCandidates,
   parseEmbedVideoIdentity,
@@ -192,9 +193,11 @@ export class VideoScraperService {
     referer: string | undefined,
     requestOrigin: string,
     signal?: AbortSignal,
+    origin?: string,
   ): Promise<string> {
     const headers: Record<string, string> = {};
     if (referer) headers["referer"] = referer;
+    if (origin) headers["origin"] = origin;
 
     // Playlists harvested at scrape time are served straight from memory —
     // no upstream request at all on the play path.
@@ -211,14 +214,15 @@ export class VideoScraperService {
     //   /proxy-chunk.
     const isNestedMaster = normalized.includes("#EXT-X-STREAM-INF");
     const refererParam = encodeURIComponent(referer || playlistUrl);
+    const originParam = origin ? `&origin=${encodeURIComponent(origin)}` : "";
     return rewriteM3u8Playlist(normalized, playlistUrl, {
       proxySegmentUrl: (targetUrl) =>
         isNestedMaster
-          ? `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`
+          ? `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${refererParam}${originParam}`
           : proxyChunkUrl(
               requestOrigin,
               targetUrl,
-              `url=${encodeURIComponent(targetUrl)}&referer=${refererParam}`,
+              `url=${encodeURIComponent(targetUrl)}&referer=${refererParam}${originParam}`,
             ),
     });
   }
@@ -642,8 +646,13 @@ export class VideoScraperService {
     // them directly (anti-hotlink Referer checks, no CORS headers), so the
     // master always points its variants at strix's /playlist route, which
     // fetches upstream and rewrites every segment through /proxy-chunk.
-    const cdnReferer =
-      this.pickForwardableHeaders(payload.video.headers).referer || url;
+    const forwardable = this.pickForwardableHeaders(payload.video.headers);
+    const cdnReferer = forwardable.referer || url;
+    // Some CDNs (cinejoy's lightspeed.st) require the site Origin on variant
+    // fetches too, so the /playlist re-entry URLs carry it alongside referer.
+    const cdnOriginParam = forwardable.origin
+      ? `&origin=${encodeURIComponent(forwardable.origin)}`
+      : "";
 
     // Flatten nested master chains (master → variant master → media playlist)
     // into a single-level master. VLC's adaptive demuxer cannot re-parse a
@@ -732,7 +741,7 @@ export class VideoScraperService {
           {
             videoBody: effectiveBody,
             proxySegmentUrl: (targetUrl: string) =>
-              `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(cdnReferer)}`,
+              `${requestOrigin}/playlist?url=${encodeURIComponent(targetUrl)}&referer=${encodeURIComponent(cdnReferer)}${cdnOriginParam}`,
             excludedVariantUrls: payload.unplayableVariantUrls,
           },
         )
@@ -853,13 +862,40 @@ export class VideoScraperService {
         ).catch(() => [] as RawSubtitleCandidate[])
       : null;
 
-    const videoReq = await scraperEngine.collectVideo(
-      url,
-      CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
-      isEmbed,
-      signal,
-      server,
-    );
+    // cinejoy: its extractor runs the whole browser flow itself (including
+    // the TMDB stub interception) and returns the master + body directly.
+    // The generic engine would just re-open the same page with vidnest
+    // selectors and find nothing.
+    let videoReq: RequestData | null = null;
+    if (CinejoyExtractor.canHandle(url)) {
+      try {
+        const extracted = await CinejoyExtractor.extract(url, signal);
+        videoReq = {
+          url: extracted.url,
+          method: "GET",
+          headers: extracted.headers ?? {},
+          resource_type: "media",
+          post_data: null,
+          body: extracted.body,
+        };
+      } catch (e) {
+        if (signal?.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
+        logger.warn(
+          `Cinejoy extractor failed for ${url}: ${(e as Error).message}`,
+          "VideoScraperService",
+        );
+      }
+    } else {
+      videoReq = await scraperEngine.collectVideo(
+        url,
+        CONFIG.SCRAPER.DEFAULT_TIMEOUT / 1000,
+        isEmbed,
+        signal,
+        server,
+      );
+    }
 
     if (!videoReq) {
       if (signal?.aborted) {
