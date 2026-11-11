@@ -671,11 +671,17 @@ const proxySubHandler = async (
     // Apple's HLS authoring spec requires every WebVTT segment to declare an
     // X-TIMESTAMP-MAP so AVPlayer can position cues (tvOS/airOS players are
     // strict about this — the same file plays fine in ffmpeg/VLC without it).
-    // LOCAL:0 ↔ MPEGTS:0 keeps cue times as-is for a single from-zero segment;
-    // ffmpeg/VLC ignore the map at offset 0, so nothing else changes.
+    // LOCAL must use the full HLS timestamp form (00:00:00.000): AVFoundation
+    // silently DROPS the whole text track on the bare "LOCAL:0" short form
+    // (VLC/ffmpeg tolerate both — which is exactly why this only showed up
+    // on AirPlay/tvOS). LOCAL:00:00:00.000 ↔ MPEGTS:0 keeps cue times as-is
+    // for a single from-zero segment.
     const vttOut =
       vtt.startsWith("WEBVTT") && !vtt.includes("X-TIMESTAMP-MAP")
-        ? vtt.replace(/^WEBVTT/, "WEBVTT\nX-TIMESTAMP-MAP:LOCAL:0,MPEGTS:0")
+        ? vtt.replace(
+            /^WEBVTT/,
+            "WEBVTT\nX-TIMESTAMP-MAP:LOCAL:00:00:00.000,MPEGTS:0",
+          )
         : vtt;
 
     // A response served BEFORE calibration landed must not be pinned by
