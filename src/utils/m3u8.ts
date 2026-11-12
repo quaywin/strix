@@ -408,7 +408,7 @@ export function buildMasterPlaylistWithSubtitles(
     ? effectiveSubs
         .map(
           (t) =>
-            `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${t.label.replace(/"/g, "")}",DEFAULT=${t.default ? "YES" : "NO"},AUTOSELECT=YES,FORCED=NO,LANGUAGE="${t.language}",URI="${t.proxyUrl}&playlist=1"`,
+            `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${t.label.replace(/"/g, "")}",DEFAULT=${t.default ? "YES" : "NO"},AUTOSELECT=YES,FORCED=NO,LANGUAGE="${t.language}",CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog",URI="${t.proxyUrl}&playlist=1"`,
         )
         .join("\n")
     : "";
