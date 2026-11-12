@@ -723,6 +723,13 @@ export class VideoScraperService {
       // reads the extension from the LAST dot of the URL, so dots in the
       // query (wyzie token, hostnames) are percent-encoded to %2E — decoded
       // back transparently server-side — to keep .m3u8 the last one.
+      //
+      // Regardless of URL shape, ffmpeg's hls demuxer refuses SUBTITLE
+      // renditions by default twice over (verified on 7.1.1, libavformat
+      // hls.c): TYPE=SUBTITLES needs -strict experimental, and WebVTT
+      // segments are outside the default allowed_extensions list. VLC's
+      // native adaptive demuxer and AVPlayer/tvOS have no such policy —
+      // they are the supported consumers here.
       for (const t of playlistSubs) {
         const q = t.proxyUrl.indexOf("?");
         const query = t.proxyUrl
