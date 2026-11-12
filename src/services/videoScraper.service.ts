@@ -459,7 +459,8 @@ export class VideoScraperService {
       // with a small gap: parallel bursts are what trips the proxy's
       // abuse heuristics (a real player fetches one playlist at a time).
       if (text.includes("#EXT-X-STREAM-INF") && depth < 2) {
-        const children: string[] = [];
+        const priorityChildren: string[] = [];
+        const backgroundChildren: string[] = [];
         const parsedVariants: { url: string; score: number }[] = [];
         let curScore = 0;
         for (const line of text.split(/\r?\n/)) {
@@ -468,7 +469,7 @@ export class VideoScraperService {
             const uri = trimmed.match(/URI="([^"]+)"/i)?.[1];
             if (uri) {
               try {
-                children.push(resolveUrlWithBaseParams(uri, url));
+                priorityChildren.push(resolveUrlWithBaseParams(uri, url));
               } catch {}
             }
             continue;
@@ -492,15 +493,32 @@ export class VideoScraperService {
         }
         // Prioritize highest-quality variants (4K, 1080p, 720p) first
         parsedVariants.sort((a, b) => b.score - a.score);
-        for (const v of parsedVariants.slice(
-          0,
-          VideoScraperService.MAX_VARIANTS_PER_VOD,
-        )) {
-          children.push(v.url);
+        // Top 2 variants are harvested synchronously for immediate playback & duration resolution
+        const topVariants = parsedVariants.slice(0, 2);
+        for (const v of topVariants) {
+          priorityChildren.push(v.url);
         }
-        for (const childUrl of children) {
+        // Lower variants (e.g. 720p, 360p) are deferred to background harvest so the scrape returns fast
+        const lowerVariants = parsedVariants.slice(
+          2,
+          VideoScraperService.MAX_VARIANTS_PER_VOD,
+        );
+        for (const v of lowerVariants) {
+          backgroundChildren.push(v.url);
+        }
+
+        for (const childUrl of priorityChildren) {
           await harvestOne(childUrl, null, depth + 1);
-          await Bun.sleep(300);
+          await Bun.sleep(150);
+        }
+
+        if (backgroundChildren.length > 0) {
+          void (async () => {
+            for (const childUrl of backgroundChildren) {
+              await Bun.sleep(250);
+              await harvestOne(childUrl, null, depth + 1).catch(() => {});
+            }
+          })();
         }
       }
     };

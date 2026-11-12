@@ -103,7 +103,7 @@ describe("buildMasterPlaylistWithSubtitles passthrough", () => {
       '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=NO,LANGUAGE="en"',
     );
     expect(out).toContain(
-      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Vietnamese",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="vi",URI="https://strix.test/proxy-sub?url=vi&playlist=1"',
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Vietnamese",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="vi",CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog",URI="https://strix.test/proxy-sub?url=vi&playlist=1"',
     );
     // Variant references "subs"
     expect(out).toContain('SUBTITLES="subs"');

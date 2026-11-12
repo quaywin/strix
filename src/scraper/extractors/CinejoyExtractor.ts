@@ -144,11 +144,26 @@ export class CinejoyExtractor {
       );
 
       let masterUrl: string | null = null;
+      let resolveMaster: ((url: string) => void) | null = null;
+      const masterPromise = new Promise<string>((res) => {
+        resolveMaster = res;
+      });
+
       page.on("request", (req) => {
         if (!masterUrl && MASTER_RE.test(req.url())) {
           masterUrl = req.url();
+          resolveMaster?.(masterUrl);
         }
       });
+
+      const waitOrMaster = async (maxMs: number): Promise<boolean> => {
+        if (masterUrl) return true;
+        const timer = page.waitForTimeout(maxMs).then(() => false);
+        return Promise.race([
+          masterPromise.then(() => true),
+          timer,
+        ]);
+      };
 
       const t0 = Date.now();
       logger.info(
@@ -166,7 +181,9 @@ export class CinejoyExtractor {
         if (signal?.aborted) {
           throw new DOMException("The operation was aborted", "AbortError");
         }
-        await page.waitForTimeout(2000);
+        // Yield immediately the moment master.m3u8 arrives, avoiding rigid 2s sleep blocks
+        const found = await waitOrMaster(1500);
+        if (found || masterUrl) break;
 
         const st = await page
           .evaluate(() => ({
@@ -189,7 +206,7 @@ export class CinejoyExtractor {
             .getByRole("button", { name: "Try Again" })
             .click({ timeout: 3000 })
             .catch(() => {});
-          await page.waitForTimeout(ERROR_RETRY_COOLDOWN_MS);
+          await waitOrMaster(ERROR_RETRY_COOLDOWN_MS);
           continue;
         }
 
