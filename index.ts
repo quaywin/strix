@@ -446,10 +446,23 @@ export const handleScrapeVideo = async (
     embed?: string;
     is_embed?: string;
     server?: string;
+    fresh?: string;
+    refresh?: string;
   },
   request: Request,
 ): Promise<Response> => {
-  const { url, fallback, proxy, format, json, embed, is_embed, server } = query;
+  const {
+    url,
+    fallback,
+    proxy,
+    format,
+    json,
+    embed,
+    is_embed,
+    server,
+    fresh,
+    refresh,
+  } = query;
   if (!url) {
     return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
       status: 400,
@@ -460,6 +473,8 @@ export const handleScrapeVideo = async (
   const wantProxy = proxy === "1" || proxy === "true";
   const wantEmbed =
     embed === "1" || embed === "true" || is_embed === "1" || is_embed === "true";
+  const wantFresh =
+    fresh === "1" || fresh === "true" || refresh === "1" || refresh === "true";
   const requestOrigin = getRequestOrigin(request);
 
   try {
@@ -473,7 +488,7 @@ export const handleScrapeVideo = async (
         requestOrigin,
         wantEmbed,
         request.signal,
-        false,
+        wantFresh,
         server,
       );
     } catch (primaryErr: any) {
@@ -494,7 +509,7 @@ export const handleScrapeVideo = async (
         requestOrigin,
         wantEmbed,
         request.signal,
-        false,
+        wantFresh,
         server,
       );
     }

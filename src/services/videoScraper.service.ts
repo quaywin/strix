@@ -7,6 +7,12 @@ import {
   parseEmbedVideoIdentity,
 } from "../utils/embedSubtitles";
 import { fetchWyzieSubtitles, wyzieToCandidates } from "../utils/wyzie";
+import {
+  fetchSubdlSubtitles,
+  subdlToCandidates,
+  isSubdlSubtitleUrl,
+  extractSubtitleFromZip,
+} from "../utils/subdl";
 import { curlFetch, DEFAULT_USER_AGENT, smartFetch } from "../utils/http";
 import {
   buildMasterPlaylistWithSubtitles,
@@ -117,7 +123,9 @@ export class VideoScraperService {
    */
   private variantBodies = new TtlCache<string>(CONFIG.VOD_CACHE_TTL_MS, 40);
   /** Titles Wyzie had no subs for — protects the API quota on re-scrapes. */
-  private wyzieMissCache = new TtlCache<boolean>(24 * 60 * 60 * 1000);
+  private wyzieMissCache = new TtlCache<boolean>(15 * 60 * 1000);
+  /** Titles Subdl had no subs for — protects the API quota on re-scrapes. */
+  private subdlMissCache = new TtlCache<boolean>(15 * 60 * 1000);
   /**
    * vdrk probe results (possibly empty) keyed by embedUrl+languages. The
    * cache is slow (0.6-8s/file) and fresh scrapes re-probe the same TMDB id
@@ -658,6 +666,7 @@ export class VideoScraperService {
           !/\.m3u8($|[?&])/i.test(t.url) &&
           (/\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url) ||
             isWyzieSubtitleUrl(t.url) ||
+            isSubdlSubtitleUrl(t.url) ||
             t.format === "vtt" ||
             t.format === "srt"),
       )
@@ -1054,7 +1063,42 @@ export class VideoScraperService {
                 "VideoScraperService",
               );
             }
-          } catch (_) {}
+          } catch (e) {
+            logger.warn(
+              `Wyzie probe error for ${url}: ${(e as Error).message}`,
+              "VideoScraperService",
+            );
+          }
+        }
+      }
+      if (CONFIG.SUBDL_API_KEY && identity) {
+        const stillMissing = missingLanguages(
+          CONFIG.SUBTITLE_LANGUAGES,
+          payload.subCandidates || [],
+        );
+        if (stillMissing.length > 0) {
+          try {
+            const subdlCandidates = await this.probeSubdlSubtitles(
+              identity,
+              stillMissing,
+              signal,
+            );
+            if (subdlCandidates.length > 0) {
+              payload.subCandidates = [
+                ...(payload.subCandidates || []),
+                ...subdlCandidates,
+              ];
+              logger.info(
+                `Subdl subtitles: +${subdlCandidates.length} track(s) (missing: ${stillMissing.join(",")}) for: ${url}`,
+                "VideoScraperService",
+              );
+            }
+          } catch (e) {
+            logger.warn(
+              `Subdl probe error for ${url}: ${(e as Error).message}`,
+              "VideoScraperService",
+            );
+          }
         }
       }
 
@@ -1175,6 +1219,35 @@ export class VideoScraperService {
     };
     if (referer) {
       headers["referer"] = referer;
+    }
+
+    // Subdl subtitles are served as zip archives containing SRT files
+    if (isSubdlSubtitleUrl(url) || url.toLowerCase().includes(".zip")) {
+      const res = await smartFetch(url, {
+        headers,
+        signal: signal || AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        throw new Error(`Failed to fetch Subdl zip: HTTP ${res.status}`);
+      }
+      const arrayBuf = await res.arrayBuffer();
+      const buf = Buffer.from(arrayBuf);
+
+      let targetEp: number | undefined;
+      try {
+        const u = new URL(url);
+        const epStr =
+          u.searchParams.get("target_ep") || u.searchParams.get("ep");
+        if (epStr) targetEp = parseInt(epStr, 10);
+      } catch {}
+
+      const srtText = extractSubtitleFromZip(buf, targetEp);
+      if (!srtText) {
+        throw new Error("No subtitle found in Subdl zip archive");
+      }
+      const vttText = srtToVtt(maybeFixMojibake(srtText));
+      this.subCache.set(url, vttText, CONFIG.SUBTITLE_CACHE_TTL_MS);
+      return this.applySyncTransform(url, vttText);
     }
 
     const res = await smartFetch(url, {
@@ -1302,10 +1375,10 @@ export class VideoScraperService {
         (c) =>
           !c.isRendition &&
           (c.format === "srt" || c.format === "vtt") &&
-          isWyzieSubtitleUrl(c.url) &&
+          (isWyzieSubtitleUrl(c.url) || isSubdlSubtitleUrl(c.url)) &&
           this.subtitleSyncCache.get(c.url) === undefined,
       )
-      .slice(0, 3); // mirrors the Wyzie candidate cap
+      .slice(0, 3); // mirrors the external candidate cap
     if (targets.length === 0) return;
 
     // Reference candidates in confidence order: an embedded rendition is
@@ -1465,12 +1538,75 @@ export class VideoScraperService {
     });
     const candidates = wyzieToCandidates(subtitles).slice(0, 3);
     if (candidates.length === 0) {
-      this.wyzieMissCache.set(missKey, true);
+      if (!signal?.aborted) {
+        this.wyzieMissCache.set(missKey, true);
+      }
       return [];
     }
 
     logger.info(
       `Wyzie fallback: ${candidates.length} direct link(s) (${subtitles.map((s) => s.language).join(",")})`,
+      "VideoScraperService",
+    );
+    return candidates;
+  }
+
+  /**
+   * Subdl fallback (L3): queries api.subdl.com when both vdrk and Wyzie lack
+   * requested languages. Downloads are zip archives unzipped on-the-fly at play time.
+   */
+  private async probeSubdlSubtitles(
+    identity: {
+      kind?: "movie" | "tv";
+      tmdbId: string;
+      season?: number;
+      episode?: number;
+    },
+    missing: string[],
+    signal?: AbortSignal,
+  ): Promise<RawSubtitleCandidate[]> {
+    const apiKey = CONFIG.SUBDL_API_KEY;
+    if (!apiKey) return [];
+
+    const missKey = `subdl:${identity.kind ?? "movie"}:${identity.tmdbId}:${identity.season ?? 0}:${identity.episode ?? 0}:${missing.slice().sort().join(",")}`;
+    if (this.subdlMissCache.get(missKey)) return [];
+
+    let res;
+    try {
+      res = await fetchSubdlSubtitles(apiKey, {
+        tmdbId: identity.tmdbId,
+        kind: identity.kind,
+        season: identity.season,
+        episode: identity.episode,
+        languages: missing,
+        signal,
+      });
+    } catch (e) {
+      logger.warn(
+        `Subdl fetch error for ${identity.tmdbId}: ${(e as Error).message}`,
+        "VideoScraperService",
+      );
+      return [];
+    }
+
+    if (!res.ok) {
+      logger.warn(
+        `Subdl API returned HTTP ${res.status} for ${identity.tmdbId} (missing: ${missing.join(",")})`,
+        "VideoScraperService",
+      );
+      return [];
+    }
+
+    const candidates = subdlToCandidates(res.subtitles).slice(0, 3);
+    if (candidates.length === 0) {
+      if (!signal?.aborted) {
+        this.subdlMissCache.set(missKey, true);
+      }
+      return [];
+    }
+
+    logger.info(
+      `Subdl fallback: ${candidates.length} direct link(s) (${res.subtitles.map((s) => s.language).join(",")})`,
       "VideoScraperService",
     );
     return candidates;

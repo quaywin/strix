@@ -70,6 +70,9 @@ export const CONFIG = {
   // subtitles for a title. Returns direct SRT links — no key on the file
   // URLs themselves, only on the search call. Empty key disables L2.
   WYZIE_API_KEY: process.env.WYZIE_API_KEY || "",
+  // Subdl fallback (L3): secondary fallback when neither vdrk nor Wyzie
+  // return subtitles for a required language. Empty key disables L3.
+  SUBDL_API_KEY: process.env.SUBDL_API_KEY || "",
   // Auto-calibrate Wyzie subtitle tracks against an embedded HLS subtitle
   // rendition from the same master (cue-onset alignment → linear scale+offset,
   // then rewritten cue timings at serve time). Wyzie SRTs are synced to an
