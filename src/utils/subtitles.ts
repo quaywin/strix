@@ -168,14 +168,21 @@ export function srtToVtt(content: string): string {
 
   const rawBlocks = normalized.split(/\n\s*\n+/);
   const cleanedBlocks: string[] = [];
+  let headerMapLine: string | null = null;
   let cueCounter = 1;
 
   for (const block of rawBlocks) {
     const trimmed = block.trim();
     if (!trimmed) continue;
 
+    // Check if block has X-TIMESTAMP-MAP in header block
+    const mapMatch = trimmed.match(/^X-TIMESTAMP-MAP[:=].*$/m);
+    if (mapMatch) {
+      headerMapLine = mapMatch[0].trim();
+    }
+
     // Drop repeated or standalone WEBVTT header lines in inner content
-    if (/^WEBVTT(?:\s.*)?$/i.test(trimmed)) {
+    if (/^WEBVTT\b/i.test(trimmed) && !trimmed.includes("-->")) {
       continue;
     }
 
@@ -202,7 +209,8 @@ export function srtToVtt(content: string): string {
     }
   }
 
-  return `WEBVTT\n\n${cleanedBlocks.join("\n\n")}\n`;
+  const header = headerMapLine ? `WEBVTT\n${headerMapLine}\n\n` : "WEBVTT\n\n";
+  return `${header}${cleanedBlocks.join("\n\n")}\n`;
 }
 
 /**
@@ -398,7 +406,7 @@ export function mergeHlsVttSegments(segments: string[]): string {
       if (lines.length === 0) continue;
       const isTag = (l: string) => l.startsWith("NOTE") || /^(STYLE|REGION)/i.test(l);
       if (isTag(lines[0] ?? "")) continue;
-      const filtered = lines.filter((l) => !/^X-TIMESTAMP-MAP:/i.test(l));
+      const filtered = lines.filter((l) => !/^X-TIMESTAMP-MAP[:=]/i.test(l));
       if (filtered.length === 0) continue;
 
       const timingIdx = filtered.findIndex((l) => parseCueTimingLine(l) !== null);

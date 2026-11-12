@@ -317,8 +317,44 @@ Test Subtitle`;
 
       const text = await res.text();
       expect(text.startsWith("WEBVTT")).toBe(true);
+      expect(text).toContain("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0");
+      expect(text).not.toContain("X-TIMESTAMP-MAP:");
       expect(text).toContain("00:00:01.000 --> 00:00:03.000");
       expect(text).toContain("Test Subtitle");
+    } finally {
+      mockSubServer.stop(true);
+    }
+  });
+
+  it("normalizes legacy or colon-based X-TIMESTAMP-MAP to RFC 8216 equals syntax", async () => {
+    const vttFixture = `WEBVTT
+X-TIMESTAMP-MAP:LOCAL:0,MPEGTS:900000
+
+00:00:01.000 --> 00:00:03.000
+Legacy Subtitle`;
+
+    const mockSubServer = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(vttFixture, {
+          status: 200,
+          headers: { "Content-Type": "text/vtt" },
+        });
+      },
+    });
+
+    const subUrl = `http://localhost:${mockSubServer.port}/sample.vtt`;
+
+    try {
+      const res = await app.handle(
+        new Request(
+          `http://localhost/proxy-sub?url=${encodeURIComponent(subUrl)}`,
+        ),
+      );
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000");
+      expect(text).not.toContain("X-TIMESTAMP-MAP:");
     } finally {
       mockSubServer.stop(true);
     }
@@ -352,6 +388,19 @@ Test Subtitle`;
       ),
     );
     expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("#EXT-X-TARGETDURATION:7140");
+    expect(text).toContain("#EXTINF:7140.000,");
+  });
+
+  it("returns single-segment VOD media playlist when requested via /proxy-sub/subs.m3u8 even without playlist=1", async () => {
+    const res = await app.handle(
+      new Request(
+        "http://localhost/proxy-sub/subs.m3u8?url=https%3A%2F%2Fexample.com%2Fsub.vtt&duration=7140",
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("application/vnd.apple.mpegurl");
     const text = await res.text();
     expect(text).toContain("#EXT-X-TARGETDURATION:7140");
     expect(text).toContain("#EXTINF:7140.000,");

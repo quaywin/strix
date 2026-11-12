@@ -605,7 +605,9 @@ const proxySubHandler = async (
   const referer = query.referer;
   const userAgent =
     query.ua || request.headers.get("user-agent") || DEFAULT_USER_AGENT;
-  const wantPlaylist = query.playlist === "1";
+  const pathname = new URL(request.url).pathname;
+  const wantPlaylist =
+    query.playlist === "1" || pathname.endsWith("subs.m3u8");
 
   try {
     // HLS renditions must point at a media *playlist*, not a raw WebVTT
@@ -671,18 +673,26 @@ const proxySubHandler = async (
     // Apple's HLS authoring spec requires every WebVTT segment to declare an
     // X-TIMESTAMP-MAP so AVPlayer can position cues (tvOS/airOS players are
     // strict about this — the same file plays fine in ffmpeg/VLC without it).
+    // RFC 8216 Section 3.5 mandates X-TIMESTAMP-MAP=LOCAL:...,MPEGTS:... (with '=').
     // LOCAL must use the full HLS timestamp form (00:00:00.000): AVFoundation
-    // silently DROPS the whole text track on the bare "LOCAL:0" short form
-    // (VLC/ffmpeg tolerate both — which is exactly why this only showed up
-    // on AirPlay/tvOS). LOCAL:00:00:00.000 ↔ MPEGTS:0 keeps cue times as-is
-    // for a single from-zero segment.
-    const vttOut =
-      vtt.startsWith("WEBVTT") && !vtt.includes("X-TIMESTAMP-MAP")
-        ? vtt.replace(
-            /^WEBVTT/,
-            "WEBVTT\nX-TIMESTAMP-MAP:LOCAL:00:00:00.000,MPEGTS:0",
-          )
-        : vtt;
+    // silently DROPS the whole text track on the bare "LOCAL:0" short form or ':'.
+    // LOCAL:00:00:00.000 ↔ MPEGTS:0 keeps cue times as-is for a single from-zero segment.
+    let vttOut = vtt;
+    if (vttOut.startsWith("WEBVTT")) {
+      if (!vttOut.includes("X-TIMESTAMP-MAP")) {
+        vttOut = vttOut.replace(
+          /^WEBVTT/,
+          "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0",
+        );
+      } else {
+        // Normalize any colon-based X-TIMESTAMP-MAP: to X-TIMESTAMP-MAP=
+        // and bare LOCAL:0 to LOCAL:00:00:00.000 for AVPlayer compatibility.
+        vttOut = vttOut.replace(
+          /^X-TIMESTAMP-MAP[:=]\s*LOCAL:(?:0|00:00:00(?:\.000)?),\s*MPEGTS:(\d+)/m,
+          "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:$1",
+        );
+      }
+    }
 
     // A response served BEFORE calibration landed must not be pinned by
     // downstream HTTP caches for the full 6h — that would freeze the

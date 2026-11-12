@@ -631,16 +631,18 @@ export class VideoScraperService {
     // Upstream rendition playlists (.m3u8) stay out (hls.js consumes the
     // upstream declaration directly via the absolute-ized EXT-X-MEDIA passthrough),
     // but all tracks are exposed through the JSON API.
-    const playlistSubs = subtitles.filter(
-      (t) =>
-        !t.isRendition &&
-        t.format !== "m3u8" &&
-        !/\.m3u8($|[?&])/i.test(t.url) &&
-        (/\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url) ||
-          isWyzieSubtitleUrl(t.url) ||
-          t.format === "vtt" ||
-          t.format === "srt"),
-    );
+    const playlistSubs = subtitles
+      .filter(
+        (t) =>
+          !t.isRendition &&
+          t.format !== "m3u8" &&
+          !/\.m3u8($|[?&])/i.test(t.url) &&
+          (/\.(vtt|srt)($|[?&])|format=(vtt|srt)($|&)/i.test(t.url) ||
+            isWyzieSubtitleUrl(t.url) ||
+            t.format === "vtt" ||
+            t.format === "srt"),
+      )
+      .map((t) => ({ ...t }));
 
     // Variant playlists on these CDNs hang or 404 when a browser fetches
     // them directly (anti-hotlink Referer checks, no CORS headers), so the
@@ -712,6 +714,9 @@ export class VideoScraperService {
       if (durationSec > 0) {
         const rounded = Math.round(durationSec);
         payload.duration = rounded;
+        for (const t of subtitles) {
+          t.proxyUrl += `&duration=${rounded}`;
+        }
         for (const t of playlistSubs) {
           t.proxyUrl += `&duration=${rounded}`;
         }
