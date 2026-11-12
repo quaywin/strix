@@ -248,9 +248,13 @@ export class CinejoyExtractor {
       // upstream fetch. Non-fatal — URL-only results still play.
       let body: string | undefined;
       try {
+        const timeoutSignal = AbortSignal.timeout(8000);
+        const combinedSignal = signal
+          ? AbortSignal.any([signal, timeoutSignal])
+          : timeoutSignal;
         const res = await smartFetch(masterUrl, {
           headers: { ...headers, "accept-encoding": "identity" },
-          signal: AbortSignal.timeout(8000),
+          signal: combinedSignal,
         });
         if (res.ok) {
           body = await res.text();

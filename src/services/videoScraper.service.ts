@@ -387,12 +387,13 @@ export class VideoScraperService {
       url: string,
       bodyText: string | null,
       depth: number,
+      isBackground: boolean = false,
     ): Promise<void> => {
       if (visited.has(url) || visited.size >= 10) return;
-      // Bound total wall time: worst-case per-URL retry chains (2 × 15s
+      // Bound total wall time for synchronous harvest: worst-case per-URL retry chains (2 × 15s
       // timeouts + backoff) across 10 URLs would otherwise outlive the
       // server's idle timeout and strand the requesting player.
-      if (Date.now() > deadline) {
+      if (!isBackground && Date.now() > deadline) {
         budgetExceeded = true;
         return;
       }
@@ -516,7 +517,7 @@ export class VideoScraperService {
           void (async () => {
             for (const childUrl of backgroundChildren) {
               await Bun.sleep(250);
-              await harvestOne(childUrl, null, depth + 1).catch(() => {});
+              await harvestOne(childUrl, null, depth + 1, true).catch(() => {});
             }
           })();
         }
@@ -542,7 +543,7 @@ export class VideoScraperService {
     if (unplayableVariants.size > 0) {
       payload.unplayableVariantUrls = unplayableVariants;
     }
-    payload.variantUrls = [...visited];
+    payload.variantUrls = Array.from(new Set([...visited]));
     logger.info(
       `Harvested ${okCount}/${visited.size} playlist(s) (${Math.round(totalBytes / 1024)}KB${budgetExceeded ? ", budget exceeded — rest fetch live" : ""}) for: ${payload.video.url.slice(0, 100)}`,
       "VideoScraperService",
