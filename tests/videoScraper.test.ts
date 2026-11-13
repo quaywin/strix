@@ -5,6 +5,7 @@ import {
   extractDurationFromMediaPlaylist,
   extractPlaylistDuration,
   extractFirstSegmentUrl,
+  isOverMaxResolution,
 } from "../src/utils/m3u8";
 import {
   inferSubtitleMetadata,
@@ -175,7 +176,7 @@ describe("buildMasterPlaylistWithSubtitles", () => {
     expect(result.indexOf("1280x720")).toBeLessThan(result.indexOf("640x360"));
   });
 
-  it("sorts variants descending from 4K/1080p down to 720p/480p", () => {
+  it("filters out 4K variants and sorts from 1080p down to 720p/480p", () => {
     const masterBody = `#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
 720p.m3u8
@@ -192,14 +193,66 @@ describe("buildMasterPlaylistWithSubtitles", () => {
       { videoBody: masterBody },
     );
 
-    const idx4k = result.indexOf("3840x2160");
+    expect(result).not.toContain("3840x2160");
+    expect(result).not.toContain("4k.m3u8");
+
     const idx1080 = result.indexOf("1920x1080");
     const idx720 = result.indexOf("1280x720");
     const idx480 = result.indexOf("854x480");
 
-    expect(idx4k).toBeLessThan(idx1080);
     expect(idx1080).toBeLessThan(idx720);
     expect(idx720).toBeLessThan(idx480);
+  });
+
+  it("falls back to 4K variant if 4K is the only available rendition", () => {
+    const masterBody = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=16000000,RESOLUTION=3840x2160
+4k.m3u8`;
+
+    const result = buildMasterPlaylistWithSubtitles(
+      "https://stream.example.com/master.m3u8",
+      [],
+      { videoBody: masterBody },
+    );
+
+    expect(result).toContain("3840x2160");
+    expect(result).toContain("4k.m3u8");
+  });
+
+  it("allows 4K when maxResolutionWidth is configured to 3840", () => {
+    const masterBody = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=16000000,RESOLUTION=3840x2160
+4k.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p.m3u8`;
+
+    const result = buildMasterPlaylistWithSubtitles(
+      "https://stream.example.com/master.m3u8",
+      [],
+      { videoBody: masterBody, maxResolutionWidth: 3840 },
+    );
+
+    expect(result).toContain("3840x2160");
+    expect(result).toContain("4k.m3u8");
+    const idx4k = result.indexOf("3840x2160");
+    const idx1080 = result.indexOf("1920x1080");
+    expect(idx4k).toBeLessThan(idx1080);
+  });
+
+  it("isOverMaxResolution checks both width and height dynamically without hardcoding", () => {
+    // Default 1080p limit (1920x1080)
+    expect(isOverMaxResolution(3840, 2160)).toBe(true);
+    expect(isOverMaxResolution(2560, 1440)).toBe(true);
+    expect(isOverMaxResolution(1920, 1080)).toBe(false);
+    expect(isOverMaxResolution(1920, 800)).toBe(false);
+    expect(isOverMaxResolution(1280, 720)).toBe(false);
+    expect(isOverMaxResolution(0, 0)).toBe(false);
+
+    // Dynamic 4K configuration (3840x2160)
+    expect(isOverMaxResolution(3840, 2160, 3840, 2160)).toBe(false);
+    expect(isOverMaxResolution(7680, 4320, 3840, 2160)).toBe(true);
   });
 
   it("excludes unplayable variants when excludedVariantUrls is provided", () => {

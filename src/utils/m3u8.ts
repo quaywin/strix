@@ -1,3 +1,4 @@
+import { CONFIG } from "../config";
 import type { RawSubtitleCandidate, SubtitleTrack } from "./subtitles";
 
 /**
@@ -370,6 +371,21 @@ export function parseHlsSubtitleRenditions(
 }
 
 /**
+ * Checks whether a video rendition's resolution exceeds the maximum allowed resolution.
+ */
+export function isOverMaxResolution(
+  width: number,
+  height: number,
+  maxWidth: number = CONFIG.MAX_RESOLUTION_WIDTH,
+  maxHeight: number = CONFIG.MAX_RESOLUTION_HEIGHT,
+): boolean {
+  if (maxWidth <= 0 && maxHeight <= 0) return false;
+  if (maxWidth > 0 && width > 0 && width > maxWidth) return true;
+  if (maxHeight > 0 && height > 0 && height > maxHeight) return true;
+  return false;
+}
+
+/**
  * Builds or augments an RFC 8216 HLS Master Playlist combining a video stream with subtitle tracks.
  */
 export function buildMasterPlaylistWithSubtitles(
@@ -379,6 +395,8 @@ export function buildMasterPlaylistWithSubtitles(
     videoBody?: string;
     proxySegmentUrl?: (url: string) => string;
     excludedVariantUrls?: Set<string>;
+    maxResolutionWidth?: number;
+    maxResolutionHeight?: number;
   } = {},
 ): string {
   const isExistingMaster = Boolean(
@@ -422,6 +440,8 @@ export function buildMasterPlaylistWithSubtitles(
       inf: string;
       url: string;
       score: number;
+      width: number;
+      height: number;
     }
     const variants: VariantEntry[] = [];
     let pendingInf: string | null = null;
@@ -515,16 +535,17 @@ export function buildMasterPlaylistWithSubtitles(
             const bwMatch = pendingInf.match(/BANDWIDTH=(\d+)/i);
             const resMatch = pendingInf.match(/RESOLUTION=(\d+)x(\d+)/i);
             const width = resMatch?.[1] ? parseInt(resMatch[1], 10) : 0;
+            const height = resMatch?.[2] ? parseInt(resMatch[2], 10) : 0;
             const bandwidth = bwMatch?.[1] ? parseInt(bwMatch[1], 10) : 0;
             const score = width > 0 ? width * 10000000 + bandwidth : bandwidth;
-            variants.push({ inf: pendingInf, url: finalUrl, score });
+            variants.push({ inf: pendingInf, url: finalUrl, score, width, height });
             pendingInf = null;
           } else {
             resultLines.push(finalUrl);
           }
         } catch {
           if (pendingInf) {
-            variants.push({ inf: pendingInf, url: trimmed, score: 0 });
+            variants.push({ inf: pendingInf, url: trimmed, score: 0, width: 0, height: 0 });
             pendingInf = null;
           } else {
             resultLines.push(line);
@@ -580,9 +601,26 @@ export function buildMasterPlaylistWithSubtitles(
       resultLines.push(subMediaLines);
     }
 
+    // Filter out variants exceeding max resolution (default 1920x1080 = 1080p)
+    const maxResWidth =
+      options.maxResolutionWidth ?? CONFIG.MAX_RESOLUTION_WIDTH;
+    const maxResHeight =
+      options.maxResolutionHeight ??
+      (options.maxResolutionWidth !== undefined
+        ? options.maxResolutionWidth > 0
+          ? Math.round((options.maxResolutionWidth * 9) / 16)
+          : 0
+        : CONFIG.MAX_RESOLUTION_HEIGHT);
+
+    const eligibleVariants = variants.filter(
+      (v) => !isOverMaxResolution(v.width, v.height, maxResWidth, maxResHeight),
+    );
+    const finalVariants =
+      eligibleVariants.length > 0 ? eligibleVariants : variants;
+
     // Sort variants from highest quality to lowest so HLS players default to 1080p
-    variants.sort((a, b) => b.score - a.score);
-    for (const v of variants) {
+    finalVariants.sort((a, b) => b.score - a.score);
+    for (const v of finalVariants) {
       resultLines.push(v.inf);
       resultLines.push(v.url);
     }

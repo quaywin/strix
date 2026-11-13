@@ -14,6 +14,28 @@ function parseSubtitleLanguages(): string[] | "*" {
   return codes.length > 0 ? codes : "*";
 }
 
+function parseMaxResolution(): { width: number; height: number } {
+  const envWidth = process.env.MAX_RESOLUTION_WIDTH;
+  const envHeight = process.env.MAX_RESOLUTION_HEIGHT;
+
+  const width = envWidth !== undefined ? parseInt(envWidth, 10) : 1920;
+  let height = 1080;
+  if (envHeight !== undefined) {
+    height = parseInt(envHeight, 10);
+  } else if (width > 0) {
+    height = Math.round((width * 9) / 16);
+  } else {
+    height = 0;
+  }
+
+  return {
+    width: isNaN(width) ? 1920 : width,
+    height: isNaN(height) ? 1080 : height,
+  };
+}
+
+const maxResolution = parseMaxResolution();
+
 export const CONFIG = {
   PORT: parseInt(process.env.PORT || "5005", 10),
   CHROME_PATH: process.env.CHROME_PATH || "",
@@ -86,4 +108,7 @@ export const CONFIG = {
   // NaN would silently disable every alignment downstream.
   SUBTITLE_SYNC_WINDOW_S:
     parseInt(process.env.SUBTITLE_SYNC_WINDOW_S || "120", 10) || 120,
+  // Maximum video resolution to include/prioritize in HLS playlists (default: 1920x1080 to exclude 4K/1440p)
+  MAX_RESOLUTION_WIDTH: maxResolution.width,
+  MAX_RESOLUTION_HEIGHT: maxResolution.height,
 };

@@ -9,6 +9,7 @@ import {
   scraperEngine,
 } from "../scraper/ScraperEngine";
 import { smartFetch } from "../utils/http";
+import { isOverMaxResolution } from "../utils/m3u8";
 import { TtlCache } from "../utils/ttlCache";
 import { runCoalesced, type InFlightEntry } from "../utils/inFlight";
 
@@ -138,8 +139,15 @@ export class ScraperService {
     }
 
     if (variants.length > 0) {
+      // Filter out variants exceeding max resolution (default 1920x1080)
+      const eligibleVariants = variants.filter(
+        (v) => !isOverMaxResolution(v.width, v.height),
+      );
+      const finalVariants =
+        eligibleVariants.length > 0 ? eligibleVariants : variants;
+
       // Sort variants: highest resolution first, then highest bandwidth
-      variants.sort((a, b) => {
+      finalVariants.sort((a, b) => {
         const areaA = a.width * a.height;
         const areaB = b.width * b.height;
         if (areaB !== areaA) {
@@ -147,7 +155,7 @@ export class ScraperService {
         }
         return b.bandwidth - a.bandwidth;
       });
-      return variants[0]?.url || playlistUrl;
+      return finalVariants[0]?.url || playlistUrl;
     }
 
     return playlistUrl;

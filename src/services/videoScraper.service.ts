@@ -24,6 +24,7 @@ import {
   extractDurationFromMediaPlaylist,
   extractPlaylistDuration,
   extractFirstSegmentUrl,
+  isOverMaxResolution,
 } from "../utils/m3u8";
 import {
   maybeFixMojibake,
@@ -470,8 +471,15 @@ export class VideoScraperService {
       if (text.includes("#EXT-X-STREAM-INF") && depth < 2) {
         const priorityChildren: string[] = [];
         const backgroundChildren: string[] = [];
-        const parsedVariants: { url: string; score: number }[] = [];
+        const parsedVariants: {
+          url: string;
+          score: number;
+          width: number;
+          height: number;
+        }[] = [];
         let curScore = 0;
+        let curWidth = 0;
+        let curHeight = 0;
         for (const line of text.split(/\r?\n/)) {
           const trimmed = line.trim();
           if (trimmed.startsWith("#EXT-X-MEDIA:")) {
@@ -487,8 +495,11 @@ export class VideoScraperService {
             const bwMatch = trimmed.match(/BANDWIDTH=(\d+)/i);
             const resMatch = trimmed.match(/RESOLUTION=(\d+)x(\d+)/i);
             const width = resMatch?.[1] ? parseInt(resMatch[1], 10) : 0;
+            const height = resMatch?.[2] ? parseInt(resMatch[2], 10) : 0;
             const bandwidth = bwMatch?.[1] ? parseInt(bwMatch[1], 10) : 0;
             curScore = width > 0 ? width * 10000000 + bandwidth : bandwidth;
+            curWidth = width;
+            curHeight = height;
             continue;
           }
           if (!trimmed || trimmed.startsWith("#")) continue;
@@ -496,19 +507,30 @@ export class VideoScraperService {
             parsedVariants.push({
               url: resolveUrlWithBaseParams(trimmed, url),
               score: curScore,
+              width: curWidth,
+              height: curHeight,
             });
           } catch {}
           curScore = 0;
+          curWidth = 0;
+          curHeight = 0;
         }
-        // Prioritize highest-quality variants (4K, 1080p, 720p) first
-        parsedVariants.sort((a, b) => b.score - a.score);
+        // Filter out variants exceeding max resolution (default 1920x1080) so only 1080p, 720p, etc. are harvested
+        const eligibleParsed = parsedVariants.filter(
+          (v) => !isOverMaxResolution(v.width, v.height),
+        );
+        const finalParsed =
+          eligibleParsed.length > 0 ? eligibleParsed : parsedVariants;
+
+        // Prioritize highest-quality variants (1080p, 720p) first
+        finalParsed.sort((a, b) => b.score - a.score);
         // Top 2 variants are harvested synchronously for immediate playback & duration resolution
-        const topVariants = parsedVariants.slice(0, 2);
+        const topVariants = finalParsed.slice(0, 2);
         for (const v of topVariants) {
           priorityChildren.push(v.url);
         }
         // Lower variants (e.g. 720p, 360p) are deferred to background harvest so the scrape returns fast
-        const lowerVariants = parsedVariants.slice(
+        const lowerVariants = finalParsed.slice(
           2,
           VideoScraperService.MAX_VARIANTS_PER_VOD,
         );
